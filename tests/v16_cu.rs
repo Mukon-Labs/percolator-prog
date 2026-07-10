@@ -44262,6 +44262,98 @@ fn v16_attack_asset1_insolvency_cannot_drain_asset0_domain_insurance() {
     );
 }
 
+fn terminal_spent_asset_env(with_provider_receivable: bool) -> (V16CuEnv, Keypair) {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(2, 10_000, 10_000, 10_000);
+    let admin = env.admin.insecure_clone();
+    env.configure_auth_mark_with_cu(0, 100);
+    env.configure_auth_mark_for_asset_as_admin(1, 1, 100);
+    env.top_up_insurance_domain_with_authority(&admin, 2, 450);
+    env.mutate_market(|_, group| {
+        group.assets[1].lifecycle = AssetLifecycleV16::Recovery;
+        group.insurance_domain_spent[2] = 450;
+        group.insurance_domain_budget_remaining_total -= 450;
+        group.insurance -= 450;
+        group.c_tot += 450;
+        if with_provider_receivable {
+            let receivable = 250 * BOUND_SCALE;
+            group.source_credit[3] = percolator::SourceCreditStateV16 {
+                spent_backing_num: receivable,
+                provider_receivable_num: receivable,
+                ..percolator::SourceCreditStateV16::EMPTY
+            };
+            group.source_backing_buckets[3] = percolator::BackingBucketV16 {
+                market_id: group.assets[1].market_id,
+                consumed_liened_backing_num: receivable,
+                expiry_slot: 1,
+                status: BackingBucketStatusV16::Expired,
+                ..percolator::BackingBucketV16::EMPTY
+            };
+        }
+    });
+    (env, admin)
+}
+
+// Issue #91: fully consumed insurance is history, not a permanent lifecycle lock.
+// Drive the public wrapper instruction and retain unrelated asset/value state.
+#[test]
+fn v16_attack_spent_only_recovery_asset_can_restart() {
+    let (mut env, admin) = terminal_spent_asset_env(false);
+    let before = env.market_state().1;
+    let asset0_before = before.assets[0];
+    let vault_before = before.vault;
+    let c_tot_before = before.c_tot;
+    let insurance_before = before.insurance;
+    assert_eq!(before.assets[1].lifecycle, AssetLifecycleV16::Recovery);
+    assert_eq!(before.insurance_domain_budget[2], 450);
+    assert_eq!(before.insurance_domain_spent[2], 450);
+    assert_eq!(before.insurance_domain_budget_remaining_total, 0);
+
+    env.svm.warp_to_slot(3);
+    let restart_cu = env
+        .try_restart_asset_oracle_with_authority(&admin, 1, 3, 100)
+        .expect("spent-only Recovery asset remains restartable");
+    assert_cu_within(
+        "spent-domain empty-asset RestartAssetOracle",
+        restart_cu,
+        CUSTODY_CU_LIMIT,
+    );
+    let after_restart = env.market_state().1;
+    assert_eq!(after_restart.assets[1].lifecycle, AssetLifecycleV16::Active);
+    assert_eq!(after_restart.assets[1].effective_price, 100);
+    assert_eq!(after_restart.insurance_domain_budget[2], 0);
+    assert_eq!(after_restart.insurance_domain_spent[2], 0);
+    assert_eq!(after_restart.vault, vault_before);
+    assert_eq!(after_restart.c_tot, c_tot_before);
+    assert_eq!(after_restart.insurance, insurance_before);
+    assert_eq!(after_restart.assets[0], asset0_before);
+    assert_eq!(after_restart.vault as u64, env.token_amount(env.vault));
+}
+
+// Frozen-spec guard: consumed backing is a provider receivable. Even when the
+// insurance budget is fully spent, restart must reject atomically rather than
+// erase that recoverable principal.
+#[test]
+fn v16_attack_spent_cleanup_cannot_erase_provider_receivable() {
+    let (mut env, admin) = terminal_spent_asset_env(true);
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let vault_before = env.svm.get_account(&env.vault).unwrap();
+    let before = env.market_state().1;
+    assert_eq!(
+        before.source_credit[3].provider_receivable_num,
+        250 * BOUND_SCALE
+    );
+    assert_eq!(
+        before.source_backing_buckets[3].consumed_liened_backing_num,
+        250 * BOUND_SCALE
+    );
+
+    env.svm.warp_to_slot(3);
+    let rejected = env.try_restart_asset_oracle_with_authority(&admin, 1, 3, 100);
+    assert!(rejected.is_err(), "provider receivable must block restart");
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(env.svm.get_account(&env.vault).unwrap(), vault_before);
+}
+
 // Product spec — per-asset cold-storage admin keys (governance): EVERY asset (including asset 0) has
 // its OWN admin that can rotate that asset's domain authorities (insurance/operator/backing/oracle)
 // and itself, and the asset admin can be BURNED to 0; isolated — it can never act on another asset. Asset 0's
