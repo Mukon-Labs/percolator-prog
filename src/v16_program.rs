@@ -63,8 +63,9 @@ pub mod constants {
     pub const PORTFOLIO_ENGINE_ACCOUNT_LEN: usize = HEADER_LEN + PORTFOLIO_STATE_LEN;
     pub const PORTFOLIO_MATCHER_CONFIG_OFF: usize = PORTFOLIO_ENGINE_ACCOUNT_LEN;
     pub const PORTFOLIO_MATCHER_CONFIG_LEN: usize = 104;
-    pub const PORTFOLIO_ACCOUNT_LEN: usize =
-        PORTFOLIO_ENGINE_ACCOUNT_LEN + PORTFOLIO_MATCHER_CONFIG_LEN;
+    pub const PORTFOLIO_ID_OFF: usize = PORTFOLIO_MATCHER_CONFIG_OFF + PORTFOLIO_MATCHER_CONFIG_LEN;
+    pub const PORTFOLIO_ID_LEN: usize = 8;
+    pub const PORTFOLIO_ACCOUNT_LEN: usize = PORTFOLIO_ID_OFF + PORTFOLIO_ID_LEN;
     pub const MAX_MATCHER_TAIL_ACCOUNTS: usize = 32;
     pub const MATCHER_ABI_VERSION: u32 = 3;
     pub const MATCHER_CONTEXT_MIN_LEN: usize = 64;
@@ -159,8 +160,9 @@ pub mod state {
             MARKET_GROUP_LEN, MARKET_GROUP_OFF, MIN_MARKET_ACCOUNT_LEN, ORACLE_LEG_CAP,
             ORACLE_LEG_FLAGS_MASK, ORACLE_MODE_AUTH_MARK, ORACLE_MODE_EWMA_MARK,
             ORACLE_MODE_HYBRID_AFTER_HOURS, ORACLE_MODE_MANUAL, PORTFOLIO_ACCOUNT_LEN,
-            PORTFOLIO_ENGINE_ACCOUNT_LEN, PORTFOLIO_MATCHER_CONFIG_LEN,
-            PORTFOLIO_MATCHER_CONFIG_OFF, PORTFOLIO_STATE_LEN, VERSION, WRAPPER_CONFIG_LEN,
+            PORTFOLIO_ENGINE_ACCOUNT_LEN, PORTFOLIO_ID_LEN, PORTFOLIO_ID_OFF,
+            PORTFOLIO_MATCHER_CONFIG_LEN, PORTFOLIO_MATCHER_CONFIG_OFF, PORTFOLIO_STATE_LEN,
+            VERSION, WRAPPER_CONFIG_LEN,
         },
         error::PercolatorError,
     };
@@ -548,7 +550,9 @@ pub mod state {
         pub backing_trade_fee_insurance_share_bps_short: u16,
         pub fee_redirect_to_market_0_bps: u16,
         pub matcher_req_seq: u64,
-        pub _padding1: [u8; 8],
+        /// Next program-assigned portfolio incarnation ID. Zero is accepted only as the legacy
+        /// pre-counter sentinel and is normalized to one by the next successful InitPortfolio.
+        pub next_portfolio_id: u64,
     }
 
     #[repr(C)]
@@ -787,6 +791,39 @@ pub mod state {
     }
 
     #[inline]
+    pub fn read_portfolio_id(data: &[u8]) -> Result<u64, ProgramError> {
+        check_header(data, KIND_PORTFOLIO)?;
+        let id = read_u64(data, PORTFOLIO_ID_OFF)?;
+        if id == 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(id)
+    }
+
+    #[inline]
+    fn write_portfolio_id(data: &mut [u8], id: u64) -> Result<(), ProgramError> {
+        check_header(data, KIND_PORTFOLIO)?;
+        if id == 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        data.get_mut(PORTFOLIO_ID_OFF..PORTFOLIO_ID_OFF + PORTFOLIO_ID_LEN)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(&id.to_le_bytes());
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn allocate_portfolio_id(next: u64) -> Result<(u64, u64), ProgramError> {
+        // Wrapper configs written before the counter existed contain zero in this former padding
+        // word. Such a market starts the sequence at one on its next successful initialization.
+        let id = if next == 0 { 1 } else { next };
+        let next = id
+            .checked_add(1)
+            .ok_or(PercolatorError::EngineCounterOverflow)?;
+        Ok((id, next))
+    }
+
+    #[inline]
     fn validate_backing_domain_ledger(
         ledger: &BackingDomainLedgerAccountV16,
     ) -> Result<(), ProgramError> {
@@ -965,7 +1002,6 @@ pub mod state {
             || config.conf_filter_bps > 10_000
             || config.invert > 1
             || config._padding0 != 0
-            || config._padding1 != [0u8; 8]
             || config.fee_redirect_to_market_0_bps > 10_000
             || config.oracle_leg_count as usize > ORACLE_LEG_CAP
             || (config.oracle_leg_flags & !ORACLE_LEG_FLAGS_MASK) != 0
@@ -1265,7 +1301,7 @@ pub mod state {
     ) -> Result<usize, ProgramError> {
         // Fixed-size: source-domains are a fixed sparse array embedded in PORTFOLIO_STATE_LEN.
         // Independent of the market's asset count N (O(1) portfolio). The wrapper-owned
-        // matcher config tail lives after the engine portfolio body.
+        // matcher config and program-assigned incarnation ID live after the engine portfolio body.
         Ok(PORTFOLIO_ACCOUNT_LEN)
     }
 
@@ -2300,6 +2336,7 @@ pub mod state {
         owner: [u8; 32],
         last_fee_slot: u64,
         max_market_slots: usize,
+        portfolio_id: u64,
     ) -> Result<(), ProgramError> {
         let required = portfolio_account_len_for_market_slots(max_market_slots)?;
         if data.len() < required {
@@ -2322,7 +2359,7 @@ pub mod state {
         for leg in wire.legs.iter_mut() {
             *leg = empty_leg;
         }
-        Ok(())
+        write_portfolio_id(data, portfolio_id)
     }
 
     #[cfg(not(target_os = "solana"))]
@@ -5514,7 +5551,7 @@ pub mod processor {
             backing_trade_fee_insurance_share_bps_short: 0,
             fee_redirect_to_market_0_bps: 0,
             matcher_req_seq: 0,
-            _padding1: [0u8; 8],
+            next_portfolio_id: 1,
         };
         state::init_market_account_zero_copy(
             &mut market_ai.try_borrow_mut_data()?,
@@ -5554,13 +5591,15 @@ pub mod processor {
         if portfolio_ai.data_len() < required_portfolio_len {
             portfolio_ai.realloc(required_portfolio_len, true)?;
         }
-        {
+        let cfg_after = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
             reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
+            let (portfolio_id, next_portfolio_id) =
+                state::allocate_portfolio_id(cfg.next_portfolio_id)?;
             let last_fee_slot = authenticated_market_slot_or_fallback_view(&group);
             state::init_portfolio_account_zero_copy(
                 &mut portfolio_ai.try_borrow_mut_data()?,
@@ -5569,6 +5608,7 @@ pub mod processor {
                 owner.key.to_bytes(),
                 last_fee_slot,
                 max_market_slots,
+                portfolio_id,
             )?;
             let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
             let portfolio =
@@ -5580,7 +5620,10 @@ pub mod processor {
             group
                 .register_empty_materialized_portfolio_not_atomic(&portfolio.as_view())
                 .map_err(map_v16_error)?;
-        }
+            cfg.next_portfolio_id = next_portfolio_id;
+            cfg
+        };
+        state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg_after)?;
         let _ = (cfg, source_domain_count);
         Ok(())
     }
@@ -12078,6 +12121,16 @@ pub mod processor {
             );
         }
 
+        #[test]
+        fn portfolio_id_allocator_normalizes_legacy_zero_and_rejects_exhaustion() {
+            assert_eq!(state::allocate_portfolio_id(0).unwrap(), (1, 2));
+            assert_eq!(state::allocate_portfolio_id(41).unwrap(), (41, 42));
+            assert_eq!(
+                state::allocate_portfolio_id(u64::MAX),
+                Err(PercolatorError::EngineCounterOverflow.into())
+            );
+        }
+
         fn test_wrapper_config(price: u64) -> state::WrapperConfigV16 {
             let mut cfg = state::WrapperConfigV16::default();
             cfg.marketauth = [1u8; 32];
@@ -12151,6 +12204,7 @@ pub mod processor {
                 [11u8; 32],
                 0,
                 1,
+                1,
             )
             .unwrap();
             state::init_portfolio_account_zero_copy(
@@ -12160,6 +12214,7 @@ pub mod processor {
                 [13u8; 32],
                 0,
                 1,
+                2,
             )
             .unwrap();
 

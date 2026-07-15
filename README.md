@@ -141,6 +141,14 @@ Assets 1..N are **truly permissionless ⇒ untrusted**. The protocol must guaran
   `v16_bpf_account_residual_reward_counter_caps_available_crystallized_loss`,
   `v16_bpf_account_residual_reward_counter_accumulates_across_batch_legs`,
   `v16_attack_account_residual_spent_above_crystallized_rejects_trade_without_mutation`.)
+- **Counter snapshots bind to a portfolio incarnation, not just its reusable account address.**
+  `InitPortfolio` assigns `portfolio_id` from the market's checked, monotonically increasing
+  `next_portfolio_id`. A distributor must archive `(market pubkey, portfolio pubkey, portfolio_id)`
+  together with its starting counters and require the same tuple before crystallization or claim;
+  counter deltas must use checked subtraction. Closing and recreating the same portfolio pubkey gets
+  a different ID, so a stale snapshot cannot authenticate the replacement account. IDs are local to
+  one market, so `portfolio_id` alone is not an identity. **✅**
+  (`v16_portfolio_incarnation_id_separates_close_and_reuse`.)
 
 ### Governance & admin keys
 - **Per-asset admin keys, isolated — uniform across all assets including asset 0** — one asset's admin
