@@ -12,14 +12,29 @@ A finding is a real LoF / DoS / CU issue only if it is reachable through the pub
 
 CU exhaustion by itself is not enough. On SVM, an error aborts and rolls back account changes. A CU probe is substantive only when it shows a user-facing progress failure, not merely that a badly chosen transaction burns compute and reverts.
 
-## Strict Security-Label Gate
+## Security Labels
 
-Use `REAL` or `PARTIAL` LoF/DoS labels only when the public LiteSVM red test demonstrates the security outcome itself.
+Every finding gets exactly one severity and one impact, written `[<SEVERITY> <IMPACT>]`.
 
-- LoF requires a normally initialized live market and net extractable loss borne by an independent user or canonical backing/provider. The attacker is either an unprivileged caller OR a compromised admin key acting beyond its reserved trusts (see Bounded Admin-Authority Requirement). Withdrawal of the caller's own isolated, domain-segregated reserve, the caller reclaiming its own fees, fair-price limit mismatches, harm that requires a dishonest oracle mark, and non-extractable rounding drift are correctness or hardening findings, not LoF.
-- DoS requires a publicly reachable state in which every bounded owner/keeper continuation fails despite one honest cranker supplying correct inputs. Batch-only rejection, blocked new admission, empty retired-slot reuse, a working public forfeit/escape path, next-slot recovery, and attacks that require the adversary to win ordering every slot are not persistent DoS.
-- `PARTIAL` still requires actual victim loss or actual persistent loss of progress; it describes bounded scope or materiality, not uncertainty about exploitability.
-- Before applying a security title, run the exploit against the exact pre-fix parent and the fixed head. State injection, prose-only reachability, or a green-only regression is insufficient.
+- SEVERITY is one of: `BLOCKER`, `PRIVILEGED`, `HARDENING`.
+- IMPACT is one of: `LoF` (loss of funds) or `DoS` (denial of service / fund-stranding).
+
+Six labels total: `[BLOCKER LoF]`, `[BLOCKER DoS]`, `[PRIVILEGED LoF]`, `[PRIVILEGED DoS]`, `[HARDENING LoF]`, `[HARDENING DoS]`. Do **not** use `REAL`, `PARTIAL`, or `DEFENDED`.
+
+### Severity
+
+- **BLOCKER** — an independent, non-signing party loses value or is denied progress, and it is reachable **even when the operator controls all admin keys and holds them safely**. Either an unprivileged public caller triggers it, or an unprivileged relayer replays an *honest* party's own signed transaction (the signer is honest; the attacker just re-submits public/pre-signed bytes — bounded by Solana's ~150-slot recent-blockhash TTL and legitimate address/slot reuse, but not preventable by key custody). Must fix before launch.
+- **PRIVILEGED** — the loss or DoS **only fires when a privileged admin key is malicious or compromised**, acting beyond its reserved trusts (see Bounded Admin-Authority Requirement): e.g. raising a mutable fee past a counterparty's signed consent, seizing an authority role without the holder's consent, or draining backing/insurance to a non-owner. Does not occur under honest, uncompromised keys; defense-in-depth against key compromise, not a launch blocker under an honest-key threat model.
+- **HARDENING** — no independent-victim value is at risk. The apparent exploit is self-inflicted (victim == signer, or a self-reclaim withdrawal that can only pay the signer's own account), reachable only via a host/test artifact (e.g. recreating a program-owned account at a reaped keyless address through `set_account`), dependent on a dishonest oracle mark, or non-extractable rounding drift. Robustness / liveness-UX only; never merged as a live loss.
+
+### Impact
+
+- **LoF** requires a normally initialized live market and net extractable loss borne by an independent user or canonical backing/provider — a party's withdrawable balance falls and someone else's rises, or funds leave canonical custody. Withdrawal of the caller's own isolated, domain-segregated reserve, the caller reclaiming its own fees, fair-price limit mismatches, harm that requires a dishonest oracle mark, and non-extractable rounding drift are `HARDENING`, not LoF.
+- **DoS** requires a publicly reachable state in which every bounded owner/keeper continuation fails despite one honest cranker supplying correct inputs (terminal Resolved, LockActive forever, unbounded-CU / unbounded-transaction wind-down). Fund-stranding is DoS even when no attacker profits. Batch-only rejection, blocked new admission, empty retired-slot reuse, a working public forfeit/escape path, next-slot recovery, and attacks that require the adversary to win ordering every slot are not persistent DoS.
+
+### Evidence gate
+
+Before applying a `BLOCKER` or `PRIVILEGED` label, run the exploit against the **exact pre-fix parent** and the **fixed head**. State injection, prose-only reachability, or a green-only regression is insufficient. If the red test relies on self-re-auth, self-reclaim, a host-artifact reinit, a dishonest oracle, or state injection, the finding is `HARDENING`. If it needs a compromised admin key, it is `PRIVILEGED`. Otherwise, with an independent victim and net-extractable loss or a no-escape DoS, it is `BLOCKER`.
 
 ## Bounded Admin-Authority Requirement
 
@@ -31,7 +46,7 @@ Reserved admin trusts (out of scope):
 - **Oracle authority.** Users accept the oracle as a separate, explicit trust. Honest oracle marks (within the circuit breaker) are ground truth. A finding whose harm *requires* a dishonest oracle mark is an oracle-trust issue tested separately, not counted here.
 - **Shutdown-with-exit.** Admin may shut down an asset or market, but every shutdown path must leave each affected user a bounded public path to close its position and withdraw its capital. Shutdown is the only admin power that may touch user liveness, and only because the user can still get out.
 
-In scope (real LoF / DoS, not merely "privileged hardening"):
+In scope as `PRIVILEGED` findings (a compromised admin key is a real, tracked threat — not merely "hardening" — but under the honest-key threat model these are defense-in-depth, not `BLOCKER`; a finding that additionally works with *no* admin-key compromise is `BLOCKER`):
 
 - Any admin action that moves a user's, or canonical backing/provider's, value to the admin or a third party — e.g. shutdown-cleanup misrouting, or draining backing/insurance to a payee other than its owner. Abandoned residuals must escheat to the canonical (asset-0) insurance fund like fees, never to the admin signer.
 - Any admin action, using a **non-oracle** power, that strands a user with no bounded public exit — *even if it requires an admin shutdown to set up*. "Requires a shutdown" is not a reachability downgrade under this model; shutdown-preserves-exit is exactly the property under test. A shutdown-created state whose only escape path is itself bricked is an in-scope DoS.
