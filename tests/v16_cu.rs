@@ -7,9 +7,14 @@ use percolator::{
 use percolator_prog::{
     constants::{
         ASSET_ORACLE_WRAPPER_LEN, MARKET_GROUP_OFF, MATCHER_ABI_VERSION, MATCHER_CONTEXT_MIN_LEN,
-        ORACLE_LEG_FLAG_DIVIDE_LEG2, ORACLE_LEG_FLAG_DIVIDE_LEG3, PORTFOLIO_ENGINE_ACCOUNT_LEN,
+        ORACLE_LEG_FLAG_DIVIDE_LEG2, ORACLE_LEG_FLAG_DIVIDE_LEG3, ORDER_AUTHORIZATION_STATE_ACTIVE,
+        ORDER_AUTHORIZATION_STATE_CONSUMED, ORDER_AUTHORIZATION_STATE_REVOKED,
+        ORDER_TRIGGER_AT_OR_ABOVE, ORDER_TRIGGER_AT_OR_BELOW, PORTFOLIO_ENGINE_ACCOUNT_LEN,
     },
-    ix::{BatchTradeCpiLeg, BatchTradeLeg, CrankObservationHint, Instruction as ProgInstruction},
+    ix::{
+        BatchTradeCpiLeg, BatchTradeLeg, CrankObservationHint, Instruction as ProgInstruction,
+        OrderAuthorizationBranch,
+    },
     oracle_v16, processor, state,
     state::{MarketGroupV16, PortfolioAccountV16},
 };
@@ -21,6 +26,7 @@ use solana_sdk::{
     program_option::COption,
     program_pack::Pack,
     pubkey::Pubkey,
+    rent::Rent,
     signature::{Keypair, Signer},
     system_instruction,
     transaction::Transaction,
@@ -33,6 +39,8 @@ const CUSTODY_CU_LIMIT: u64 = 300_000;
 const TRADE_CU_LIMIT: u64 = 345_000;
 const MULTI_ASSET_OPEN_TRADE_CU_LIMIT: u64 = 750_000;
 const MATCHER_CONTEXT_LEN: usize = 320;
+const AUTH_MATCHER_EXEC_PRICE_OFFSET: usize = 97;
+const AUTH_MATCHER_PARTIAL_FILL_OFFSET: usize = 105;
 
 fn crank_observations(asset_index: u16) -> Vec<CrankObservationHint> {
     vec![CrankObservationHint {
@@ -787,6 +795,21 @@ impl V16CuEnv {
 
     fn create_portfolio(&mut self, owner: &Keypair) -> Pubkey {
         self.create_portfolio_with_cu(owner).0
+    }
+
+    fn initialize_order_market_instance(&mut self, instance_id: u64) -> u64 {
+        send_tx(
+            &mut self.svm,
+            self.program_id,
+            &self.payer,
+            ProgInstruction::InitializeOrderMarketInstance { instance_id },
+            vec![
+                AccountMeta::new_readonly(self.admin.pubkey(), true),
+                AccountMeta::new(self.market, false),
+            ],
+            &[&self.admin],
+        )
+        .expect("initialize order market instance")
     }
 
     fn create_portfolio_with_cu(&mut self, owner: &Keypair) -> (Pubkey, u64) {
@@ -1995,6 +2018,29 @@ impl V16CuEnv {
         .expect("set matcher config")
     }
 
+    fn set_auth_matcher_exec_price(&mut self, matcher_context: Pubkey, exec_price: u64) {
+        let mut account = self
+            .svm
+            .get_account(&matcher_context)
+            .expect("auth matcher context");
+        account.data[AUTH_MATCHER_EXEC_PRICE_OFFSET..AUTH_MATCHER_EXEC_PRICE_OFFSET + 8]
+            .copy_from_slice(&exec_price.to_le_bytes());
+        self.svm
+            .set_account(matcher_context, account)
+            .expect("set auth matcher execution price");
+    }
+
+    fn set_auth_matcher_partial_fill(&mut self, matcher_context: Pubkey, partial_fill: bool) {
+        let mut account = self
+            .svm
+            .get_account(&matcher_context)
+            .expect("auth matcher context");
+        account.data[AUTH_MATCHER_PARTIAL_FILL_OFFSET] = u8::from(partial_fill);
+        self.svm
+            .set_account(matcher_context, account)
+            .expect("set auth matcher partial-fill mode");
+    }
+
     fn try_set_matcher_config(
         &mut self,
         matcher_program: Pubkey,
@@ -2164,6 +2210,177 @@ impl V16CuEnv {
             metas,
             &[owner_a],
         )
+    }
+
+    fn create_order_authorization(
+        &mut self,
+        owner: &Keypair,
+        portfolio: Pubkey,
+        delegate: &Keypair,
+        expiry_slot: u64,
+        branch_count: u8,
+        branches: [OrderAuthorizationBranch; 2],
+    ) -> Pubkey {
+        self.try_create_order_authorization(
+            owner,
+            portfolio,
+            delegate,
+            expiry_slot,
+            branch_count,
+            branches,
+        )
+        .expect("authorize order")
+    }
+
+    fn try_create_order_authorization(
+        &mut self,
+        owner: &Keypair,
+        portfolio: Pubkey,
+        delegate: &Keypair,
+        expiry_slot: u64,
+        branch_count: u8,
+        branches: [OrderAuthorizationBranch; 2],
+    ) -> Result<Pubkey, String> {
+        let authorization = Keypair::new();
+        self.ensure_signer_account(delegate.pubkey());
+        let authorization_lamports = self
+            .svm
+            .get_sysvar::<Rent>()
+            .minimum_balance(state::order_authorization_account_len());
+        send_raw_ixs(
+            &mut self.svm,
+            &self.payer,
+            vec![
+                system_instruction::create_account(
+                    &self.payer.pubkey(),
+                    &authorization.pubkey(),
+                    authorization_lamports,
+                    state::order_authorization_account_len() as u64,
+                    &self.program_id,
+                ),
+                Instruction {
+                    program_id: self.program_id,
+                    accounts: vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(self.market, false),
+                        AccountMeta::new(portfolio, false),
+                        AccountMeta::new(authorization.pubkey(), true),
+                    ],
+                    data: ProgInstruction::AuthorizeOrder {
+                        delegate: delegate.pubkey().to_bytes(),
+                        expiry_slot,
+                        branch_count,
+                        branches,
+                    }
+                    .encode(),
+                },
+            ],
+            &[owner, &authorization],
+        )?;
+        Ok(authorization.pubkey())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_authorize_existing_order_account(
+        &mut self,
+        owner: &Keypair,
+        portfolio: Pubkey,
+        delegate: &Keypair,
+        authorization: Pubkey,
+        authorization_signer: Option<&Keypair>,
+        expiry_slot: u64,
+        branch_count: u8,
+        branches: [OrderAuthorizationBranch; 2],
+    ) -> Result<u64, String> {
+        self.ensure_signer_account(delegate.pubkey());
+        let instruction = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new_readonly(owner.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(portfolio, false),
+                AccountMeta::new(authorization, authorization_signer.is_some()),
+            ],
+            data: ProgInstruction::AuthorizeOrder {
+                delegate: delegate.pubkey().to_bytes(),
+                expiry_slot,
+                branch_count,
+                branches,
+            }
+            .encode(),
+        };
+        match authorization_signer {
+            Some(signer) => send_raw_ixs(
+                &mut self.svm,
+                &self.payer,
+                vec![instruction],
+                &[owner, signer],
+            ),
+            None => send_raw_ixs(&mut self.svm, &self.payer, vec![instruction], &[owner]),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_execute_authorized_order(
+        &mut self,
+        delegate: &Keypair,
+        portfolio: Pubkey,
+        lp_portfolio: Pubkey,
+        matcher_program: Pubkey,
+        matcher_context: Pubkey,
+        matcher_delegate: Pubkey,
+        authorization: Pubkey,
+        branch_index: u8,
+    ) -> Result<u64, String> {
+        self.send(
+            ProgInstruction::ExecuteAuthorizedOrder { branch_index },
+            vec![
+                AccountMeta::new_readonly(delegate.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(portfolio, false),
+                AccountMeta::new(lp_portfolio, false),
+                AccountMeta::new_readonly(matcher_program, false),
+                AccountMeta::new(matcher_context, false),
+                AccountMeta::new_readonly(matcher_delegate, false),
+                AccountMeta::new(authorization, false),
+            ],
+            &[delegate],
+        )
+    }
+
+    fn revoke_order(&mut self, owner: &Keypair, authorization: Pubkey) -> Result<u64, String> {
+        self.send(
+            ProgInstruction::RevokeOrder,
+            vec![
+                AccountMeta::new_readonly(owner.pubkey(), true),
+                AccountMeta::new(authorization, false),
+            ],
+            &[owner],
+        )
+    }
+
+    fn close_order_authorization(
+        &mut self,
+        owner: &Keypair,
+        authorization: Pubkey,
+    ) -> Result<u64, String> {
+        self.send(
+            ProgInstruction::CloseOrderAuthorization,
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(authorization, false),
+                AccountMeta::new(owner.pubkey(), false),
+            ],
+            &[owner],
+        )
+    }
+
+    fn order_authorization_state(&self, authorization: Pubkey) -> state::OrderAuthorizationV16 {
+        let account = self
+            .svm
+            .get_account(&authorization)
+            .expect("order authorization account");
+        state::read_order_authorization(&account.data).expect("valid order authorization")
     }
 
     fn withdraw(&mut self, owner: &Keypair, portfolio: Pubkey, amount: u128) -> Pubkey {
@@ -3734,6 +3951,1083 @@ fn assert_cu_within(label: &str, cu: u64, limit: u64) {
         cu <= limit,
         "{label} consumed {cu} CU, above the {limit} CU guardrail"
     );
+}
+
+#[test]
+fn v16_bpf_scoped_order_authorization_is_exact_one_shot_and_oco() {
+    let mut env = V16CuEnv::new();
+    env.initialize_order_market_instance(0x1020_3040_5060_7080);
+    let matcher_program = Pubkey::new_unique();
+    let matcher_bytes = std::fs::read(auth_matcher_program_path()).expect("read auth matcher BPF");
+    env.svm.add_program(matcher_program, &matcher_bytes);
+
+    let owner = Keypair::new();
+    let lp_owner = Keypair::new();
+    let delegate = Keypair::new();
+    let wrong_delegate = Keypair::new();
+    let portfolio = env.create_portfolio(&owner);
+    let lp_portfolio = env.create_portfolio(&lp_owner);
+    env.deposit(&owner, portfolio, 1_000_000_000);
+    env.deposit(&lp_owner, lp_portfolio, 1_000_000_000);
+    let (matcher_context, matcher_delegate, _) =
+        env.init_auth_matcher_context(matcher_program, &lp_owner, lp_portfolio);
+
+    let order_size = (10 * POS_SCALE) as i128;
+    let asset_market_id = env.market_state().1.assets[0].market_id;
+    let open_branch = OrderAuthorizationBranch {
+        asset_index: 0,
+        asset_market_id,
+        size_q: order_size,
+        max_fee_bps: 100,
+        trigger_price_e6: 100,
+        limit_price_e6: 100,
+        trigger_condition: ORDER_TRIGGER_AT_OR_BELOW,
+        reduce_only: 0,
+    };
+    let unsigned_blank_authorization = Pubkey::new_unique();
+    let blank_account = Account {
+        lamports: 777_777_777,
+        data: vec![0u8; state::order_authorization_account_len()],
+        owner: env.program_id,
+        executable: false,
+        rent_epoch: 0,
+    };
+    env.svm
+        .set_account(unsigned_blank_authorization, blank_account.clone())
+        .unwrap();
+    assert!(
+        env.try_authorize_existing_order_account(
+            &owner,
+            portfolio,
+            &delegate,
+            unsigned_blank_authorization,
+            None,
+            100,
+            1,
+            [open_branch, OrderAuthorizationBranch::default()],
+        )
+        .is_err(),
+        "an unsigned pre-existing program account must not be capturable"
+    );
+    let blank_after = env
+        .svm
+        .get_account(&unsigned_blank_authorization)
+        .expect("blank authorization account remains");
+    assert_eq!(blank_after.lamports, blank_account.lamports);
+    assert_eq!(blank_after.owner, blank_account.owner);
+    assert_eq!(blank_after.data, blank_account.data);
+
+    for (label, data) in [
+        (
+            "oversized",
+            vec![0u8; state::order_authorization_account_len() + 1],
+        ),
+        ("nonzero", {
+            let mut data = vec![0u8; state::order_authorization_account_len()];
+            data[17] = 1;
+            data
+        }),
+    ] {
+        let malformed_authorization = Keypair::new();
+        env.svm
+            .set_account(
+                malformed_authorization.pubkey(),
+                Account {
+                    lamports: 888_888_888,
+                    data,
+                    owner: env.program_id,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        assert!(
+            env.try_authorize_existing_order_account(
+                &owner,
+                portfolio,
+                &delegate,
+                malformed_authorization.pubkey(),
+                Some(&malformed_authorization),
+                100,
+                1,
+                [open_branch, OrderAuthorizationBranch::default()],
+            )
+            .is_err(),
+            "{label} authorization storage must be rejected"
+        );
+    }
+    let authorization = env.create_order_authorization(
+        &owner,
+        portfolio,
+        &delegate,
+        100,
+        1,
+        [open_branch, OrderAuthorizationBranch::default()],
+    );
+    assert_eq!(
+        env.order_authorization_state(authorization).state,
+        ORDER_AUTHORIZATION_STATE_ACTIVE
+    );
+    let authorization_account = env
+        .svm
+        .get_account(&authorization)
+        .expect("system-created authorization account");
+    assert_eq!(authorization_account.owner, env.program_id);
+    assert_eq!(
+        authorization_account.data.len(),
+        state::order_authorization_account_len()
+    );
+
+    env.ensure_signer_account(wrong_delegate.pubkey());
+    assert!(
+        env.try_execute_authorized_order(
+            &wrong_delegate,
+            portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            authorization,
+            0,
+        )
+        .is_err(),
+        "a different executor must not exercise the owner's scoped order"
+    );
+    assert_eq!(
+        env.order_authorization_state(authorization).state,
+        ORDER_AUTHORIZATION_STATE_ACTIVE
+    );
+    let wrong_portfolio = env.create_portfolio(&owner);
+    assert!(
+        env.try_execute_authorized_order(
+            &delegate,
+            wrong_portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            authorization,
+            0,
+        )
+        .is_err(),
+        "the executor cannot redirect an authorization to another owner portfolio"
+    );
+
+    let untriggered = env.create_order_authorization(
+        &owner,
+        portfolio,
+        &delegate,
+        100,
+        1,
+        [
+            OrderAuthorizationBranch {
+                trigger_price_e6: 90,
+                limit_price_e6: 90,
+                ..open_branch
+            },
+            OrderAuthorizationBranch::default(),
+        ],
+    );
+    assert!(
+        env.try_execute_authorized_order(
+            &delegate,
+            portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            untriggered,
+            0,
+        )
+        .is_err(),
+        "the executor cannot bypass the signed trigger"
+    );
+    assert_eq!(
+        env.order_authorization_state(untriggered).state,
+        ORDER_AUTHORIZATION_STATE_ACTIVE
+    );
+    assert!(
+        env.revoke_order(&wrong_delegate, untriggered).is_err(),
+        "only the portfolio owner may revoke an authorization"
+    );
+    assert_eq!(
+        env.order_authorization_state(untriggered).state,
+        ORDER_AUTHORIZATION_STATE_ACTIVE
+    );
+
+    let close_active = env.create_order_authorization(
+        &owner,
+        portfolio,
+        &delegate,
+        100,
+        1,
+        [open_branch, OrderAuthorizationBranch::default()],
+    );
+    assert!(
+        env.close_order_authorization(&wrong_delegate, close_active)
+            .is_err(),
+        "only the portfolio owner may close an authorization account"
+    );
+    let close_lamports = env.svm.get_account(&close_active).unwrap().lamports;
+    let owner_lamports_before = env.svm.get_account(&owner.pubkey()).unwrap().lamports;
+    env.close_order_authorization(&owner, close_active)
+        .expect("owner closes active authorization as cancellation");
+    assert_eq!(
+        env.svm.get_account(&owner.pubkey()).unwrap().lamports,
+        owner_lamports_before + close_lamports,
+        "closing returns exactly the authorization account rent to its owner"
+    );
+    assert!(
+        env.svm
+            .get_account(&close_active)
+            .is_none_or(|account| account.lamports == 0 && account.data.is_empty()),
+        "closed authorization account must no longer retain data or lamports"
+    );
+
+    let authorized_trade_cu = env
+        .try_execute_authorized_order(
+            &delegate,
+            portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            authorization,
+            0,
+        )
+        .expect("execute exact authorized limit order");
+    assert_cu_within(
+        "ExecuteAuthorizedOrder",
+        authorized_trade_cu,
+        TRADE_CU_LIMIT,
+    );
+    assert_eq!(
+        env.order_authorization_state(authorization).state,
+        ORDER_AUTHORIZATION_STATE_CONSUMED
+    );
+    assert!(has_active_leg_for_asset(&env.portfolio_state(portfolio), 0));
+    assert!(
+        env.try_execute_authorized_order(
+            &delegate,
+            portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            authorization,
+            0,
+        )
+        .is_err(),
+        "a consumed authorization must not replay"
+    );
+
+    let oco = env.create_order_authorization(
+        &owner,
+        portfolio,
+        &delegate,
+        100,
+        2,
+        [
+            OrderAuthorizationBranch {
+                asset_index: 0,
+                asset_market_id,
+                size_q: -order_size,
+                max_fee_bps: 100,
+                trigger_price_e6: 100,
+                limit_price_e6: 100,
+                trigger_condition: ORDER_TRIGGER_AT_OR_ABOVE,
+                reduce_only: 1,
+            },
+            OrderAuthorizationBranch {
+                asset_index: 0,
+                asset_market_id,
+                size_q: -order_size,
+                max_fee_bps: 100,
+                trigger_price_e6: 90,
+                limit_price_e6: 85,
+                trigger_condition: ORDER_TRIGGER_AT_OR_BELOW,
+                reduce_only: 1,
+            },
+        ],
+    );
+    env.try_execute_authorized_order(
+        &delegate,
+        portfolio,
+        lp_portfolio,
+        matcher_program,
+        matcher_context,
+        matcher_delegate,
+        oco,
+        0,
+    )
+    .expect("execute triggered TP branch");
+    let oco_after = env.order_authorization_state(oco);
+    assert_eq!(oco_after.state, ORDER_AUTHORIZATION_STATE_CONSUMED);
+    assert_eq!(oco_after.active_mask, 0);
+    assert!(
+        env.try_execute_authorized_order(
+            &delegate,
+            portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            oco,
+            1,
+        )
+        .is_err(),
+        "one OCO fill must atomically invalidate its sibling"
+    );
+
+    let revoked = env.create_order_authorization(
+        &owner,
+        portfolio,
+        &delegate,
+        100,
+        1,
+        [open_branch, OrderAuthorizationBranch::default()],
+    );
+    env.revoke_order(&owner, revoked)
+        .expect("owner revokes order");
+    assert_eq!(
+        env.order_authorization_state(revoked).state,
+        ORDER_AUTHORIZATION_STATE_REVOKED
+    );
+    assert!(
+        env.try_execute_authorized_order(
+            &delegate,
+            portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            revoked,
+            0,
+        )
+        .is_err(),
+        "revocation must be terminal"
+    );
+
+    let overlapping_oco = env.try_create_order_authorization(
+        &owner,
+        portfolio,
+        &delegate,
+        100,
+        2,
+        [
+            OrderAuthorizationBranch {
+                asset_index: 0,
+                asset_market_id,
+                size_q: order_size,
+                max_fee_bps: 100,
+                trigger_price_e6: 110,
+                limit_price_e6: 110,
+                trigger_condition: ORDER_TRIGGER_AT_OR_BELOW,
+                reduce_only: 1,
+            },
+            OrderAuthorizationBranch {
+                asset_index: 0,
+                asset_market_id,
+                size_q: order_size,
+                max_fee_bps: 100,
+                trigger_price_e6: 100,
+                limit_price_e6: 100,
+                trigger_condition: ORDER_TRIGGER_AT_OR_ABOVE,
+                reduce_only: 1,
+            },
+        ],
+    );
+    assert!(
+        overlapping_oco.is_err(),
+        "OCO trigger ranges must not overlap and let the executor choose either branch"
+    );
+
+    let current_slot = env.svm.get_sysvar::<Clock>().slot;
+    let at_expiry = env.create_order_authorization(
+        &owner,
+        portfolio,
+        &delegate,
+        current_slot + 1,
+        1,
+        [open_branch, OrderAuthorizationBranch::default()],
+    );
+    let expiring = env.create_order_authorization(
+        &owner,
+        portfolio,
+        &delegate,
+        current_slot + 1,
+        1,
+        [open_branch, OrderAuthorizationBranch::default()],
+    );
+    env.svm.warp_to_slot(current_slot + 1);
+    env.try_execute_authorized_order(
+        &delegate,
+        portfolio,
+        lp_portfolio,
+        matcher_program,
+        matcher_context,
+        matcher_delegate,
+        at_expiry,
+        0,
+    )
+    .expect("authorization remains valid through its inclusive expiry slot");
+    assert_eq!(
+        env.order_authorization_state(at_expiry).state,
+        ORDER_AUTHORIZATION_STATE_CONSUMED
+    );
+    env.svm.warp_to_slot(current_slot + 2);
+    let expired_error = env
+        .try_execute_authorized_order(
+            &delegate,
+            portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            expiring,
+            0,
+        )
+        .expect_err("expired authorization must fail");
+    assert!(
+        expired_error.contains("Custom(8)") || expired_error.contains("custom program error: 0x8"),
+        "expiry must fail at the authorization gate, got {expired_error}"
+    );
+    assert_eq!(
+        env.order_authorization_state(expiring).state,
+        ORDER_AUTHORIZATION_STATE_ACTIVE,
+        "expiry must not mutate the signed authorization record"
+    );
+}
+
+#[test]
+fn v16_bpf_scoped_order_enforces_engine_price_and_total_fee_caps() {
+    let mut env = V16CuEnv::new();
+    env.initialize_order_market_instance(0x1122_3344_5566_7788);
+    let matcher_program = Pubkey::new_unique();
+    let matcher_bytes = std::fs::read(auth_matcher_program_path()).expect("read auth matcher BPF");
+    env.svm.add_program(matcher_program, &matcher_bytes);
+
+    let owner = Keypair::new();
+    let lp_owner = Keypair::new();
+    let delegate = Keypair::new();
+    let portfolio = env.create_portfolio(&owner);
+    let lp_portfolio = env.create_portfolio(&lp_owner);
+    env.deposit(&owner, portfolio, 1_000_000_000);
+    env.deposit(&lp_owner, lp_portfolio, 2_000_000_000);
+    let (matcher_context, matcher_delegate, _) =
+        env.init_auth_matcher_context(matcher_program, &lp_owner, lp_portfolio);
+    let order_size = (10 * POS_SCALE) as i128;
+    let asset_market_id = env.market_state().1.assets[0].market_id;
+
+    let fee_capped = env.create_order_authorization(
+        &owner,
+        portfolio,
+        &delegate,
+        100,
+        1,
+        [
+            OrderAuthorizationBranch {
+                asset_index: 0,
+                asset_market_id,
+                size_q: order_size,
+                max_fee_bps: 50,
+                trigger_price_e6: 100,
+                limit_price_e6: 100,
+                trigger_condition: ORDER_TRIGGER_AT_OR_BELOW,
+                reduce_only: 0,
+            },
+            OrderAuthorizationBranch::default(),
+        ],
+    );
+    env.update_trade_fee_policy_with_cu(51);
+    let fee_market_before = env
+        .svm
+        .get_account(&env.market)
+        .expect("market before fee rejection");
+    let fee_portfolio_before = env
+        .svm
+        .get_account(&portfolio)
+        .expect("portfolio before fee rejection");
+    assert!(
+        env.try_execute_authorized_order(
+            &delegate,
+            portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            fee_capped,
+            0,
+        )
+        .is_err(),
+        "a mutable base fee above the owner's signed maximum must reject"
+    );
+    assert_eq!(
+        env.order_authorization_state(fee_capped).state,
+        ORDER_AUTHORIZATION_STATE_ACTIVE
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap().data,
+        fee_market_before.data,
+        "fee-cap rejection must roll back matcher request sequence and market state"
+    );
+    assert_eq!(
+        env.svm.get_account(&portfolio).unwrap().data,
+        fee_portfolio_before.data,
+        "fee-cap rejection must not change the portfolio"
+    );
+
+    env.update_trade_fee_policy_with_cu(50);
+    env.svm.expire_blockhash();
+    env.try_execute_authorized_order(
+        &delegate,
+        portfolio,
+        lp_portfolio,
+        matcher_program,
+        matcher_context,
+        matcher_delegate,
+        fee_capped,
+        0,
+    )
+    .expect("fee exactly at the signed maximum");
+    assert_eq!(
+        env.order_authorization_state(fee_capped).state,
+        ORDER_AUTHORIZATION_STATE_CONSUMED
+    );
+
+    let price_owner = Keypair::new();
+    let price_portfolio = env.create_portfolio(&price_owner);
+    env.deposit(&price_owner, price_portfolio, 1_000_000_000);
+
+    env.set_auth_matcher_exec_price(matcher_context, 90);
+    let buy_gap = env.create_order_authorization(
+        &price_owner,
+        price_portfolio,
+        &delegate,
+        100,
+        1,
+        [
+            OrderAuthorizationBranch {
+                asset_index: 0,
+                asset_market_id,
+                size_q: order_size,
+                max_fee_bps: 100,
+                trigger_price_e6: 90,
+                limit_price_e6: 95,
+                trigger_condition: ORDER_TRIGGER_AT_OR_ABOVE,
+                reduce_only: 0,
+            },
+            OrderAuthorizationBranch::default(),
+        ],
+    );
+    let buy_market_before = env.svm.get_account(&env.market).unwrap();
+    let buy_portfolio_before = env.svm.get_account(&price_portfolio).unwrap();
+    assert!(
+        env.try_execute_authorized_order(
+            &delegate,
+            price_portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            buy_gap,
+            0,
+        )
+        .is_err(),
+        "a matcher buy quote inside the limit must reject when the engine price is above it"
+    );
+    assert_eq!(
+        env.order_authorization_state(buy_gap).state,
+        ORDER_AUTHORIZATION_STATE_ACTIVE
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap().data,
+        buy_market_before.data
+    );
+    assert_eq!(
+        env.svm.get_account(&price_portfolio).unwrap().data,
+        buy_portfolio_before.data
+    );
+
+    env.set_auth_matcher_exec_price(matcher_context, 110);
+    let sell_gap = env.create_order_authorization(
+        &price_owner,
+        price_portfolio,
+        &delegate,
+        100,
+        1,
+        [
+            OrderAuthorizationBranch {
+                asset_index: 0,
+                asset_market_id,
+                size_q: -order_size,
+                max_fee_bps: 100,
+                trigger_price_e6: 110,
+                limit_price_e6: 105,
+                trigger_condition: ORDER_TRIGGER_AT_OR_BELOW,
+                reduce_only: 0,
+            },
+            OrderAuthorizationBranch::default(),
+        ],
+    );
+    assert!(
+        env.try_execute_authorized_order(
+            &delegate,
+            price_portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            sell_gap,
+            0,
+        )
+        .is_err(),
+        "a matcher sell quote inside the limit must reject when the engine price is below it"
+    );
+    assert_eq!(
+        env.order_authorization_state(sell_gap).state,
+        ORDER_AUTHORIZATION_STATE_ACTIVE
+    );
+
+    env.set_auth_matcher_exec_price(matcher_context, 0);
+    env.set_auth_matcher_partial_fill(matcher_context, true);
+    let partial = env.create_order_authorization(
+        &price_owner,
+        price_portfolio,
+        &delegate,
+        100,
+        1,
+        [
+            OrderAuthorizationBranch {
+                asset_index: 0,
+                asset_market_id,
+                size_q: order_size,
+                max_fee_bps: 100,
+                trigger_price_e6: 100,
+                limit_price_e6: 100,
+                trigger_condition: ORDER_TRIGGER_AT_OR_BELOW,
+                reduce_only: 0,
+            },
+            OrderAuthorizationBranch::default(),
+        ],
+    );
+    let partial_portfolio_before = env.svm.get_account(&price_portfolio).unwrap();
+    assert!(
+        env.try_execute_authorized_order(
+            &delegate,
+            price_portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            partial,
+            0,
+        )
+        .is_err(),
+        "delegated orders are full-fill-only so an OCO sibling cannot be dropped after a partial"
+    );
+    assert_eq!(
+        env.order_authorization_state(partial).state,
+        ORDER_AUTHORIZATION_STATE_ACTIVE
+    );
+    assert_eq!(
+        env.svm.get_account(&price_portfolio).unwrap().data,
+        partial_portfolio_before.data
+    );
+}
+
+#[test]
+fn v16_bpf_scoped_order_rejects_reused_asset_generation() {
+    let mut env = V16CuEnv::new();
+    env.initialize_order_market_instance(0x2100_0000_0000_0001);
+    env.activate_asset(1, 1, 100);
+
+    let matcher_program = Pubkey::new_unique();
+    let matcher_bytes = std::fs::read(auth_matcher_program_path()).expect("read auth matcher BPF");
+    env.svm.add_program(matcher_program, &matcher_bytes);
+    let owner = Keypair::new();
+    let lp_owner = Keypair::new();
+    let delegate = Keypair::new();
+    let portfolio = env.create_portfolio(&owner);
+    let lp_portfolio = env.create_portfolio(&lp_owner);
+    env.deposit(&owner, portfolio, 1_000_000_000);
+    env.deposit(&lp_owner, lp_portfolio, 1_000_000_000);
+    let (matcher_context, matcher_delegate, _) =
+        env.init_auth_matcher_context(matcher_program, &lp_owner, lp_portfolio);
+
+    let old_market_id = env.market_state().1.assets[1].market_id;
+    let order_size = (10 * POS_SCALE) as i128;
+    let old_branch = OrderAuthorizationBranch {
+        asset_index: 1,
+        asset_market_id: old_market_id,
+        size_q: order_size,
+        max_fee_bps: 100,
+        trigger_price_e6: 300,
+        limit_price_e6: 300,
+        trigger_condition: ORDER_TRIGGER_AT_OR_BELOW,
+        reduce_only: 0,
+    };
+    let old_authorization = env.create_order_authorization(
+        &owner,
+        portfolio,
+        &delegate,
+        100,
+        1,
+        [old_branch, OrderAuthorizationBranch::default()],
+    );
+
+    env.update_asset_lifecycle_as_admin_with_cu(
+        percolator_prog::processor::ASSET_ACTION_RETIRE,
+        1,
+        2,
+        0,
+    );
+    env.activate_asset(1, 3, 250);
+    let new_market_id = env.market_state().1.assets[1].market_id;
+    assert!(
+        new_market_id > old_market_id,
+        "reused asset slot must carry a new market generation"
+    );
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let portfolio_before = env.svm.get_account(&portfolio).unwrap();
+    let lp_before = env.svm.get_account(&lp_portfolio).unwrap();
+    let matcher_before = env.svm.get_account(&matcher_context).unwrap();
+    assert!(
+        env.try_execute_authorized_order(
+            &delegate,
+            portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            old_authorization,
+            0,
+        )
+        .is_err(),
+        "an old order must not follow a reused asset index into a replacement market"
+    );
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(env.svm.get_account(&portfolio).unwrap(), portfolio_before);
+    assert_eq!(env.svm.get_account(&lp_portfolio).unwrap(), lp_before);
+    assert_eq!(
+        env.svm.get_account(&matcher_context).unwrap(),
+        matcher_before
+    );
+    assert_eq!(
+        env.order_authorization_state(old_authorization).state,
+        ORDER_AUTHORIZATION_STATE_ACTIVE
+    );
+
+    let fresh_branch = OrderAuthorizationBranch {
+        asset_market_id: new_market_id,
+        ..old_branch
+    };
+    let fresh_authorization = env.create_order_authorization(
+        &owner,
+        portfolio,
+        &delegate,
+        100,
+        1,
+        [fresh_branch, OrderAuthorizationBranch::default()],
+    );
+    env.try_execute_authorized_order(
+        &delegate,
+        portfolio,
+        lp_portfolio,
+        matcher_program,
+        matcher_context,
+        matcher_delegate,
+        fresh_authorization,
+        0,
+    )
+    .expect("replacement asset accepts only a freshly scoped authorization");
+    assert_eq!(
+        env.order_authorization_state(fresh_authorization).state,
+        ORDER_AUTHORIZATION_STATE_CONSUMED
+    );
+}
+
+#[test]
+fn v16_bpf_scoped_order_rejects_recreated_portfolio_incarnation() {
+    let mut env = V16CuEnv::new();
+    env.initialize_order_market_instance(0x2200_0000_0000_0001);
+    let matcher_program = Pubkey::new_unique();
+    let matcher_bytes = std::fs::read(auth_matcher_program_path()).expect("read auth matcher BPF");
+    env.svm.add_program(matcher_program, &matcher_bytes);
+
+    let owner = Keypair::new();
+    let delegate = Keypair::new();
+    let portfolio = env.create_portfolio(&owner);
+    let asset_market_id = env.market_state().1.assets[0].market_id;
+    let branch = OrderAuthorizationBranch {
+        asset_index: 0,
+        asset_market_id,
+        size_q: (10 * POS_SCALE) as i128,
+        max_fee_bps: 100,
+        trigger_price_e6: 100,
+        limit_price_e6: 100,
+        trigger_condition: ORDER_TRIGGER_AT_OR_BELOW,
+        reduce_only: 0,
+    };
+    let old_authorization = env.create_order_authorization(
+        &owner,
+        portfolio,
+        &delegate,
+        100,
+        1,
+        [branch, OrderAuthorizationBranch::default()],
+    );
+    let old_instance = env
+        .order_authorization_state(old_authorization)
+        .portfolio_instance_id;
+    env.close_portfolio_with_cu(&owner, portfolio);
+
+    env.svm
+        .set_account(
+            portfolio,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; env.portfolio_account_len],
+                owner: env.program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::InitPortfolio,
+        vec![
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(portfolio, false),
+        ],
+        &[&owner],
+    )
+    .expect("reinitialize the exact same portfolio address");
+    let fresh_authorization = env.create_order_authorization(
+        &owner,
+        portfolio,
+        &delegate,
+        100,
+        1,
+        [branch, OrderAuthorizationBranch::default()],
+    );
+    let fresh_instance = env
+        .order_authorization_state(fresh_authorization)
+        .portfolio_instance_id;
+    assert_ne!(
+        fresh_instance, old_instance,
+        "portfolio close/recreate must allocate a new incarnation"
+    );
+
+    let lp_owner = Keypair::new();
+    let lp_portfolio = env.create_portfolio(&lp_owner);
+    env.deposit(&owner, portfolio, 1_000_000_000);
+    env.deposit(&lp_owner, lp_portfolio, 1_000_000_000);
+    let (matcher_context, matcher_delegate, _) =
+        env.init_auth_matcher_context(matcher_program, &lp_owner, lp_portfolio);
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let portfolio_before = env.svm.get_account(&portfolio).unwrap();
+    let matcher_before = env.svm.get_account(&matcher_context).unwrap();
+    assert!(
+        env.try_execute_authorized_order(
+            &delegate,
+            portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            old_authorization,
+            0,
+        )
+        .is_err(),
+        "an old authorization must not trade a recreated portfolio at the same address"
+    );
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(env.svm.get_account(&portfolio).unwrap(), portfolio_before);
+    assert_eq!(
+        env.svm.get_account(&matcher_context).unwrap(),
+        matcher_before
+    );
+    assert_eq!(
+        env.order_authorization_state(old_authorization).state,
+        ORDER_AUTHORIZATION_STATE_ACTIVE
+    );
+    env.try_execute_authorized_order(
+        &delegate,
+        portfolio,
+        lp_portfolio,
+        matcher_program,
+        matcher_context,
+        matcher_delegate,
+        fresh_authorization,
+        0,
+    )
+    .expect("fresh portfolio incarnation accepts its fresh authorization");
+}
+
+#[test]
+fn v16_bpf_scoped_order_rejects_recreated_market_incarnation() {
+    let mut env = V16CuEnv::new();
+    let old_market_instance = 0x2300_0000_0000_0001;
+    let new_market_instance = 0x2300_0000_0000_0002;
+    env.initialize_order_market_instance(old_market_instance);
+    let owner = Keypair::new();
+    let delegate = Keypair::new();
+    let portfolio = env.create_portfolio(&owner);
+    let branch = OrderAuthorizationBranch {
+        asset_index: 0,
+        asset_market_id: env.market_state().1.assets[0].market_id,
+        size_q: (10 * POS_SCALE) as i128,
+        max_fee_bps: 100,
+        trigger_price_e6: 100,
+        limit_price_e6: 100,
+        trigger_condition: ORDER_TRIGGER_AT_OR_BELOW,
+        reduce_only: 0,
+    };
+    let old_authorization = env.create_order_authorization(
+        &owner,
+        portfolio,
+        &delegate,
+        100,
+        1,
+        [branch, OrderAuthorizationBranch::default()],
+    );
+    assert_eq!(
+        env.order_authorization_state(old_authorization)
+            .market_instance_id,
+        old_market_instance
+    );
+    env.close_portfolio_with_cu(&owner, portfolio);
+    let market_len = env.svm.get_account(&env.market).unwrap().data.len();
+    env.resolve();
+    env.close_slab_with_cu();
+
+    env.svm
+        .set_account(
+            env.market,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; market_len],
+                owner: env.program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    env.svm
+        .set_account(
+            env.vault,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, env.vault_authority, 0),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    let params = V16CuMarketParams::default();
+    let admin = env.admin.insecure_clone();
+    env.svm.expire_blockhash();
+    env.send(
+        init_market_instruction(&params),
+        vec![
+            AccountMeta::new(env.admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new_readonly(env.mint, false),
+        ],
+        &[&admin],
+    )
+    .expect("reinitialize the exact same market address");
+    env.initialize_order_market_instance(new_market_instance);
+
+    env.svm
+        .set_account(
+            portfolio,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; env.portfolio_account_len],
+                owner: env.program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::InitPortfolio,
+        vec![
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(portfolio, false),
+        ],
+        &[&owner],
+    )
+    .expect("reinitialize portfolio in the replacement market");
+    let fresh_authorization = env.create_order_authorization(
+        &owner,
+        portfolio,
+        &delegate,
+        100,
+        1,
+        [branch, OrderAuthorizationBranch::default()],
+    );
+    assert_eq!(
+        env.order_authorization_state(fresh_authorization)
+            .market_instance_id,
+        new_market_instance
+    );
+
+    let matcher_program = Pubkey::new_unique();
+    let matcher_bytes = std::fs::read(auth_matcher_program_path()).expect("read auth matcher BPF");
+    env.svm.add_program(matcher_program, &matcher_bytes);
+    let lp_owner = Keypair::new();
+    let lp_portfolio = env.create_portfolio(&lp_owner);
+    env.deposit(&owner, portfolio, 1_000_000_000);
+    env.deposit(&lp_owner, lp_portfolio, 1_000_000_000);
+    let (matcher_context, matcher_delegate, _) =
+        env.init_auth_matcher_context(matcher_program, &lp_owner, lp_portfolio);
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let portfolio_before = env.svm.get_account(&portfolio).unwrap();
+    let matcher_before = env.svm.get_account(&matcher_context).unwrap();
+    assert!(
+        env.try_execute_authorized_order(
+            &delegate,
+            portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            old_authorization,
+            0,
+        )
+        .is_err(),
+        "an old authorization must not revive after full market reincarnation"
+    );
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(env.svm.get_account(&portfolio).unwrap(), portfolio_before);
+    assert_eq!(
+        env.svm.get_account(&matcher_context).unwrap(),
+        matcher_before
+    );
+    assert_eq!(
+        env.order_authorization_state(old_authorization).state,
+        ORDER_AUTHORIZATION_STATE_ACTIVE
+    );
+    env.try_execute_authorized_order(
+        &delegate,
+        portfolio,
+        lp_portfolio,
+        matcher_program,
+        matcher_context,
+        matcher_delegate,
+        fresh_authorization,
+        0,
+    )
+    .expect("replacement market accepts only its fresh authorization");
 }
 
 #[test]

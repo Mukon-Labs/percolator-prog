@@ -26,6 +26,7 @@ use solana_program::{
     program_error::ProgramError,
     program_pack::Pack,
     pubkey::Pubkey,
+    system_program,
     sysvar::Sysvar,
 };
 
@@ -44,6 +45,7 @@ pub mod constants {
     pub const KIND_PORTFOLIO: u8 = 2;
     pub const KIND_BACKING_DOMAIN_LEDGER: u8 = 3;
     pub const KIND_INSURANCE_LEDGER: u8 = 4;
+    pub const KIND_ORDER_AUTHORIZATION: u8 = 5;
 
     pub const HEADER_LEN: usize = 16;
     pub const WRAPPER_CONFIG_LEN: usize = 448;
@@ -65,6 +67,12 @@ pub mod constants {
     pub const PORTFOLIO_MATCHER_CONFIG_LEN: usize = 104;
     pub const PORTFOLIO_ACCOUNT_LEN: usize =
         PORTFOLIO_ENGINE_ACCOUNT_LEN + PORTFOLIO_MATCHER_CONFIG_LEN;
+    pub const ORDER_AUTHORIZATION_BRANCH_CAP: usize = 2;
+    pub const ORDER_AUTHORIZATION_STATE_ACTIVE: u8 = 1;
+    pub const ORDER_AUTHORIZATION_STATE_CONSUMED: u8 = 2;
+    pub const ORDER_AUTHORIZATION_STATE_REVOKED: u8 = 3;
+    pub const ORDER_TRIGGER_AT_OR_BELOW: u8 = 0;
+    pub const ORDER_TRIGGER_AT_OR_ABOVE: u8 = 1;
     pub const MAX_MATCHER_TAIL_ACCOUNTS: usize = 32;
     pub const MATCHER_ABI_VERSION: u32 = 3;
     pub const MATCHER_CONTEXT_MIN_LEN: usize = 64;
@@ -155,12 +163,13 @@ pub mod state {
     use crate::{
         constants::{
             ASSET_ORACLE_PROFILE_LEN, ASSET_ORACLE_WRAPPER_LEN, HEADER_LEN,
-            KIND_BACKING_DOMAIN_LEDGER, KIND_INSURANCE_LEDGER, KIND_MARKET, KIND_PORTFOLIO, MAGIC,
-            MARKET_GROUP_LEN, MARKET_GROUP_OFF, MIN_MARKET_ACCOUNT_LEN, ORACLE_LEG_CAP,
-            ORACLE_LEG_FLAGS_MASK, ORACLE_MODE_AUTH_MARK, ORACLE_MODE_EWMA_MARK,
-            ORACLE_MODE_HYBRID_AFTER_HOURS, ORACLE_MODE_MANUAL, PORTFOLIO_ACCOUNT_LEN,
-            PORTFOLIO_ENGINE_ACCOUNT_LEN, PORTFOLIO_MATCHER_CONFIG_LEN,
-            PORTFOLIO_MATCHER_CONFIG_OFF, PORTFOLIO_STATE_LEN, VERSION, WRAPPER_CONFIG_LEN,
+            KIND_BACKING_DOMAIN_LEDGER, KIND_INSURANCE_LEDGER, KIND_MARKET,
+            KIND_ORDER_AUTHORIZATION, KIND_PORTFOLIO, MAGIC, MARKET_GROUP_LEN, MARKET_GROUP_OFF,
+            MIN_MARKET_ACCOUNT_LEN, ORACLE_LEG_CAP, ORACLE_LEG_FLAGS_MASK, ORACLE_MODE_AUTH_MARK,
+            ORACLE_MODE_EWMA_MARK, ORACLE_MODE_HYBRID_AFTER_HOURS, ORACLE_MODE_MANUAL,
+            ORDER_AUTHORIZATION_BRANCH_CAP, PORTFOLIO_ACCOUNT_LEN, PORTFOLIO_ENGINE_ACCOUNT_LEN,
+            PORTFOLIO_MATCHER_CONFIG_LEN, PORTFOLIO_MATCHER_CONFIG_OFF, PORTFOLIO_STATE_LEN,
+            VERSION, WRAPPER_CONFIG_LEN,
         },
         error::PercolatorError,
     };
@@ -548,7 +557,10 @@ pub mod state {
         pub backing_trade_fee_insurance_share_bps_short: u16,
         pub fee_redirect_to_market_0_bps: u16,
         pub matcher_req_seq: u64,
-        pub _padding1: [u8; 8],
+        /// Non-zero, authority-selected identifier for one initialized slab incarnation. It is
+        /// deliberately not inferred from the market pubkey because CloseSlab permits the same
+        /// account address to be initialized again.
+        pub order_market_instance_id: u64,
     }
 
     #[repr(C)]
@@ -654,7 +666,79 @@ pub mod state {
         pub matcher_program: [u8; 32],
         pub matcher_context: [u8; 32],
         pub matcher_delegate: [u8; 32],
+        /// Bit 0 is the matcher-enabled flag. Bits 1..63 are a wrapper-owned portfolio
+        /// incarnation id allocated from the market's monotonic request sequence. Packing the
+        /// fields preserves the deployed 104-byte matcher-config tail while making stale order
+        /// authorizations fail after ClosePortfolio + InitPortfolio at the same address.
         pub enabled: u64,
+    }
+
+    impl PortfolioMatcherConfigV16 {
+        const ENABLED_MASK: u64 = 1;
+
+        pub fn matcher_enabled(self) -> bool {
+            self.enabled & Self::ENABLED_MASK != 0
+        }
+
+        pub fn portfolio_instance_id(self) -> u64 {
+            self.enabled >> 1
+        }
+
+        pub fn set_matcher_enabled(&mut self, enabled: bool) {
+            self.enabled = (self.enabled & !Self::ENABLED_MASK) | u64::from(enabled);
+        }
+
+        pub fn set_portfolio_instance_id(
+            &mut self,
+            portfolio_instance_id: u64,
+        ) -> Result<(), ProgramError> {
+            if portfolio_instance_id == 0 || portfolio_instance_id > (u64::MAX >> 1) {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            self.enabled = (portfolio_instance_id << 1) | (self.enabled & Self::ENABLED_MASK);
+            Ok(())
+        }
+    }
+
+    /// One owner-authorized future trade branch. The authorization account may carry either one
+    /// standalone order or two mutually exclusive TP/SL branches. `size_q` retains the existing
+    /// TradeCpi sign convention (positive = taker buy, negative = taker sell).
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct OrderAuthorizationBranchV16 {
+        pub size_q: i128,
+        pub trigger_price_e6: u64,
+        pub limit_price_e6: u64,
+        pub max_fee_bps: u64,
+        /// Monotonic generation of the configured asset occupying `asset_index`.
+        pub asset_market_id: u64,
+        pub asset_index: u16,
+        pub trigger_condition: u8,
+        pub reduce_only: u8,
+        pub _reserved: [u8; 12],
+    }
+
+    /// Program-owned, one-shot authority granted by a portfolio owner to a narrowly scoped
+    /// executor. It is deliberately separate from the fixed portfolio layout.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct OrderAuthorizationV16 {
+        pub branches: [OrderAuthorizationBranchV16; ORDER_AUTHORIZATION_BRANCH_CAP],
+        pub market_group: [u8; 32],
+        pub portfolio: [u8; 32],
+        pub owner: [u8; 32],
+        pub delegate: [u8; 32],
+        pub authorization_account_id: [u8; 32],
+        pub expiry_slot: u64,
+        pub created_slot: u64,
+        /// Market instance selected once by market authority for this slab incarnation.
+        pub market_instance_id: u64,
+        /// Monotonic wrapper-owned incarnation of the bound portfolio account.
+        pub portfolio_instance_id: u64,
+        pub state: u8,
+        pub branch_count: u8,
+        pub active_mask: u8,
+        pub _reserved: [u8; 13],
     }
 
     pub type AssetOracleStorageV16 = [u8; ASSET_ORACLE_WRAPPER_LEN];
@@ -729,6 +813,53 @@ pub mod state {
         HEADER_LEN + core::mem::size_of::<InsuranceLedgerAccountV16>()
     }
 
+    pub const fn order_authorization_account_len() -> usize {
+        HEADER_LEN + core::mem::size_of::<OrderAuthorizationV16>()
+    }
+
+    pub fn init_order_authorization_account(
+        data: &mut [u8],
+        authorization: &OrderAuthorizationV16,
+    ) -> Result<(), ProgramError> {
+        if data.len() < order_authorization_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        if is_initialized(data) {
+            return Err(PercolatorError::AlreadyInitialized.into());
+        }
+        for byte in data.iter_mut() {
+            *byte = 0;
+        }
+        write_header(data, KIND_ORDER_AUTHORIZATION)?;
+        write_order_authorization(data, authorization)
+    }
+
+    pub fn read_order_authorization(data: &[u8]) -> Result<OrderAuthorizationV16, ProgramError> {
+        check_header(data, KIND_ORDER_AUTHORIZATION)?;
+        let end = HEADER_LEN
+            .checked_add(core::mem::size_of::<OrderAuthorizationV16>())
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        let bytes = data
+            .get(HEADER_LEN..end)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        Ok(bytemuck::pod_read_unaligned(bytes))
+    }
+
+    pub fn write_order_authorization(
+        data: &mut [u8],
+        authorization: &OrderAuthorizationV16,
+    ) -> Result<(), ProgramError> {
+        check_header(data, KIND_ORDER_AUTHORIZATION)?;
+        let end = HEADER_LEN
+            .checked_add(core::mem::size_of::<OrderAuthorizationV16>())
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        let bytes = data
+            .get_mut(HEADER_LEN..end)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        bytes.copy_from_slice(bytemuck::bytes_of(authorization));
+        Ok(())
+    }
+
     #[inline]
     fn matcher_config_bytes(data: &[u8]) -> Result<&[u8], ProgramError> {
         data.get(
@@ -759,9 +890,6 @@ pub mod state {
                 .get(..config_len)
                 .ok_or(PercolatorError::InvalidAccountLen)?,
         );
-        if cfg.enabled > 1 {
-            return Err(ProgramError::InvalidAccountData);
-        }
         Ok(cfg)
     }
 
@@ -771,9 +899,6 @@ pub mod state {
         cfg: &PortfolioMatcherConfigV16,
     ) -> Result<(), ProgramError> {
         check_header(data, KIND_PORTFOLIO)?;
-        if cfg.enabled > 1 {
-            return Err(ProgramError::InvalidAccountData);
-        }
         let bytes = matcher_config_bytes_mut(data)?;
         for b in bytes.iter_mut() {
             *b = 0;
@@ -784,6 +909,28 @@ pub mod state {
             .ok_or(PercolatorError::InvalidAccountLen)?
             .copy_from_slice(bytemuck::bytes_of(cfg));
         Ok(())
+    }
+
+    pub fn read_portfolio_instance_id(data: &[u8]) -> Result<u64, ProgramError> {
+        let id = read_portfolio_matcher_config(data)?.portfolio_instance_id();
+        if id == 0 {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        Ok(id)
+    }
+
+    pub fn initialize_portfolio_instance_id(
+        data: &mut [u8],
+        portfolio_instance_id: u64,
+    ) -> Result<u64, ProgramError> {
+        let mut cfg = read_portfolio_matcher_config(data)?;
+        let existing = cfg.portfolio_instance_id();
+        if existing != 0 {
+            return Ok(existing);
+        }
+        cfg.set_portfolio_instance_id(portfolio_instance_id)?;
+        write_portfolio_matcher_config(data, &cfg)?;
+        Ok(portfolio_instance_id)
     }
 
     #[inline]
@@ -965,7 +1112,6 @@ pub mod state {
             || config.conf_filter_bps > 10_000
             || config.invert > 1
             || config._padding0 != 0
-            || config._padding1 != [0u8; 8]
             || config.fee_redirect_to_market_0_bps > 10_000
             || config.oracle_leg_count as usize > ORACLE_LEG_CAP
             || (config.oracle_leg_flags & !ORACLE_LEG_FLAGS_MASK) != 0
@@ -1373,6 +1519,29 @@ pub mod state {
         write_wrapper_config_to_bytes(data, config)
     }
 
+    pub fn read_order_market_instance_id(data: &[u8]) -> Result<u64, ProgramError> {
+        let id = read_wrapper_config_from_bytes(data)?.order_market_instance_id;
+        if id == 0 {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        Ok(id)
+    }
+
+    pub fn initialize_order_market_instance_id(
+        data: &mut [u8],
+        instance_id: u64,
+    ) -> Result<(), ProgramError> {
+        if instance_id == 0 {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let mut config = read_wrapper_config_from_bytes(data)?;
+        if config.order_market_instance_id != 0 {
+            return Err(PercolatorError::AlreadyInitialized.into());
+        }
+        config.order_market_instance_id = instance_id;
+        write_wrapper_config_to_bytes(data, &config)
+    }
+
     pub fn bump_matcher_req_seq(data: &mut [u8]) -> Result<u64, ProgramError> {
         check_header(data, KIND_MARKET)?;
         let mut config = read_wrapper_config_from_bytes(data)?;
@@ -1383,6 +1552,16 @@ pub mod state {
         let req_id = config.matcher_req_seq;
         write_wrapper_config_to_bytes(data, &config)?;
         Ok(req_id)
+    }
+
+    pub fn read_asset_market_id(data: &[u8], asset_index: usize) -> Result<u64, ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        validate_market_dynamic_len(data)?;
+        let market_id = asset_slot_wire(data, asset_index)?.asset.market_id.get();
+        if market_id == 0 {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        Ok(market_id)
     }
 
     pub fn market_view_mut(
@@ -2403,6 +2582,18 @@ pub mod ix {
         pub limit_price: u64,
     }
 
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct OrderAuthorizationBranch {
+        pub asset_index: u16,
+        pub asset_market_id: u64,
+        pub size_q: i128,
+        pub max_fee_bps: u64,
+        pub trigger_price_e6: u64,
+        pub limit_price_e6: u64,
+        pub trigger_condition: u8,
+        pub reduce_only: u8,
+    }
+
     /// Authenticated market data made available to the engine auto-crank. The caller chooses which
     /// oracle accounts to provide, not which engine action executes.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2459,6 +2650,26 @@ pub mod ix {
             size_q: i128,
             fee_bps: u64,
             limit_price: u64,
+        },
+        /// Initialize a separate, program-owned one-shot order authorization account. The owner
+        /// signs this ordinary recent-blockhash transaction; the future trade is not pre-signed.
+        AuthorizeOrder {
+            delegate: [u8; 32],
+            expiry_slot: u64,
+            branch_count: u8,
+            branches: [OrderAuthorizationBranch; 2],
+        },
+        /// Execute one branch as its scoped delegate. A successful fill consumes the complete
+        /// authorization, giving two-branch records atomic OCO behavior.
+        ExecuteAuthorizedOrder {
+            branch_index: u8,
+        },
+        RevokeOrder,
+        CloseOrderAuthorization,
+        /// One-time authority initialization of the scoped-order generation for this slab
+        /// incarnation. A fresh non-zero random value must be used after every CloseSlab/re-init.
+        InitializeOrderMarketInstance {
+            instance_id: u64,
         },
         /// Atomic multi-leg batch: apply every leg against one taker/LP pair with a single
         /// end-state initial-margin check (interim legs need not be individually margin-feasible).
@@ -2704,6 +2915,38 @@ pub mod ix {
                     size_q: read_i128(&mut rest)?,
                     fee_bps: read_u64(&mut rest)?,
                     limit_price: read_u64(&mut rest)?,
+                },
+                70 => {
+                    let delegate = read_bytes32(&mut rest)?;
+                    let expiry_slot = read_u64(&mut rest)?;
+                    let branch_count = read_u8(&mut rest)?;
+                    let mut branches = [OrderAuthorizationBranch::default(); 2];
+                    for branch in branches.iter_mut() {
+                        *branch = OrderAuthorizationBranch {
+                            asset_index: read_u16(&mut rest)?,
+                            asset_market_id: read_u64(&mut rest)?,
+                            size_q: read_i128(&mut rest)?,
+                            max_fee_bps: read_u64(&mut rest)?,
+                            trigger_price_e6: read_u64(&mut rest)?,
+                            limit_price_e6: read_u64(&mut rest)?,
+                            trigger_condition: read_u8(&mut rest)?,
+                            reduce_only: read_u8(&mut rest)?,
+                        };
+                    }
+                    Self::AuthorizeOrder {
+                        delegate,
+                        expiry_slot,
+                        branch_count,
+                        branches,
+                    }
+                }
+                71 => Self::ExecuteAuthorizedOrder {
+                    branch_index: read_u8(&mut rest)?,
+                },
+                72 => Self::RevokeOrder,
+                73 => Self::CloseOrderAuthorization,
+                74 => Self::InitializeOrderMarketInstance {
+                    instance_id: read_u64(&mut rest)?,
                 },
                 66 => {
                     let n = read_u8(&mut rest)? as usize;
@@ -3005,6 +3248,37 @@ pub mod ix {
                     push_i128(&mut out, size_q);
                     push_u64(&mut out, fee_bps);
                     push_u64(&mut out, limit_price);
+                }
+                Self::AuthorizeOrder {
+                    delegate,
+                    expiry_slot,
+                    branch_count,
+                    ref branches,
+                } => {
+                    out.push(70);
+                    out.extend_from_slice(&delegate);
+                    push_u64(&mut out, expiry_slot);
+                    out.push(branch_count);
+                    for branch in branches.iter() {
+                        push_u16(&mut out, branch.asset_index);
+                        push_u64(&mut out, branch.asset_market_id);
+                        push_i128(&mut out, branch.size_q);
+                        push_u64(&mut out, branch.max_fee_bps);
+                        push_u64(&mut out, branch.trigger_price_e6);
+                        push_u64(&mut out, branch.limit_price_e6);
+                        out.push(branch.trigger_condition);
+                        out.push(branch.reduce_only);
+                    }
+                }
+                Self::ExecuteAuthorizedOrder { branch_index } => {
+                    out.push(71);
+                    out.push(branch_index);
+                }
+                Self::RevokeOrder => out.push(72),
+                Self::CloseOrderAuthorization => out.push(73),
+                Self::InitializeOrderMarketInstance { instance_id } => {
+                    out.push(74);
+                    push_u64(&mut out, instance_id);
                 }
                 Self::BatchTradeNoCpi { ref legs } => {
                     out.push(66);
@@ -5176,6 +5450,29 @@ pub mod processor {
                 fee_bps,
                 limit_price,
             ),
+            Instruction::AuthorizeOrder {
+                delegate,
+                expiry_slot,
+                branch_count,
+                branches,
+            } => handle_authorize_order(
+                program_id,
+                accounts,
+                delegate,
+                expiry_slot,
+                branch_count,
+                &branches,
+            ),
+            Instruction::ExecuteAuthorizedOrder { branch_index } => {
+                handle_execute_authorized_order(program_id, accounts, branch_index)
+            }
+            Instruction::RevokeOrder => handle_revoke_order(program_id, accounts),
+            Instruction::CloseOrderAuthorization => {
+                handle_close_order_authorization(program_id, accounts)
+            }
+            Instruction::InitializeOrderMarketInstance { instance_id } => {
+                handle_initialize_order_market_instance(program_id, accounts, instance_id)
+            }
             Instruction::BatchTradeNoCpi { legs } => {
                 handle_batch_trade_nocpi(program_id, accounts, &legs)
             }
@@ -5514,7 +5811,7 @@ pub mod processor {
             backing_trade_fee_insurance_share_bps_short: 0,
             fee_redirect_to_market_0_bps: 0,
             matcher_req_seq: 0,
-            _padding1: [0u8; 8],
+            order_market_instance_id: 0,
         };
         state::init_market_account_zero_copy(
             &mut market_ai.try_borrow_mut_data()?,
@@ -6389,7 +6686,7 @@ pub mod processor {
         matcher_delegate_key: &Pubkey,
     ) -> Result<usize, ProgramError> {
         let cfg = state::read_portfolio_matcher_config(&account_b_ai.try_borrow_data()?)?;
-        if cfg.enabled != 1
+        if !cfg.matcher_enabled()
             || cfg.matcher_program != matcher_prog_key.to_bytes()
             || cfg.matcher_context != matcher_ctx_key.to_bytes()
             || cfg.matcher_delegate != matcher_delegate_key.to_bytes()
@@ -6431,6 +6728,392 @@ pub mod processor {
         Ok(())
     }
 
+    fn order_branch_to_state(
+        branch: &crate::ix::OrderAuthorizationBranch,
+    ) -> state::OrderAuthorizationBranchV16 {
+        state::OrderAuthorizationBranchV16 {
+            size_q: branch.size_q,
+            trigger_price_e6: branch.trigger_price_e6,
+            limit_price_e6: branch.limit_price_e6,
+            max_fee_bps: branch.max_fee_bps,
+            asset_market_id: branch.asset_market_id,
+            asset_index: branch.asset_index,
+            trigger_condition: branch.trigger_condition,
+            reduce_only: branch.reduce_only,
+            _reserved: [0; 12],
+        }
+    }
+
+    fn handle_initialize_order_market_instance<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        instance_id: u64,
+    ) -> ProgramResult {
+        let marketauth = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        expect_signer(marketauth)?;
+        expect_writable(market_ai)?;
+        expect_owner(market_ai, program_id)?;
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (cfg, mode, _, _) = state::read_market_config_mode_and_capacity(&market_data)?;
+        expect_live_authority(&cfg.marketauth, marketauth.key)?;
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        state::initialize_order_market_instance_id(&mut market_data, instance_id)
+    }
+
+    fn validate_order_branch_shape(
+        market_ai: &AccountInfo,
+        branch: &state::OrderAuthorizationBranchV16,
+    ) -> ProgramResult {
+        if branch.size_q == 0
+            || branch.size_q == i128::MIN
+            || branch.trigger_price_e6 == 0
+            || branch.trigger_price_e6 > percolator::MAX_ORACLE_PRICE
+            || branch.limit_price_e6 == 0
+            || branch.limit_price_e6 > percolator::MAX_ORACLE_PRICE
+            || branch.asset_market_id == 0
+            || branch.trigger_condition > constants::ORDER_TRIGGER_AT_OR_ABOVE
+            || branch.reduce_only > 1
+            || branch._reserved != [0; 12]
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        // A buy is capped by a maximum execution price; a sell is bounded by a minimum. Keeping
+        // that cap on the safe side of the trigger makes every authorized branch executable only
+        // within the owner's signed slippage envelope.
+        if (branch.size_q > 0 && branch.limit_price_e6 < branch.trigger_price_e6)
+            || (branch.size_q < 0 && branch.limit_price_e6 > branch.trigger_price_e6)
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let (cfg, mode, _, _, protocol_max_fee_bps) = state::read_market_trade_preflight(
+            &market_ai.try_borrow_data()?,
+            branch.asset_index as usize,
+        )?;
+        let live_market_id = state::read_asset_market_id(
+            &market_ai.try_borrow_data()?,
+            branch.asset_index as usize,
+        )?;
+        if mode != MarketModeV16::Live
+            || branch.asset_market_id != live_market_id
+            || branch.max_fee_bps < cfg.trade_fee_base_bps
+            || branch.max_fee_bps > protocol_max_fee_bps
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        Ok(())
+    }
+
+    fn ensure_order_portfolio_instance(
+        market_ai: &AccountInfo,
+        portfolio_ai: &AccountInfo,
+    ) -> Result<(u64, u64), ProgramError> {
+        let market_instance_id =
+            state::read_order_market_instance_id(&market_ai.try_borrow_data()?)?;
+        let existing = state::read_portfolio_matcher_config(&portfolio_ai.try_borrow_data()?)?
+            .portfolio_instance_id();
+        if existing != 0 {
+            return Ok((market_instance_id, existing));
+        }
+        let sequence = state::bump_matcher_req_seq(&mut market_ai.try_borrow_mut_data()?)?;
+        let portfolio_instance_id = state::initialize_portfolio_instance_id(
+            &mut portfolio_ai.try_borrow_mut_data()?,
+            sequence,
+        )?;
+        Ok((market_instance_id, portfolio_instance_id))
+    }
+
+    fn handle_authorize_order<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        delegate: [u8; 32],
+        expiry_slot: u64,
+        branch_count: u8,
+        branches: &[crate::ix::OrderAuthorizationBranch; 2],
+    ) -> ProgramResult {
+        let owner = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let portfolio_ai = account(accounts, 2)?;
+        let authorization_ai = account(accounts, 3)?;
+        expect_signer(owner)?;
+        expect_signer(authorization_ai)?;
+        expect_writable(market_ai)?;
+        expect_writable(portfolio_ai)?;
+        expect_writable(authorization_ai)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(portfolio_ai, program_id)?;
+        expect_owner(authorization_ai, program_id)?;
+        let authorization_data = authorization_ai.try_borrow_data()?;
+        if delegate == [0; 32]
+            || !(1..=constants::ORDER_AUTHORIZATION_BRANCH_CAP as u8).contains(&branch_count)
+            || authorization_data.len() != state::order_authorization_account_len()
+            || authorization_data.iter().any(|byte| *byte != 0)
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        drop(authorization_data);
+        let current_slot = Clock::get()?.slot;
+        if expiry_slot <= current_slot {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let (portfolio_header, portfolio_owner) =
+            state::read_portfolio_owner_preflight(&portfolio_ai.try_borrow_data()?)?;
+        if portfolio_header.market_group_id != market_ai.key.to_bytes()
+            || portfolio_header.portfolio_account_id != portfolio_ai.key.to_bytes()
+            || portfolio_owner != owner.key.to_bytes()
+        {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        let (market_instance_id, portfolio_instance_id) =
+            ensure_order_portfolio_instance(market_ai, portfolio_ai)?;
+
+        let mut stored_branches = [state::OrderAuthorizationBranchV16::default();
+            constants::ORDER_AUTHORIZATION_BRANCH_CAP];
+        for (index, stored) in stored_branches.iter_mut().enumerate() {
+            *stored = order_branch_to_state(&branches[index]);
+            if index < branch_count as usize {
+                validate_order_branch_shape(market_ai, stored)?;
+            } else if *stored != state::OrderAuthorizationBranchV16::default() {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+        }
+        // Two branches are an exact OCO pair: both close the same quantity on the same asset, and
+        // their opposite trigger directions represent TP and SL. Either successful fill consumes
+        // the whole record.
+        if branch_count == 2 {
+            let first = stored_branches[0];
+            let second = stored_branches[1];
+            if first.asset_index != second.asset_index
+                || first.asset_market_id != second.asset_market_id
+                || first.size_q != second.size_q
+                || first.reduce_only != 1
+                || second.reduce_only != 1
+                || first.trigger_condition == second.trigger_condition
+            {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            let (below, above) = if first.trigger_condition == constants::ORDER_TRIGGER_AT_OR_BELOW
+            {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            if below.trigger_price_e6 >= above.trigger_price_e6 {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+        }
+
+        let authorization = state::OrderAuthorizationV16 {
+            branches: stored_branches,
+            market_group: market_ai.key.to_bytes(),
+            portfolio: portfolio_ai.key.to_bytes(),
+            owner: owner.key.to_bytes(),
+            delegate,
+            authorization_account_id: authorization_ai.key.to_bytes(),
+            expiry_slot,
+            created_slot: current_slot,
+            market_instance_id,
+            portfolio_instance_id,
+            state: constants::ORDER_AUTHORIZATION_STATE_ACTIVE,
+            branch_count,
+            active_mask: (1u8 << branch_count) - 1,
+            _reserved: [0; 13],
+        };
+        state::init_order_authorization_account(
+            &mut authorization_ai.try_borrow_mut_data()?,
+            &authorization,
+        )
+    }
+
+    fn order_trigger_satisfied(
+        trigger_condition: u8,
+        oracle_price_e6: u64,
+        trigger_price_e6: u64,
+    ) -> bool {
+        match trigger_condition {
+            constants::ORDER_TRIGGER_AT_OR_BELOW => oracle_price_e6 <= trigger_price_e6,
+            constants::ORDER_TRIGGER_AT_OR_ABOVE => oracle_price_e6 >= trigger_price_e6,
+            _ => false,
+        }
+    }
+
+    fn validate_reduce_only_order<'a>(
+        market_ai: &AccountInfo<'a>,
+        portfolio_ai: &AccountInfo<'a>,
+        branch: &state::OrderAuthorizationBranchV16,
+    ) -> ProgramResult {
+        if branch.reduce_only == 0 {
+            return Ok(());
+        }
+        let (_, _, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
+        let portfolio =
+            state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
+        let leg = active_leg_for_asset_view(&portfolio, branch.asset_index as usize)?;
+        let size_abs = branch.size_q.unsigned_abs();
+        let reduces_existing_side = if branch.size_q > 0 {
+            leg.side == SideV16::Short
+        } else {
+            leg.side == SideV16::Long
+        };
+        if !reduces_existing_side || size_abs > leg.basis_pos_q.unsigned_abs() {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        Ok(())
+    }
+
+    fn handle_execute_authorized_order<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        branch_index: u8,
+    ) -> ProgramResult {
+        let delegate = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let portfolio_ai = account(accounts, 2)?;
+        let authorization_ai = account(accounts, 7)?;
+        expect_signer(delegate)?;
+        expect_writable(authorization_ai)?;
+        expect_owner(authorization_ai, program_id)?;
+
+        let mut authorization =
+            state::read_order_authorization(&authorization_ai.try_borrow_data()?)?;
+        if authorization.state != constants::ORDER_AUTHORIZATION_STATE_ACTIVE
+            || authorization.authorization_account_id != authorization_ai.key.to_bytes()
+            || authorization.market_group != market_ai.key.to_bytes()
+            || authorization.portfolio != portfolio_ai.key.to_bytes()
+            || authorization.delegate != delegate.key.to_bytes()
+            || authorization.market_instance_id == 0
+            || authorization.portfolio_instance_id == 0
+            || authorization.branch_count == 0
+            || authorization.branch_count > constants::ORDER_AUTHORIZATION_BRANCH_CAP as u8
+            || branch_index >= authorization.branch_count
+            || authorization.active_mask & (1u8 << branch_index) == 0
+            || authorization.active_mask != (1u8 << authorization.branch_count) - 1
+            || authorization._reserved != [0; 13]
+        {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        for branch in authorization
+            .branches
+            .iter()
+            .skip(authorization.branch_count as usize)
+        {
+            if *branch != state::OrderAuthorizationBranchV16::default() {
+                return Err(PercolatorError::Unauthorized.into());
+            }
+        }
+        let current_slot = Clock::get()?.slot;
+        if current_slot > authorization.expiry_slot {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        let (_, portfolio_owner) =
+            state::read_portfolio_owner_preflight(&portfolio_ai.try_borrow_data()?)?;
+        let live_market_instance_id =
+            state::read_order_market_instance_id(&market_ai.try_borrow_data()?)?;
+        let live_portfolio_instance_id =
+            state::read_portfolio_instance_id(&portfolio_ai.try_borrow_data()?)?;
+        if portfolio_owner != authorization.owner
+            || live_market_instance_id != authorization.market_instance_id
+            || live_portfolio_instance_id != authorization.portfolio_instance_id
+        {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        let branch = authorization.branches[branch_index as usize];
+        validate_order_branch_shape(market_ai, &branch)?;
+        let (_, mode, _, oracle_price, _) = state::read_market_trade_preflight(
+            &market_ai.try_borrow_data()?,
+            branch.asset_index as usize,
+        )?;
+        if mode != MarketModeV16::Live
+            || !order_trigger_satisfied(
+                branch.trigger_condition,
+                oracle_price,
+                branch.trigger_price_e6,
+            )
+        {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        validate_reduce_only_order(market_ai, portfolio_ai, &branch)?;
+        let filled = execute_trade_cpi_scoped(
+            program_id,
+            accounts,
+            &Pubkey::new_from_array(authorization.owner),
+            1,
+            branch.asset_index,
+            branch.size_q,
+            0,
+            branch.limit_price_e6,
+            Some(branch.max_fee_bps),
+        )?;
+        if filled {
+            authorization.state = constants::ORDER_AUTHORIZATION_STATE_CONSUMED;
+            authorization.active_mask = 0;
+            state::write_order_authorization(
+                &mut authorization_ai.try_borrow_mut_data()?,
+                &authorization,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn handle_revoke_order<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        let owner = account(accounts, 0)?;
+        let authorization_ai = account(accounts, 1)?;
+        expect_signer(owner)?;
+        expect_writable(authorization_ai)?;
+        expect_owner(authorization_ai, program_id)?;
+        let mut authorization =
+            state::read_order_authorization(&authorization_ai.try_borrow_data()?)?;
+        if authorization.authorization_account_id != authorization_ai.key.to_bytes()
+            || authorization.owner != owner.key.to_bytes()
+            || authorization.state != constants::ORDER_AUTHORIZATION_STATE_ACTIVE
+        {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        authorization.state = constants::ORDER_AUTHORIZATION_STATE_REVOKED;
+        authorization.active_mask = 0;
+        state::write_order_authorization(
+            &mut authorization_ai.try_borrow_mut_data()?,
+            &authorization,
+        )
+    }
+
+    fn handle_close_order_authorization<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        let owner = account(accounts, 0)?;
+        let authorization_ai = account(accounts, 1)?;
+        let destination = account(accounts, 2)?;
+        expect_signer(owner)?;
+        expect_writable(authorization_ai)?;
+        expect_writable(destination)?;
+        expect_owner(authorization_ai, program_id)?;
+        expect_key(destination, owner.key)?;
+        let authorization = state::read_order_authorization(&authorization_ai.try_borrow_data()?)?;
+        if authorization.authorization_account_id != authorization_ai.key.to_bytes()
+            || authorization.owner != owner.key.to_bytes()
+        {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        let recovered = authorization_ai.lamports();
+        let destination_lamports = destination
+            .lamports()
+            .checked_add(recovered)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        **destination.try_borrow_mut_lamports()? = destination_lamports;
+        **authorization_ai.try_borrow_mut_lamports()? = 0;
+        authorization_ai.realloc(0, false)?;
+        authorization_ai.assign(&system_program::id());
+        Ok(())
+    }
+
     #[inline(never)]
     fn handle_trade_cpi<'a>(
         program_id: &Pubkey,
@@ -6440,6 +7123,81 @@ pub mod processor {
         fee_bps: u64,
         limit_price: u64,
     ) -> ProgramResult {
+        let owner = account(accounts, 0)?;
+        let account_a_ai = account(accounts, 2)?;
+        expect_signer(owner)?;
+        let (_, account_a_owner) =
+            state::read_portfolio_owner_preflight(&account_a_ai.try_borrow_data()?)?;
+        if account_a_owner != owner.key.to_bytes() {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        execute_trade_cpi_scoped(
+            program_id,
+            accounts,
+            &Pubkey::new_from_array(account_a_owner),
+            0,
+            asset_index,
+            size_q,
+            fee_bps,
+            limit_price,
+            None,
+        )
+        .map(|_| ())
+    }
+
+    fn validate_authorized_order_execution_bounds<'a>(
+        market_ai: &AccountInfo<'a>,
+        asset_index: u16,
+        size_q: i128,
+        reported_exec_price: u64,
+        limit_price: u64,
+        max_fee_bps: u64,
+    ) -> ProgramResult {
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (cfg, group) = state::market_view_mut(&mut market_data)?;
+        let oracle_profile = read_oracle_profile_from_view(&group, &cfg, asset_index as usize)?;
+        let accepted_exec_price = accepted_reported_trade_price_view(
+            &oracle_profile,
+            &group,
+            asset_index as usize,
+            reported_exec_price,
+        )?;
+        let limit_ok = if size_q > 0 {
+            accepted_exec_price <= limit_price
+        } else {
+            accepted_exec_price >= limit_price
+        };
+        if !limit_ok {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let fee_quote = hybrid_trade_fee_quote_view(
+            &cfg,
+            &oracle_profile,
+            &group,
+            asset_index as usize,
+            size_q.unsigned_abs(),
+            accepted_exec_price,
+            0,
+        )?;
+        if fee_quote.fee_bps > max_fee_bps {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn execute_trade_cpi_scoped<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        account_a_owner_key: &Pubkey,
+        extra_fixed_accounts: usize,
+        asset_index: u16,
+        size_q: i128,
+        fee_bps: u64,
+        limit_price: u64,
+        authorized_max_fee_bps: Option<u64>,
+    ) -> Result<bool, ProgramError> {
         let signer_a = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
         let account_a_ai = account(accounts, 2)?;
@@ -6500,7 +7258,7 @@ pub mod processor {
         {
             return Err(PercolatorError::EngineProvenanceMismatch.into());
         }
-        if account_a_owner != signer_a.key.to_bytes() {
+        if account_a_owner != account_a_owner_key.to_bytes() {
             return Err(PercolatorError::Unauthorized.into());
         }
         let account_b_owner_key = Pubkey::new_from_array(account_b_owner);
@@ -6518,7 +7276,9 @@ pub mod processor {
             matcher_prog.key,
             matcher_ctx.key,
             matcher_delegate.key,
-        )?;
+        )?
+        .checked_add(extra_fixed_accounts)
+        .ok_or(PercolatorError::InvalidInstruction)?;
         let tail = accounts
             .get(tail_start..)
             .ok_or(ProgramError::NotEnoughAccountKeys)?;
@@ -6588,7 +7348,16 @@ pub mod processor {
             size_q,
             req_id,
         )?;
-        if limit_price != 0 {
+        if let Some(max_fee_bps) = authorized_max_fee_bps {
+            validate_authorized_order_execution_bounds(
+                market_ai,
+                asset_index,
+                size_q,
+                ret.exec_price_e6,
+                limit_price,
+                max_fee_bps,
+            )?;
+        } else if limit_price != 0 {
             let limit_ok = if size_q > 0 {
                 ret.exec_price_e6 <= limit_price
             } else {
@@ -6599,13 +7368,16 @@ pub mod processor {
             }
         }
         if ret.exec_size == 0 {
-            return Ok(());
+            return Ok(false);
+        }
+        if authorized_max_fee_bps.is_some() && ret.exec_size != size_q {
+            return Err(PercolatorError::InvalidInstruction.into());
         }
         let (_, _, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         handle_trade_nocpi_zero_copy(
             program_id,
-            signer_a.key,
+            account_a_owner_key,
             &account_b_owner_key,
             market_ai,
             account_a_ai,
@@ -6615,7 +7387,8 @@ pub mod processor {
             ret.exec_price_e6,
             fee_bps,
             max_market_slots,
-        )
+        )?;
+        Ok(true)
     }
 
     #[inline(never)]
@@ -6646,8 +7419,12 @@ pub mod processor {
         if lp_portfolio_ai.data_len() < required_len {
             lp_portfolio_ai.realloc(required_len, true)?;
         }
+        let current_cfg =
+            state::read_portfolio_matcher_config(&lp_portfolio_ai.try_borrow_data()?)?;
         let cfg = if enabled == 0 {
-            state::PortfolioMatcherConfigV16::default()
+            let mut cfg = state::PortfolioMatcherConfigV16::default();
+            cfg.enabled = current_cfg.enabled & !1;
+            cfg
         } else {
             let matcher_prog = account(accounts, 3)?;
             let matcher_ctx = account(accounts, 4)?;
@@ -6669,12 +7446,14 @@ pub mod processor {
                 matcher_ctx.key,
             );
             expect_key(matcher_delegate, &delegate)?;
-            state::PortfolioMatcherConfigV16 {
+            let mut cfg = state::PortfolioMatcherConfigV16 {
                 matcher_program: matcher_prog.key.to_bytes(),
                 matcher_context: matcher_ctx.key.to_bytes(),
                 matcher_delegate: matcher_delegate.key.to_bytes(),
-                enabled: 1,
-            }
+                enabled: current_cfg.enabled & !1,
+            };
+            cfg.set_matcher_enabled(true);
+            cfg
         };
         state::write_portfolio_matcher_config(&mut lp_portfolio_ai.try_borrow_mut_data()?, &cfg)
     }
@@ -12076,6 +12855,168 @@ pub mod processor {
                 state::wrapper_config_len_for_test(),
                 "WRAPPER_CONFIG_LEN must equal size_of::<WrapperConfigV16>() for the zero-copy layout",
             );
+        }
+
+        #[test]
+        fn order_authorization_layout_and_state_round_trip_are_exact() {
+            assert_eq!(
+                core::mem::size_of::<state::OrderAuthorizationBranchV16>(),
+                64
+            );
+            assert_eq!(core::mem::size_of::<state::OrderAuthorizationV16>(), 336);
+            assert_eq!(state::order_authorization_account_len(), 352);
+
+            let authorization = state::OrderAuthorizationV16 {
+                branches: [
+                    state::OrderAuthorizationBranchV16 {
+                        size_q: 12,
+                        trigger_price_e6: 100,
+                        limit_price_e6: 101,
+                        max_fee_bps: 5,
+                        asset_market_id: 77,
+                        asset_index: 3,
+                        trigger_condition: constants::ORDER_TRIGGER_AT_OR_BELOW,
+                        reduce_only: 0,
+                        _reserved: [0; 12],
+                    },
+                    state::OrderAuthorizationBranchV16::default(),
+                ],
+                market_group: [1; 32],
+                portfolio: [2; 32],
+                owner: [3; 32],
+                delegate: [4; 32],
+                authorization_account_id: [5; 32],
+                expiry_slot: 50,
+                created_slot: 10,
+                market_instance_id: 11,
+                portfolio_instance_id: 12,
+                state: constants::ORDER_AUTHORIZATION_STATE_ACTIVE,
+                branch_count: 1,
+                active_mask: 1,
+                _reserved: [0; 13],
+            };
+            let mut data = vec![0u8; state::order_authorization_account_len()];
+            state::init_order_authorization_account(&mut data, &authorization).unwrap();
+            assert_eq!(
+                state::read_order_authorization(&data).unwrap(),
+                authorization
+            );
+            let mut consumed = authorization;
+            consumed.state = constants::ORDER_AUTHORIZATION_STATE_CONSUMED;
+            consumed.active_mask = 0;
+            state::write_order_authorization(&mut data, &consumed).unwrap();
+            assert_eq!(state::read_order_authorization(&data).unwrap(), consumed);
+        }
+
+        #[test]
+        fn portfolio_instance_packing_preserves_matcher_enablement() {
+            let mut cfg = state::PortfolioMatcherConfigV16::default();
+            assert!(!cfg.matcher_enabled());
+            assert_eq!(cfg.portfolio_instance_id(), 0);
+            cfg.set_portfolio_instance_id(77).unwrap();
+            assert_eq!(cfg.portfolio_instance_id(), 77);
+            assert!(!cfg.matcher_enabled());
+            cfg.set_matcher_enabled(true);
+            assert!(cfg.matcher_enabled());
+            assert_eq!(cfg.portfolio_instance_id(), 77);
+            cfg.set_matcher_enabled(false);
+            assert!(!cfg.matcher_enabled());
+            assert_eq!(cfg.portfolio_instance_id(), 77);
+            assert!(cfg.set_portfolio_instance_id(0).is_err());
+            assert_eq!(
+                core::mem::size_of::<state::PortfolioMatcherConfigV16>(),
+                104
+            );
+        }
+
+        #[test]
+        fn order_instruction_wire_round_trip_preserves_exact_scope() {
+            let branch = crate::ix::OrderAuthorizationBranch {
+                asset_index: 2,
+                asset_market_id: 77,
+                size_q: -17,
+                max_fee_bps: 5,
+                trigger_price_e6: 123,
+                limit_price_e6: 120,
+                trigger_condition: constants::ORDER_TRIGGER_AT_OR_ABOVE,
+                reduce_only: 1,
+            };
+            let authorize = Instruction::AuthorizeOrder {
+                delegate: [9; 32],
+                expiry_slot: 777,
+                branch_count: 1,
+                branches: [branch, crate::ix::OrderAuthorizationBranch::default()],
+            };
+            let encoded = authorize.encode();
+            assert_eq!(encoded[0], 70);
+            let mut expected = vec![70];
+            expected.extend_from_slice(&[9; 32]);
+            expected.extend_from_slice(&777u64.to_le_bytes());
+            expected.push(1);
+            expected.extend_from_slice(&2u16.to_le_bytes());
+            expected.extend_from_slice(&77u64.to_le_bytes());
+            expected.extend_from_slice(&(-17i128).to_le_bytes());
+            expected.extend_from_slice(&5u64.to_le_bytes());
+            expected.extend_from_slice(&123u64.to_le_bytes());
+            expected.extend_from_slice(&120u64.to_le_bytes());
+            expected.push(constants::ORDER_TRIGGER_AT_OR_ABOVE);
+            expected.push(1);
+            expected.extend_from_slice(&[0; 52]);
+            assert_eq!(encoded.len(), 146);
+            assert_eq!(encoded, expected, "AuthorizeOrder ABI bytes changed");
+            assert_eq!(Instruction::decode(&encoded).unwrap(), authorize);
+            let execute = Instruction::ExecuteAuthorizedOrder { branch_index: 1 };
+            assert_eq!(execute.encode(), vec![71, 1]);
+            assert_eq!(Instruction::decode(&execute.encode()).unwrap(), execute);
+            assert_eq!(Instruction::RevokeOrder.encode(), vec![72]);
+            assert_eq!(
+                Instruction::decode(&Instruction::RevokeOrder.encode()).unwrap(),
+                Instruction::RevokeOrder
+            );
+            assert_eq!(Instruction::CloseOrderAuthorization.encode(), vec![73]);
+            assert_eq!(
+                Instruction::decode(&Instruction::CloseOrderAuthorization.encode()).unwrap(),
+                Instruction::CloseOrderAuthorization
+            );
+            let initialize = Instruction::InitializeOrderMarketInstance {
+                instance_id: 0x1020_3040_5060_7080,
+            };
+            assert_eq!(
+                initialize.encode(),
+                [vec![74], 0x1020_3040_5060_7080u64.to_le_bytes().to_vec()].concat()
+            );
+            assert_eq!(
+                Instruction::decode(&initialize.encode()).unwrap(),
+                initialize
+            );
+            let mut trailing = encoded;
+            trailing.push(0);
+            assert!(Instruction::decode(&trailing).is_err());
+        }
+
+        #[test]
+        fn order_trigger_conditions_are_directionally_exact() {
+            assert!(order_trigger_satisfied(
+                constants::ORDER_TRIGGER_AT_OR_BELOW,
+                99,
+                100
+            ));
+            assert!(!order_trigger_satisfied(
+                constants::ORDER_TRIGGER_AT_OR_BELOW,
+                101,
+                100
+            ));
+            assert!(order_trigger_satisfied(
+                constants::ORDER_TRIGGER_AT_OR_ABOVE,
+                101,
+                100
+            ));
+            assert!(!order_trigger_satisfied(
+                constants::ORDER_TRIGGER_AT_OR_ABOVE,
+                99,
+                100
+            ));
+            assert!(!order_trigger_satisfied(2, 100, 100));
         }
 
         fn test_wrapper_config(price: u64) -> state::WrapperConfigV16 {

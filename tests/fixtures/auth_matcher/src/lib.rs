@@ -2,28 +2,36 @@
 
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
-    entrypoint, entrypoint::ProgramResult, program::set_return_data,
-    program_error::ProgramError, pubkey::Pubkey,
+    entrypoint,
+    entrypoint::ProgramResult,
+    program::set_return_data,
+    program_error::ProgramError,
+    pubkey::Pubkey,
 };
 
 entrypoint!(process);
 
 const ABI: u32 = 3;
 const FLAG_VALID: u32 = 1;
+const FLAG_PARTIAL_OK: u32 = 2;
 const CTX_STATE_OFFSET: usize = 64;
-const CTX_MIN_LEN: usize = CTX_STATE_OFFSET + 33;
+const CTX_EXEC_PRICE_OFFSET: usize = CTX_STATE_OFFSET + 33;
+const CTX_PARTIAL_FILL_OFFSET: usize = CTX_EXEC_PRICE_OFFSET + 8;
+const CTX_MIN_LEN: usize = CTX_PARTIAL_FILL_OFFSET + 1;
 
 fn write_return(
     out: &mut [u8],
     req_id: u64,
     lp: u64,
     asset: u64,
+    flags: u32,
+    exec_price: u64,
     oracle: u64,
     size: i128,
 ) {
     out[0..4].copy_from_slice(&ABI.to_le_bytes());
-    out[4..8].copy_from_slice(&FLAG_VALID.to_le_bytes());
-    out[8..16].copy_from_slice(&oracle.to_le_bytes());
+    out[4..8].copy_from_slice(&flags.to_le_bytes());
+    out[8..16].copy_from_slice(&exec_price.to_le_bytes());
     out[16..32].copy_from_slice(&size.to_le_bytes());
     out[32..40].copy_from_slice(&req_id.to_le_bytes());
     out[40..48].copy_from_slice(&lp.to_le_bytes());
@@ -49,7 +57,11 @@ fn process_init(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
     let market = next_account_info(account_iter)?;
     let lp_portfolio = next_account_info(account_iter)?;
 
-    if !lp_owner.is_signer || !ctx.is_writable || ctx.owner != program_id || ctx.data_len() < CTX_MIN_LEN {
+    if !lp_owner.is_signer
+        || !ctx.is_writable
+        || ctx.owner != program_id
+        || ctx.data_len() < CTX_MIN_LEN
+    {
         return Err(ProgramError::InvalidAccountData);
     }
 
@@ -107,7 +119,32 @@ fn process_single(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     let oracle = u64::from_le_bytes(data[19..27].try_into().unwrap());
     let req = i128::from_le_bytes(data[27..43].try_into().unwrap());
     let mut ctx_data = ctx.try_borrow_mut_data()?;
-    write_return(&mut ctx_data[0..64], req_id, lp, asset, oracle, req);
+    let configured_exec_price = ctx_data
+        .get(CTX_EXEC_PRICE_OFFSET..CTX_EXEC_PRICE_OFFSET + 8)
+        .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+        .unwrap_or(0);
+    let exec_price = if configured_exec_price == 0 {
+        oracle
+    } else {
+        configured_exec_price
+    };
+    let partial_fill = ctx_data.get(CTX_PARTIAL_FILL_OFFSET).copied().unwrap_or(0) != 0;
+    let flags = if partial_fill {
+        FLAG_VALID | FLAG_PARTIAL_OK
+    } else {
+        FLAG_VALID
+    };
+    let exec_size = if partial_fill { req / 2 } else { req };
+    write_return(
+        &mut ctx_data[0..64],
+        req_id,
+        lp,
+        asset,
+        flags,
+        exec_price,
+        oracle,
+        exec_size,
+    );
     Ok(())
 }
 
@@ -131,7 +168,16 @@ fn process_batch(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
         let asset = u16::from_le_bytes(data[base..base + 2].try_into().unwrap()) as u64;
         let oracle = u64::from_le_bytes(data[base + 2..base + 10].try_into().unwrap());
         let req = i128::from_le_bytes(data[base + 10..base + 26].try_into().unwrap());
-        write_return(&mut out[i * 64..i * 64 + 64], req_id, lp, asset, oracle, req);
+        write_return(
+            &mut out[i * 64..i * 64 + 64],
+            req_id,
+            lp,
+            asset,
+            FLAG_VALID,
+            oracle,
+            oracle,
+            req,
+        );
     }
     set_return_data(&out[..n * 64]);
     Ok(())
