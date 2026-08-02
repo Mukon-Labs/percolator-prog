@@ -2332,18 +2332,48 @@ impl V16CuEnv {
         authorization: Pubkey,
         branch_index: u8,
     ) -> Result<u64, String> {
+        self.try_execute_authorized_order_with_rent_destination(
+            delegate,
+            portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            authorization,
+            branch_index,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_execute_authorized_order_with_rent_destination(
+        &mut self,
+        delegate: &Keypair,
+        portfolio: Pubkey,
+        lp_portfolio: Pubkey,
+        matcher_program: Pubkey,
+        matcher_context: Pubkey,
+        matcher_delegate: Pubkey,
+        authorization: Pubkey,
+        branch_index: u8,
+        rent_destination: Option<Pubkey>,
+    ) -> Result<u64, String> {
+        let mut accounts = vec![
+            AccountMeta::new_readonly(delegate.pubkey(), true),
+            AccountMeta::new(self.market, false),
+            AccountMeta::new(portfolio, false),
+            AccountMeta::new(lp_portfolio, false),
+            AccountMeta::new_readonly(matcher_program, false),
+            AccountMeta::new(matcher_context, false),
+            AccountMeta::new_readonly(matcher_delegate, false),
+            AccountMeta::new(authorization, false),
+        ];
+        if let Some(destination) = rent_destination {
+            accounts.push(AccountMeta::new(destination, false));
+        }
         self.send(
             ProgInstruction::ExecuteAuthorizedOrder { branch_index },
-            vec![
-                AccountMeta::new_readonly(delegate.pubkey(), true),
-                AccountMeta::new(self.market, false),
-                AccountMeta::new(portfolio, false),
-                AccountMeta::new(lp_portfolio, false),
-                AccountMeta::new_readonly(matcher_program, false),
-                AccountMeta::new(matcher_context, false),
-                AccountMeta::new_readonly(matcher_delegate, false),
-                AccountMeta::new(authorization, false),
-            ],
+            accounts,
             &[delegate],
         )
     }
@@ -4396,6 +4426,80 @@ fn v16_bpf_scoped_order_authorization_is_exact_one_shot_and_oco() {
         env.order_authorization_state(expiring).state,
         ORDER_AUTHORIZATION_STATE_ACTIVE,
         "expiry must not mutate the signed authorization record"
+    );
+
+    let redirected = env.create_order_authorization(
+        &owner,
+        portfolio,
+        &delegate,
+        current_slot + 100,
+        1,
+        [open_branch, OrderAuthorizationBranch::default()],
+    );
+    let owner_lamports_before_redirect = env.svm.get_account(&owner.pubkey()).unwrap().lamports;
+    let delegate_lamports_before_redirect =
+        env.svm.get_account(&delegate.pubkey()).unwrap().lamports;
+    assert!(
+        env.try_execute_authorized_order_with_rent_destination(
+            &delegate,
+            portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            redirected,
+            0,
+            Some(delegate.pubkey()),
+        )
+        .is_err(),
+        "executor must not redirect authorization rent away from the recorded owner"
+    );
+    assert_eq!(
+        env.order_authorization_state(redirected).state,
+        ORDER_AUTHORIZATION_STATE_ACTIVE,
+        "wrong rent destination must roll back the fill and consumption"
+    );
+    assert_eq!(
+        env.svm.get_account(&owner.pubkey()).unwrap().lamports,
+        owner_lamports_before_redirect
+    );
+    assert_eq!(
+        env.svm.get_account(&delegate.pubkey()).unwrap().lamports,
+        delegate_lamports_before_redirect
+    );
+
+    let auto_close = env.create_order_authorization(
+        &owner,
+        portfolio,
+        &delegate,
+        current_slot + 100,
+        1,
+        [open_branch, OrderAuthorizationBranch::default()],
+    );
+    let rent = env.svm.get_account(&auto_close).unwrap().lamports;
+    let owner_lamports_before = env.svm.get_account(&owner.pubkey()).unwrap().lamports;
+    env.try_execute_authorized_order_with_rent_destination(
+        &delegate,
+        portfolio,
+        lp_portfolio,
+        matcher_program,
+        matcher_context,
+        matcher_delegate,
+        auto_close,
+        0,
+        Some(owner.pubkey()),
+    )
+    .expect("filled authorization atomically returns its rent");
+    assert_eq!(
+        env.svm.get_account(&owner.pubkey()).unwrap().lamports,
+        owner_lamports_before + rent,
+        "executor-triggered closure must return exactly the rent to the recorded owner"
+    );
+    assert!(
+        env.svm
+            .get_account(&auto_close)
+            .is_none_or(|account| account.lamports == 0 && account.data.is_empty()),
+        "filled authorization must close in the execution transaction"
     );
 }
 

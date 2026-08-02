@@ -7055,6 +7055,14 @@ pub mod processor {
                 &mut authorization_ai.try_borrow_mut_data()?,
                 &authorization,
             )?;
+            // Account 8 is optional for compatibility with existing executor transactions.
+            // New executors provide the authorization's recorded owner so a successful fill
+            // atomically returns rent without requiring a later wallet signature. The exact-key
+            // check prevents the delegate from redirecting any lamports.
+            if let Some(destination) = accounts.get(8) {
+                expect_key(destination, &Pubkey::new_from_array(authorization.owner))?;
+                close_order_authorization_account(authorization_ai, destination)?;
+            }
         }
         Ok(())
     }
@@ -7102,6 +7110,15 @@ pub mod processor {
         {
             return Err(PercolatorError::Unauthorized.into());
         }
+        close_order_authorization_account(authorization_ai, destination)
+    }
+
+    fn close_order_authorization_account(
+        authorization_ai: &AccountInfo,
+        destination: &AccountInfo,
+    ) -> ProgramResult {
+        expect_writable(authorization_ai)?;
+        expect_writable(destination)?;
         let recovered = authorization_ai.lamports();
         let destination_lamports = destination
             .lamports()
