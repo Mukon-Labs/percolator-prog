@@ -32,6 +32,22 @@ use solana_program::{
 
 declare_id!("Perco1ator111111111111111111111111111111111");
 
+// Opt-in SBF profiling only. Default/release builds contain no checkpoint
+// instructions or log traffic; `--features cu-audit` emits phase boundaries
+// around the matcher-backed trade path for deterministic CU attribution.
+#[cfg(feature = "cu-audit")]
+macro_rules! cu_checkpoint {
+    ($label:literal) => {{
+        solana_program::msg!(concat!("CU_CHECKPOINT:", $label));
+        solana_program::log::sol_log_compute_units();
+    }};
+}
+
+#[cfg(not(feature = "cu-audit"))]
+macro_rules! cu_checkpoint {
+    ($label:literal) => {};
+}
+
 pub mod constants {
     use core::mem::size_of;
     use percolator::{
@@ -6018,6 +6034,7 @@ pub mod processor {
         fee_bps: u64,
         max_market_slots: usize,
     ) -> ProgramResult {
+        cu_checkpoint!("trade_core:start");
         ensure_portfolio_storage_for_market_slots(account_a_ai, max_market_slots)?;
         ensure_portfolio_storage_for_market_slots(account_b_ai, max_market_slots)?;
         let mut cfg_after = None;
@@ -6082,6 +6099,7 @@ pub mod processor {
                 &account_b,
                 core::slice::from_ref(&req),
             )?;
+            cu_checkpoint!("trade_core:currentness_checked");
             let backing_before = if cfg.backing_trade_fee_policy_count == 0 {
                 None
             } else {
@@ -6094,6 +6112,7 @@ pub mod processor {
                 source_lien_effective_reserved_snapshot_for_trade_view(&account_a)?;
             let source_lien_before_b =
                 source_lien_effective_reserved_snapshot_for_trade_view(&account_b)?;
+            cu_checkpoint!("trade_core:source_snapshots_ready");
             let outcome = if size_q > 0 {
                 group
                     .execute_trade_with_fee_loss_stale_scoped_not_atomic(
@@ -6111,6 +6130,7 @@ pub mod processor {
                     )
                     .map_err(map_v16_error)?
             };
+            cu_checkpoint!("trade_core:engine_applied");
             if let Some((backing_before_a, backing_before_b)) = backing_before {
                 apply_backing_domain_fees_after_trade_view(
                     &cfg,
@@ -6152,10 +6172,12 @@ pub mod processor {
                 source_lien_before_b.as_ref(),
                 source_lien_after_b.as_ref(),
             )?;
+            cu_checkpoint!("trade_core:accounting_complete");
         }
         if let Some(cfg) = cfg_after {
             state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)?;
         }
+        cu_checkpoint!("trade_core:end");
         Ok(())
     }
 
@@ -7215,6 +7237,7 @@ pub mod processor {
         limit_price: u64,
         authorized_max_fee_bps: Option<u64>,
     ) -> Result<bool, ProgramError> {
+        cu_checkpoint!("trade_cpi:start");
         let signer_a = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
         let account_a_ai = account(accounts, 2)?;
@@ -7319,6 +7342,7 @@ pub mod processor {
         let (_, _, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         let cpi_requests = [(asset_index, size_q)];
+        cu_checkpoint!("trade_cpi:before_currentness");
         ensure_cpi_trade_portfolios_current_before_matcher(
             market_ai,
             account_a_ai,
@@ -7326,6 +7350,7 @@ pub mod processor {
             max_market_slots,
             &cpi_requests,
         )?;
+        cu_checkpoint!("trade_cpi:before_matcher");
         let req_id = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             state::bump_matcher_req_seq(&mut market_data)?
@@ -7352,6 +7377,7 @@ pub mod processor {
                 &[bump],
             ],
         )?;
+        cu_checkpoint!("trade_cpi:matcher_returned");
 
         let ret = {
             let data = matcher_ctx.try_borrow_data()?;
@@ -7392,6 +7418,7 @@ pub mod processor {
         }
         let (_, _, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        cu_checkpoint!("trade_cpi:before_engine");
         handle_trade_nocpi_zero_copy(
             program_id,
             account_a_owner_key,
@@ -7405,6 +7432,7 @@ pub mod processor {
             fee_bps,
             max_market_slots,
         )?;
+        cu_checkpoint!("trade_cpi:end");
         Ok(true)
     }
 
