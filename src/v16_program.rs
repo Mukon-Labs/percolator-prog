@@ -2852,6 +2852,13 @@ pub mod ix {
             asset_index: u16,
             side: u8,
         },
+        /// Authority-gated migration for markets that admitted fresh basis
+        /// after quantity ADL. The supplied portfolio owner co-signs as the
+        /// economically affected side witness.
+        ReconcileLegacyAdlPartition {
+            asset_index: u16,
+            side: u8,
+        },
         ClaimResolvedPayoutTopup,
         SyncMaintenanceFee {
             now_slot: u64,
@@ -3154,6 +3161,10 @@ pub mod ix {
                     reduce_q: read_u128(&mut rest)?,
                 },
                 45 => Self::FinalizeResetSide {
+                    asset_index: read_u16(&mut rest)?,
+                    side: read_u8(&mut rest)?,
+                },
+                75 => Self::ReconcileLegacyAdlPartition {
                     asset_index: read_u16(&mut rest)?,
                     side: read_u8(&mut rest)?,
                 },
@@ -3583,6 +3594,11 @@ pub mod ix {
                 }
                 Self::FinalizeResetSide { asset_index, side } => {
                     out.push(45);
+                    push_u16(&mut out, asset_index);
+                    out.push(side);
+                }
+                Self::ReconcileLegacyAdlPartition { asset_index, side } => {
+                    out.push(75);
                     push_u16(&mut out, asset_index);
                     out.push(side);
                 }
@@ -5704,6 +5720,9 @@ pub mod processor {
             } => handle_rebalance_reduce(program_id, accounts, asset_index, reduce_q),
             Instruction::FinalizeResetSide { asset_index, side } => {
                 handle_finalize_reset_side(program_id, accounts, asset_index, side)
+            }
+            Instruction::ReconcileLegacyAdlPartition { asset_index, side } => {
+                handle_reconcile_legacy_adl_partition(program_id, accounts, asset_index, side)
             }
             Instruction::ClaimResolvedPayoutTopup => {
                 handle_claim_resolved_payout_topup(program_id, accounts)
@@ -10237,6 +10256,87 @@ pub mod processor {
     }
 
     #[inline(never)]
+    fn handle_reconcile_legacy_adl_partition<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        asset_index: u16,
+        side: u8,
+    ) -> ProgramResult {
+        let marketauth = account(accounts, 0)?;
+        let portfolio_owner = account(accounts, 1)?;
+        let market_ai = account(accounts, 2)?;
+        let portfolio_ai = account(accounts, 3)?;
+        expect_signer(marketauth)?;
+        expect_signer(portfolio_owner)?;
+        expect_writable(market_ai)?;
+        expect_writable(portfolio_ai)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(portfolio_ai, program_id)?;
+
+        let (_, mode, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        ensure_portfolio_storage_for_market_slots(portfolio_ai, max_market_slots)?;
+        let side = decode_side(side)?;
+        let asset_index = asset_index as usize;
+
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+        expect_live_authority(&cfg.marketauth, marketauth.key)?;
+        reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
+        if asset_index >= group.header.config.max_market_slots.get() as usize
+            || asset_index >= group.markets.len()
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+
+        let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
+        let mut portfolio =
+            state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
+        expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
+        expect_portfolio_view_owner(&portfolio, portfolio_owner.key)?;
+        portfolio
+            .as_view()
+            .validate_with_market(&group.as_view())
+            .map_err(map_v16_error)?;
+
+        let leg = active_leg_for_asset_view(&portfolio, asset_index)?;
+        let asset = group.markets[asset_index]
+            .engine
+            .asset
+            .try_to_runtime()
+            .map_err(map_v16_error)?;
+        if leg.side != side || leg.market_id != asset.market_id {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        let (oi_eff, weight_sum) = match side {
+            SideV16::Long => (asset.oi_eff_long_q, asset.loss_weight_sum_long),
+            SideV16::Short => (asset.oi_eff_short_q, asset.loss_weight_sum_short),
+        };
+        let excess_weight = weight_sum
+            .checked_sub(oi_eff)
+            .ok_or(PercolatorError::EngineRecoveryRequired)?;
+        if excess_weight == 0 || leg.loss_weight < excess_weight {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+
+        group
+            .reconcile_legacy_adl_partition_for_witness_not_atomic(
+                &mut portfolio,
+                asset_index,
+                side,
+            )
+            .map_err(map_v16_error)?;
+        group.validate_shape().map_err(map_v16_error)?;
+        portfolio
+            .as_view()
+            .validate_with_market(&group.as_view())
+            .map_err(map_v16_error)
+    }
+
+    #[inline(never)]
     fn handle_update_liquidation_fee_policy<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
@@ -13037,6 +13137,20 @@ pub mod processor {
             let mut trailing = encoded;
             trailing.push(0);
             assert!(Instruction::decode(&trailing).is_err());
+        }
+
+        #[test]
+        fn legacy_adl_partition_reconcile_wire_format_is_stable() {
+            let instruction = Instruction::ReconcileLegacyAdlPartition {
+                asset_index: 3,
+                side: 1,
+            };
+            assert_eq!(instruction.encode(), vec![75, 3, 0, 1]);
+            assert_eq!(
+                Instruction::decode(&instruction.encode()).unwrap(),
+                instruction
+            );
+            assert!(Instruction::decode(&[75, 3, 0, 1, 0]).is_err());
         }
 
         #[test]
