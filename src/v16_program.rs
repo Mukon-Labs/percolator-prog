@@ -32,6 +32,8 @@ use solana_program::{
 
 declare_id!("Perco1ator111111111111111111111111111111111");
 
+pub mod ninja_order_commitment;
+
 // Opt-in SBF profiling only. Default/release builds contain no checkpoint
 // instructions or log traffic; `--features cu-audit` emits phase boundaries
 // around the matcher-backed trade path for deterministic CU attribution.
@@ -62,6 +64,7 @@ pub mod constants {
     pub const KIND_BACKING_DOMAIN_LEDGER: u8 = 3;
     pub const KIND_INSURANCE_LEDGER: u8 = 4;
     pub const KIND_ORDER_AUTHORIZATION: u8 = 5;
+    pub const KIND_PRIVATE_ORDER_AUTHORIZATION: u8 = 6;
 
     pub const HEADER_LEN: usize = 16;
     pub const WRAPPER_CONFIG_LEN: usize = 448;
@@ -180,12 +183,12 @@ pub mod state {
         constants::{
             ASSET_ORACLE_PROFILE_LEN, ASSET_ORACLE_WRAPPER_LEN, HEADER_LEN,
             KIND_BACKING_DOMAIN_LEDGER, KIND_INSURANCE_LEDGER, KIND_MARKET,
-            KIND_ORDER_AUTHORIZATION, KIND_PORTFOLIO, MAGIC, MARKET_GROUP_LEN, MARKET_GROUP_OFF,
-            MIN_MARKET_ACCOUNT_LEN, ORACLE_LEG_CAP, ORACLE_LEG_FLAGS_MASK, ORACLE_MODE_AUTH_MARK,
-            ORACLE_MODE_EWMA_MARK, ORACLE_MODE_HYBRID_AFTER_HOURS, ORACLE_MODE_MANUAL,
-            ORDER_AUTHORIZATION_BRANCH_CAP, PORTFOLIO_ACCOUNT_LEN, PORTFOLIO_ENGINE_ACCOUNT_LEN,
-            PORTFOLIO_MATCHER_CONFIG_LEN, PORTFOLIO_MATCHER_CONFIG_OFF, PORTFOLIO_STATE_LEN,
-            VERSION, WRAPPER_CONFIG_LEN,
+            KIND_ORDER_AUTHORIZATION, KIND_PORTFOLIO, KIND_PRIVATE_ORDER_AUTHORIZATION, MAGIC,
+            MARKET_GROUP_LEN, MARKET_GROUP_OFF, MIN_MARKET_ACCOUNT_LEN, ORACLE_LEG_CAP,
+            ORACLE_LEG_FLAGS_MASK, ORACLE_MODE_AUTH_MARK, ORACLE_MODE_EWMA_MARK,
+            ORACLE_MODE_HYBRID_AFTER_HOURS, ORACLE_MODE_MANUAL, ORDER_AUTHORIZATION_BRANCH_CAP,
+            PORTFOLIO_ACCOUNT_LEN, PORTFOLIO_ENGINE_ACCOUNT_LEN, PORTFOLIO_MATCHER_CONFIG_LEN,
+            PORTFOLIO_MATCHER_CONFIG_OFF, PORTFOLIO_STATE_LEN, VERSION, WRAPPER_CONFIG_LEN,
         },
         error::PercolatorError,
     };
@@ -757,6 +760,27 @@ pub mod state {
         pub _reserved: [u8; 13],
     }
 
+    /// Opaque, one-shot authorization for a Ninja Order. No asset, direction,
+    /// size, trigger, limit, fee, or OCO-shape field is present while pending.
+    /// Those terms live only in the salted committed reveal and are checked by
+    /// the atomic execution instruction when the chosen branch triggers.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct PrivateOrderAuthorizationV16 {
+        pub commitment: [u8; 32],
+        pub market_group: [u8; 32],
+        pub portfolio: [u8; 32],
+        pub owner: [u8; 32],
+        pub delegate: [u8; 32],
+        pub authorization_account_id: [u8; 32],
+        pub expiry_slot: u64,
+        pub created_slot: u64,
+        pub market_instance_id: u64,
+        pub portfolio_instance_id: u64,
+        pub state: u8,
+        pub _reserved: [u8; 15],
+    }
+
     pub type AssetOracleStorageV16 = [u8; ASSET_ORACLE_WRAPPER_LEN];
     pub type MarketViewMutV16<'a> = MarketGroupV16ViewMut<'a, AssetOracleStorageV16>;
 
@@ -868,6 +892,55 @@ pub mod state {
         check_header(data, KIND_ORDER_AUTHORIZATION)?;
         let end = HEADER_LEN
             .checked_add(core::mem::size_of::<OrderAuthorizationV16>())
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        let bytes = data
+            .get_mut(HEADER_LEN..end)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        bytes.copy_from_slice(bytemuck::bytes_of(authorization));
+        Ok(())
+    }
+
+    pub const fn private_order_authorization_account_len() -> usize {
+        HEADER_LEN + core::mem::size_of::<PrivateOrderAuthorizationV16>()
+    }
+
+    pub fn init_private_order_authorization_account(
+        data: &mut [u8],
+        authorization: &PrivateOrderAuthorizationV16,
+    ) -> Result<(), ProgramError> {
+        if data.len() < private_order_authorization_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        if is_initialized(data) {
+            return Err(PercolatorError::AlreadyInitialized.into());
+        }
+        for byte in data.iter_mut() {
+            *byte = 0;
+        }
+        write_header(data, KIND_PRIVATE_ORDER_AUTHORIZATION)?;
+        write_private_order_authorization(data, authorization)
+    }
+
+    pub fn read_private_order_authorization(
+        data: &[u8],
+    ) -> Result<PrivateOrderAuthorizationV16, ProgramError> {
+        check_header(data, KIND_PRIVATE_ORDER_AUTHORIZATION)?;
+        let end = HEADER_LEN
+            .checked_add(core::mem::size_of::<PrivateOrderAuthorizationV16>())
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        let bytes = data
+            .get(HEADER_LEN..end)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        Ok(bytemuck::pod_read_unaligned(bytes))
+    }
+
+    pub fn write_private_order_authorization(
+        data: &mut [u8],
+        authorization: &PrivateOrderAuthorizationV16,
+    ) -> Result<(), ProgramError> {
+        check_header(data, KIND_PRIVATE_ORDER_AUTHORIZATION)?;
+        let end = HEADER_LEN
+            .checked_add(core::mem::size_of::<PrivateOrderAuthorizationV16>())
             .ok_or(PercolatorError::InvalidAccountLen)?;
         let bytes = data
             .get_mut(HEADER_LEN..end)
@@ -2682,6 +2755,21 @@ pub mod ix {
         },
         RevokeOrder,
         CloseOrderAuthorization,
+        /// Store only a salted reveal commitment and deliberately public
+        /// lifecycle scope. No branch term is persisted in this account.
+        AuthorizePrivateOrder {
+            delegate: [u8; 32],
+            expiry_slot: u64,
+            commitment: [u8; 32],
+        },
+        /// Atomically open the commitment, revalidate the selected branch
+        /// against live state, execute it, and consume the authorization.
+        ExecutePrivateOrder {
+            branch_index: u8,
+            reveal: Vec<u8>,
+        },
+        RevokePrivateOrder,
+        ClosePrivateOrderAuthorization,
         /// One-time authority initialization of the scoped-order generation for this slab
         /// incarnation. A fresh non-zero random value must be used after every CloseSlab/re-init.
         InitializeOrderMarketInstance {
@@ -2971,6 +3059,26 @@ pub mod ix {
                 74 => Self::InitializeOrderMarketInstance {
                     instance_id: read_u64(&mut rest)?,
                 },
+                76 => Self::AuthorizePrivateOrder {
+                    delegate: read_bytes32(&mut rest)?,
+                    expiry_slot: read_u64(&mut rest)?,
+                    commitment: read_bytes32(&mut rest)?,
+                },
+                77 => {
+                    let branch_index = read_u8(&mut rest)?;
+                    let reveal_len = crate::ninja_order_commitment::NINJA_ORDER_REVEAL_V1_LEN;
+                    if rest.len() < reveal_len {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
+                    let reveal = rest[..reveal_len].to_vec();
+                    rest = &rest[reveal_len..];
+                    Self::ExecutePrivateOrder {
+                        branch_index,
+                        reveal,
+                    }
+                }
+                78 => Self::RevokePrivateOrder,
+                79 => Self::ClosePrivateOrderAuthorization,
                 66 => {
                     let n = read_u8(&mut rest)? as usize;
                     if n > BATCH_TRADE_DECODE_MAX_LEGS {
@@ -3307,6 +3415,26 @@ pub mod ix {
                     out.push(74);
                     push_u64(&mut out, instance_id);
                 }
+                Self::AuthorizePrivateOrder {
+                    delegate,
+                    expiry_slot,
+                    commitment,
+                } => {
+                    out.push(76);
+                    out.extend_from_slice(&delegate);
+                    push_u64(&mut out, expiry_slot);
+                    out.extend_from_slice(&commitment);
+                }
+                Self::ExecutePrivateOrder {
+                    branch_index,
+                    ref reveal,
+                } => {
+                    out.push(77);
+                    out.push(branch_index);
+                    out.extend_from_slice(reveal);
+                }
+                Self::RevokePrivateOrder => out.push(78),
+                Self::ClosePrivateOrderAuthorization => out.push(79),
                 Self::BatchTradeNoCpi { ref legs } => {
                     out.push(66);
                     out.push(legs.len() as u8);
@@ -5505,6 +5633,25 @@ pub mod processor {
             Instruction::InitializeOrderMarketInstance { instance_id } => {
                 handle_initialize_order_market_instance(program_id, accounts, instance_id)
             }
+            Instruction::AuthorizePrivateOrder {
+                delegate,
+                expiry_slot,
+                commitment,
+            } => handle_authorize_private_order(
+                program_id,
+                accounts,
+                delegate,
+                expiry_slot,
+                commitment,
+            ),
+            Instruction::ExecutePrivateOrder {
+                branch_index,
+                reveal,
+            } => handle_execute_private_order(program_id, accounts, branch_index, &reveal),
+            Instruction::RevokePrivateOrder => handle_revoke_private_order(program_id, accounts),
+            Instruction::ClosePrivateOrderAuthorization => {
+                handle_close_private_order_authorization(program_id, accounts)
+            }
             Instruction::BatchTradeNoCpi { legs } => {
                 handle_batch_trade_nocpi(program_id, accounts, &legs)
             }
@@ -7146,6 +7293,261 @@ pub mod processor {
         expect_owner(authorization_ai, program_id)?;
         expect_key(destination, owner.key)?;
         let authorization = state::read_order_authorization(&authorization_ai.try_borrow_data()?)?;
+        if authorization.authorization_account_id != authorization_ai.key.to_bytes()
+            || authorization.owner != owner.key.to_bytes()
+        {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        close_order_authorization_account(authorization_ai, destination)
+    }
+
+    fn handle_authorize_private_order<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        delegate: [u8; 32],
+        expiry_slot: u64,
+        commitment: [u8; 32],
+    ) -> ProgramResult {
+        let owner = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let portfolio_ai = account(accounts, 2)?;
+        let authorization_ai = account(accounts, 3)?;
+        expect_signer(owner)?;
+        expect_signer(authorization_ai)?;
+        expect_writable(market_ai)?;
+        expect_writable(portfolio_ai)?;
+        expect_writable(authorization_ai)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(portfolio_ai, program_id)?;
+        expect_owner(authorization_ai, program_id)?;
+        let authorization_data = authorization_ai.try_borrow_data()?;
+        if delegate == [0; 32]
+            || commitment == [0; 32]
+            || authorization_data.len() != state::private_order_authorization_account_len()
+            || authorization_data.iter().any(|byte| *byte != 0)
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        drop(authorization_data);
+        let current_slot = Clock::get()?.slot;
+        if expiry_slot <= current_slot {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let (portfolio_header, portfolio_owner) =
+            state::read_portfolio_owner_preflight(&portfolio_ai.try_borrow_data()?)?;
+        if portfolio_header.market_group_id != market_ai.key.to_bytes()
+            || portfolio_header.portfolio_account_id != portfolio_ai.key.to_bytes()
+            || portfolio_owner != owner.key.to_bytes()
+        {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        let (market_instance_id, portfolio_instance_id) =
+            ensure_order_portfolio_instance(market_ai, portfolio_ai)?;
+        let authorization = state::PrivateOrderAuthorizationV16 {
+            commitment,
+            market_group: market_ai.key.to_bytes(),
+            portfolio: portfolio_ai.key.to_bytes(),
+            owner: owner.key.to_bytes(),
+            delegate,
+            authorization_account_id: authorization_ai.key.to_bytes(),
+            expiry_slot,
+            created_slot: current_slot,
+            market_instance_id,
+            portfolio_instance_id,
+            state: constants::ORDER_AUTHORIZATION_STATE_ACTIVE,
+            _reserved: [0; 15],
+        };
+        state::init_private_order_authorization_account(
+            &mut authorization_ai.try_borrow_mut_data()?,
+            &authorization,
+        )
+    }
+
+    fn ninja_branch_to_state(
+        branch: crate::ninja_order_commitment::NinjaOrderBranchV1,
+    ) -> state::OrderAuthorizationBranchV16 {
+        state::OrderAuthorizationBranchV16 {
+            size_q: branch.size_q,
+            trigger_price_e6: branch.trigger_price_e6,
+            limit_price_e6: branch.limit_price_e6,
+            max_fee_bps: branch.max_fee_bps,
+            asset_market_id: branch.asset_market_id,
+            asset_index: branch.asset_index,
+            trigger_condition: branch.trigger_condition,
+            reduce_only: branch.reduce_only,
+            _reserved: [0; 12],
+        }
+    }
+
+    fn validate_exact_reduce_only_order<'a>(
+        market_ai: &AccountInfo<'a>,
+        portfolio_ai: &AccountInfo<'a>,
+        branch: &state::OrderAuthorizationBranchV16,
+    ) -> ProgramResult {
+        if branch.reduce_only == 0 {
+            return Ok(());
+        }
+        let (_, _, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
+        let portfolio =
+            state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
+        let leg = active_leg_for_asset_view(&portfolio, branch.asset_index as usize)?;
+        let reduces_existing_side = if branch.size_q > 0 {
+            leg.side == SideV16::Short
+        } else {
+            leg.side == SideV16::Long
+        };
+        if !reduces_existing_side || branch.size_q.unsigned_abs() != leg.basis_pos_q.unsigned_abs()
+        {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        Ok(())
+    }
+
+    fn handle_execute_private_order<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        branch_index: u8,
+        reveal: &[u8],
+    ) -> ProgramResult {
+        let delegate = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let portfolio_ai = account(accounts, 2)?;
+        let authorization_ai = account(accounts, 7)?;
+        expect_signer(delegate)?;
+        expect_writable(authorization_ai)?;
+        expect_owner(authorization_ai, program_id)?;
+
+        let mut authorization =
+            state::read_private_order_authorization(&authorization_ai.try_borrow_data()?)?;
+        if authorization.state != constants::ORDER_AUTHORIZATION_STATE_ACTIVE
+            || authorization.authorization_account_id != authorization_ai.key.to_bytes()
+            || authorization.market_group != market_ai.key.to_bytes()
+            || authorization.portfolio != portfolio_ai.key.to_bytes()
+            || authorization.delegate != delegate.key.to_bytes()
+            || authorization.market_instance_id == 0
+            || authorization.portfolio_instance_id == 0
+            || authorization.commitment == [0; 32]
+            || authorization._reserved != [0; 15]
+        {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+
+        crate::ninja_order_commitment::verify_ninja_order_commitment_v1(
+            &authorization.commitment,
+            reveal,
+        )?;
+        let header = crate::ninja_order_commitment::decode_ninja_order_header_v1(reveal)?;
+        if header.market != authorization.market_group
+            || header.portfolio != authorization.portfolio
+            || header.owner != authorization.owner
+            || header.delegate != authorization.delegate
+            || header.authorization != authorization.authorization_account_id
+            || header.expiry_slot != authorization.expiry_slot
+            || branch_index >= header.branch_count
+        {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+
+        let current_slot = Clock::get()?.slot;
+        if current_slot > authorization.expiry_slot {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        let (_, portfolio_owner) =
+            state::read_portfolio_owner_preflight(&portfolio_ai.try_borrow_data()?)?;
+        let live_market_instance_id =
+            state::read_order_market_instance_id(&market_ai.try_borrow_data()?)?;
+        let live_portfolio_instance_id =
+            state::read_portfolio_instance_id(&portfolio_ai.try_borrow_data()?)?;
+        if portfolio_owner != authorization.owner
+            || live_market_instance_id != authorization.market_instance_id
+            || live_portfolio_instance_id != authorization.portfolio_instance_id
+        {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+
+        let branch = ninja_branch_to_state(
+            crate::ninja_order_commitment::decode_ninja_order_branch_v1(reveal, branch_index)?,
+        );
+        validate_order_branch_shape(market_ai, &branch)?;
+        let (_, mode, _, oracle_price, _) = state::read_market_trade_preflight(
+            &market_ai.try_borrow_data()?,
+            branch.asset_index as usize,
+        )?;
+        if mode != MarketModeV16::Live
+            || !order_trigger_satisfied(
+                branch.trigger_condition,
+                oracle_price,
+                branch.trigger_price_e6,
+            )
+        {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        validate_exact_reduce_only_order(market_ai, portfolio_ai, &branch)?;
+        let filled = execute_trade_cpi_scoped(
+            program_id,
+            accounts,
+            &Pubkey::new_from_array(authorization.owner),
+            1,
+            branch.asset_index,
+            branch.size_q,
+            0,
+            branch.limit_price_e6,
+            Some(branch.max_fee_bps),
+        )?;
+        if filled {
+            authorization.state = constants::ORDER_AUTHORIZATION_STATE_CONSUMED;
+            state::write_private_order_authorization(
+                &mut authorization_ai.try_borrow_mut_data()?,
+                &authorization,
+            )?;
+            if let Some(destination) = accounts.get(8) {
+                expect_key(destination, &Pubkey::new_from_array(authorization.owner))?;
+                close_order_authorization_account(authorization_ai, destination)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_revoke_private_order<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        let owner = account(accounts, 0)?;
+        let authorization_ai = account(accounts, 1)?;
+        expect_signer(owner)?;
+        expect_writable(authorization_ai)?;
+        expect_owner(authorization_ai, program_id)?;
+        let mut authorization =
+            state::read_private_order_authorization(&authorization_ai.try_borrow_data()?)?;
+        if authorization.authorization_account_id != authorization_ai.key.to_bytes()
+            || authorization.owner != owner.key.to_bytes()
+            || authorization.state != constants::ORDER_AUTHORIZATION_STATE_ACTIVE
+        {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        authorization.state = constants::ORDER_AUTHORIZATION_STATE_REVOKED;
+        state::write_private_order_authorization(
+            &mut authorization_ai.try_borrow_mut_data()?,
+            &authorization,
+        )
+    }
+
+    fn handle_close_private_order_authorization<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        let owner = account(accounts, 0)?;
+        let authorization_ai = account(accounts, 1)?;
+        let destination = account(accounts, 2)?;
+        expect_signer(owner)?;
+        expect_writable(authorization_ai)?;
+        expect_writable(destination)?;
+        expect_owner(authorization_ai, program_id)?;
+        expect_key(destination, owner.key)?;
+        let authorization =
+            state::read_private_order_authorization(&authorization_ai.try_borrow_data()?)?;
         if authorization.authorization_account_id != authorization_ai.key.to_bytes()
             || authorization.owner != owner.key.to_bytes()
         {
@@ -13054,6 +13456,43 @@ pub mod processor {
         }
 
         #[test]
+        fn private_order_authorization_layout_and_state_round_trip_are_exact() {
+            assert_eq!(
+                core::mem::size_of::<state::PrivateOrderAuthorizationV16>(),
+                240
+            );
+            assert_eq!(state::private_order_authorization_account_len(), 256);
+            let authorization = state::PrivateOrderAuthorizationV16 {
+                commitment: [1; 32],
+                market_group: [2; 32],
+                portfolio: [3; 32],
+                owner: [4; 32],
+                delegate: [5; 32],
+                authorization_account_id: [6; 32],
+                expiry_slot: 50,
+                created_slot: 10,
+                market_instance_id: 11,
+                portfolio_instance_id: 12,
+                state: constants::ORDER_AUTHORIZATION_STATE_ACTIVE,
+                _reserved: [0; 15],
+            };
+            let mut data = vec![0u8; state::private_order_authorization_account_len()];
+            state::init_private_order_authorization_account(&mut data, &authorization).unwrap();
+            assert_eq!(
+                state::read_private_order_authorization(&data).unwrap(),
+                authorization
+            );
+            assert!(state::read_order_authorization(&data).is_err());
+            let mut consumed = authorization;
+            consumed.state = constants::ORDER_AUTHORIZATION_STATE_CONSUMED;
+            state::write_private_order_authorization(&mut data, &consumed).unwrap();
+            assert_eq!(
+                state::read_private_order_authorization(&data).unwrap(),
+                consumed
+            );
+        }
+
+        #[test]
         fn portfolio_instance_packing_preserves_matcher_enablement() {
             let mut cfg = state::PortfolioMatcherConfigV16::default();
             assert!(!cfg.matcher_enabled());
@@ -13137,6 +13576,46 @@ pub mod processor {
             let mut trailing = encoded;
             trailing.push(0);
             assert!(Instruction::decode(&trailing).is_err());
+        }
+
+        #[test]
+        fn private_order_instruction_wire_format_is_stable() {
+            let authorize = Instruction::AuthorizePrivateOrder {
+                delegate: [9; 32],
+                expiry_slot: 777,
+                commitment: [8; 32],
+            };
+            let encoded = authorize.encode();
+            assert_eq!(encoded.len(), 73);
+            assert_eq!(encoded[0], 76);
+            assert_eq!(Instruction::decode(&encoded).unwrap(), authorize);
+
+            let execute = Instruction::ExecutePrivateOrder {
+                branch_index: 1,
+                reveal: vec![7; crate::ninja_order_commitment::NINJA_ORDER_REVEAL_V1_LEN],
+            };
+            let encoded = execute.encode();
+            assert_eq!(encoded.len(), 346);
+            assert_eq!(encoded[0..2], [77, 1]);
+            assert_eq!(Instruction::decode(&encoded).unwrap(), execute);
+            assert!(Instruction::decode(&encoded[..encoded.len() - 1]).is_err());
+            let mut trailing = encoded;
+            trailing.push(0);
+            assert!(Instruction::decode(&trailing).is_err());
+
+            assert_eq!(Instruction::RevokePrivateOrder.encode(), vec![78]);
+            assert_eq!(
+                Instruction::decode(&Instruction::RevokePrivateOrder.encode()).unwrap(),
+                Instruction::RevokePrivateOrder
+            );
+            assert_eq!(
+                Instruction::ClosePrivateOrderAuthorization.encode(),
+                vec![79]
+            );
+            assert_eq!(
+                Instruction::decode(&Instruction::ClosePrivateOrderAuthorization.encode()).unwrap(),
+                Instruction::ClosePrivateOrderAuthorization
+            );
         }
 
         #[test]

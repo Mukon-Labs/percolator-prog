@@ -15,7 +15,7 @@ use percolator_prog::{
         BatchTradeCpiLeg, BatchTradeLeg, CrankObservationHint, Instruction as ProgInstruction,
         OrderAuthorizationBranch,
     },
-    oracle_v16, processor, state,
+    ninja_order_commitment, oracle_v16, processor, state,
     state::{MarketGroupV16, PortfolioAccountV16},
 };
 use solana_sdk::{
@@ -37,6 +37,7 @@ use std::path::PathBuf;
 const CRANK_CU_LIMIT: u64 = 325_000;
 const CUSTODY_CU_LIMIT: u64 = 300_000;
 const TRADE_CU_LIMIT: u64 = 345_000;
+const PRIVATE_ORDER_CU_LIMIT: u64 = 375_000;
 const MULTI_ASSET_OPEN_TRADE_CU_LIMIT: u64 = 750_000;
 const MATCHER_CONTEXT_LEN: usize = 320;
 const AUTH_MATCHER_EXEC_PRICE_OFFSET: usize = 97;
@@ -57,6 +58,48 @@ fn crank_observations_with_accounts(
         asset_index,
         oracle_accounts,
     }]
+}
+
+fn ninja_reveal(
+    market: Pubkey,
+    portfolio: Pubkey,
+    owner: Pubkey,
+    delegate: Pubkey,
+    authorization: Pubkey,
+    expiry_slot: u64,
+    branch_count: u8,
+    branches: [OrderAuthorizationBranch; 2],
+) -> Vec<u8> {
+    let mut reveal = vec![0u8; ninja_order_commitment::NINJA_ORDER_REVEAL_V1_LEN];
+    reveal[..8].copy_from_slice(ninja_order_commitment::NINJA_ORDER_REVEAL_MAGIC_V1);
+    for (offset, pubkey) in [
+        (8, market),
+        (40, portfolio),
+        (72, owner),
+        (104, delegate),
+        (136, authorization),
+    ] {
+        reveal[offset..offset + 32].copy_from_slice(pubkey.as_ref());
+    }
+    reveal[168..176].copy_from_slice(&expiry_slot.to_le_bytes());
+    reveal[176] = branch_count;
+    for (index, branch) in branches.iter().take(branch_count as usize).enumerate() {
+        let offset = 184 + index * 64;
+        reveal[offset..offset + 16].copy_from_slice(&branch.size_q.to_le_bytes());
+        reveal[offset + 16..offset + 24].copy_from_slice(&branch.trigger_price_e6.to_le_bytes());
+        reveal[offset + 24..offset + 32].copy_from_slice(&branch.limit_price_e6.to_le_bytes());
+        reveal[offset + 32..offset + 40].copy_from_slice(&branch.max_fee_bps.to_le_bytes());
+        reveal[offset + 40..offset + 48].copy_from_slice(&branch.asset_market_id.to_le_bytes());
+        reveal[offset + 48..offset + 50].copy_from_slice(&branch.asset_index.to_le_bytes());
+        reveal[offset + 50] = branch.trigger_condition;
+        reveal[offset + 51] = branch.reduce_only;
+    }
+    for (index, byte) in reveal[312..].iter_mut().enumerate() {
+        *byte = (index + 1) as u8;
+    }
+    ninja_order_commitment::validate_ninja_order_reveal_v1(&reveal)
+        .expect("canonical Ninja Order reveal");
+    reveal
 }
 
 fn active_bitmap_with(indices: &[usize]) -> percolator::V16ActiveBitmap {
@@ -2413,6 +2456,110 @@ impl V16CuEnv {
         state::read_order_authorization(&account.data).expect("valid order authorization")
     }
 
+    fn create_private_order_authorization(
+        &mut self,
+        owner: &Keypair,
+        portfolio: Pubkey,
+        delegate: &Keypair,
+        expiry_slot: u64,
+        branch_count: u8,
+        branches: [OrderAuthorizationBranch; 2],
+    ) -> (Pubkey, Vec<u8>) {
+        let authorization = Keypair::new();
+        self.ensure_signer_account(delegate.pubkey());
+        let reveal = ninja_reveal(
+            self.market,
+            portfolio,
+            owner.pubkey(),
+            delegate.pubkey(),
+            authorization.pubkey(),
+            expiry_slot,
+            branch_count,
+            branches,
+        );
+        let commitment = ninja_order_commitment::ninja_order_commitment_v1(&reveal)
+            .expect("Ninja Order commitment");
+        let authorization_lamports = self
+            .svm
+            .get_sysvar::<Rent>()
+            .minimum_balance(state::private_order_authorization_account_len());
+        send_raw_ixs(
+            &mut self.svm,
+            &self.payer,
+            vec![
+                system_instruction::create_account(
+                    &self.payer.pubkey(),
+                    &authorization.pubkey(),
+                    authorization_lamports,
+                    state::private_order_authorization_account_len() as u64,
+                    &self.program_id,
+                ),
+                Instruction {
+                    program_id: self.program_id,
+                    accounts: vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(self.market, false),
+                        AccountMeta::new(portfolio, false),
+                        AccountMeta::new(authorization.pubkey(), true),
+                    ],
+                    data: ProgInstruction::AuthorizePrivateOrder {
+                        delegate: delegate.pubkey().to_bytes(),
+                        expiry_slot,
+                        commitment,
+                    }
+                    .encode(),
+                },
+            ],
+            &[owner, &authorization],
+        )
+        .expect("authorize private order");
+        (authorization.pubkey(), reveal)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_execute_private_order(
+        &mut self,
+        delegate: &Keypair,
+        portfolio: Pubkey,
+        lp_portfolio: Pubkey,
+        matcher_program: Pubkey,
+        matcher_context: Pubkey,
+        matcher_delegate: Pubkey,
+        authorization: Pubkey,
+        branch_index: u8,
+        reveal: Vec<u8>,
+    ) -> Result<u64, String> {
+        self.send(
+            ProgInstruction::ExecutePrivateOrder {
+                branch_index,
+                reveal,
+            },
+            vec![
+                AccountMeta::new_readonly(delegate.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(portfolio, false),
+                AccountMeta::new(lp_portfolio, false),
+                AccountMeta::new_readonly(matcher_program, false),
+                AccountMeta::new(matcher_context, false),
+                AccountMeta::new_readonly(matcher_delegate, false),
+                AccountMeta::new(authorization, false),
+            ],
+            &[delegate],
+        )
+    }
+
+    fn private_order_authorization_state(
+        &self,
+        authorization: Pubkey,
+    ) -> state::PrivateOrderAuthorizationV16 {
+        let account = self
+            .svm
+            .get_account(&authorization)
+            .expect("private order authorization account");
+        state::read_private_order_authorization(&account.data)
+            .expect("valid private order authorization")
+    }
+
     fn withdraw(&mut self, owner: &Keypair, portfolio: Pubkey, amount: u128) -> Pubkey {
         self.withdraw_with_cu(owner, portfolio, amount).0
     }
@@ -3980,6 +4127,214 @@ fn assert_cu_within(label: &str, cu: u64, limit: u64) {
     assert!(
         cu <= limit,
         "{label} consumed {cu} CU, above the {limit} CU guardrail"
+    );
+}
+
+#[test]
+fn v16_bpf_ninja_order_hides_terms_and_atomically_executes_limit_and_oco() {
+    let mut env = V16CuEnv::new();
+    env.initialize_order_market_instance(0x2130_4050_6070_8090);
+    let matcher_program = Pubkey::new_unique();
+    let matcher_bytes = std::fs::read(auth_matcher_program_path()).expect("read auth matcher BPF");
+    env.svm.add_program(matcher_program, &matcher_bytes);
+
+    let owner = Keypair::new();
+    let lp_owner = Keypair::new();
+    let delegate = Keypair::new();
+    let portfolio = env.create_portfolio(&owner);
+    let lp_portfolio = env.create_portfolio(&lp_owner);
+    env.deposit(&owner, portfolio, 1_000_000_000);
+    env.deposit(&lp_owner, lp_portfolio, 1_000_000_000);
+    let (matcher_context, matcher_delegate, _) =
+        env.init_auth_matcher_context(matcher_program, &lp_owner, lp_portfolio);
+
+    let order_size = (10 * POS_SCALE) as i128;
+    let asset_market_id = env.market_state().1.assets[0].market_id;
+    let open_branch = OrderAuthorizationBranch {
+        asset_index: 0,
+        asset_market_id,
+        size_q: order_size,
+        max_fee_bps: 100,
+        trigger_price_e6: 100,
+        limit_price_e6: 100,
+        trigger_condition: ORDER_TRIGGER_AT_OR_BELOW,
+        reduce_only: 0,
+    };
+    let (private_limit, reveal) = env.create_private_order_authorization(
+        &owner,
+        portfolio,
+        &delegate,
+        100,
+        1,
+        [open_branch, OrderAuthorizationBranch::default()],
+    );
+    let pending = env.svm.get_account(&private_limit).unwrap();
+    assert_eq!(
+        pending.data.len(),
+        state::private_order_authorization_account_len()
+    );
+    assert!(
+        !pending
+            .data
+            .windows(core::mem::size_of::<i128>())
+            .any(|window| window == order_size.to_le_bytes()),
+        "pending authorization must not expose signed size"
+    );
+    assert_eq!(
+        env.private_order_authorization_state(private_limit).state,
+        ORDER_AUTHORIZATION_STATE_ACTIVE
+    );
+
+    let mut wrong_reveal = reveal.clone();
+    wrong_reveal[312] ^= 1;
+    assert!(
+        env.try_execute_private_order(
+            &delegate,
+            portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            private_limit,
+            0,
+            wrong_reveal,
+        )
+        .is_err(),
+        "a changed reveal must fail its commitment"
+    );
+    assert_eq!(
+        env.private_order_authorization_state(private_limit).state,
+        ORDER_AUTHORIZATION_STATE_ACTIVE
+    );
+
+    let limit_cu = env
+        .try_execute_private_order(
+            &delegate,
+            portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            private_limit,
+            0,
+            reveal,
+        )
+        .expect("execute committed private limit");
+    assert_cu_within(
+        "ExecutePrivateOrder limit",
+        limit_cu,
+        PRIVATE_ORDER_CU_LIMIT,
+    );
+    assert_eq!(
+        env.private_order_authorization_state(private_limit).state,
+        ORDER_AUTHORIZATION_STATE_CONSUMED
+    );
+
+    let half_close = OrderAuthorizationBranch {
+        asset_index: 0,
+        asset_market_id,
+        size_q: -(order_size / 2),
+        max_fee_bps: 100,
+        trigger_price_e6: 100,
+        limit_price_e6: 100,
+        trigger_condition: ORDER_TRIGGER_AT_OR_ABOVE,
+        reduce_only: 1,
+    };
+    let (inexact, inexact_reveal) = env.create_private_order_authorization(
+        &owner,
+        portfolio,
+        &delegate,
+        100,
+        1,
+        [half_close, OrderAuthorizationBranch::default()],
+    );
+    assert!(
+        env.try_execute_private_order(
+            &delegate,
+            portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            inexact,
+            0,
+            inexact_reveal,
+        )
+        .is_err(),
+        "Ninja TP/SL must exactly close the live position"
+    );
+    assert_eq!(
+        env.private_order_authorization_state(inexact).state,
+        ORDER_AUTHORIZATION_STATE_ACTIVE
+    );
+
+    let below = OrderAuthorizationBranch {
+        size_q: -order_size,
+        trigger_price_e6: 90,
+        limit_price_e6: 90,
+        trigger_condition: ORDER_TRIGGER_AT_OR_BELOW,
+        ..half_close
+    };
+    let above = OrderAuthorizationBranch {
+        size_q: -order_size,
+        trigger_price_e6: 100,
+        limit_price_e6: 100,
+        trigger_condition: ORDER_TRIGGER_AT_OR_ABOVE,
+        ..half_close
+    };
+    let (oco, oco_reveal) = env.create_private_order_authorization(
+        &owner,
+        portfolio,
+        &delegate,
+        100,
+        2,
+        [below, above],
+    );
+    let oco_cu = env
+        .try_execute_private_order(
+            &delegate,
+            portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            oco,
+            1,
+            oco_reveal,
+        )
+        .expect("execute committed private TP/SL OCO branch");
+    assert_cu_within("ExecutePrivateOrder OCO", oco_cu, PRIVATE_ORDER_CU_LIMIT);
+    assert_eq!(
+        env.private_order_authorization_state(oco).state,
+        ORDER_AUTHORIZATION_STATE_CONSUMED
+    );
+    assert!(
+        !has_active_leg_for_asset(&env.portfolio_state(portfolio), 0),
+        "the selected OCO branch exactly closes the live position"
+    );
+    assert!(
+        env.try_execute_private_order(
+            &delegate,
+            portfolio,
+            lp_portfolio,
+            matcher_program,
+            matcher_context,
+            matcher_delegate,
+            oco,
+            0,
+            ninja_reveal(
+                env.market,
+                portfolio,
+                owner.pubkey(),
+                delegate.pubkey(),
+                oco,
+                100,
+                2,
+                [below, above],
+            ),
+        )
+        .is_err(),
+        "consuming one private OCO branch must disable the other"
     );
 }
 
