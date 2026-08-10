@@ -1,0 +1,67 @@
+name: Program verification
+
+on:
+  pull_request:
+    branches:
+      - mukon-v16
+  push:
+    branches:
+      - mukon-v16
+  workflow_dispatch:
+    inputs:
+      full_proofs:
+        description: Run every program Kani harness after the fee proofs
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: program-verification-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  KANI_VERSION: 0.66.0
+
+jobs:
+  tests:
+    name: Host unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Run host unit tests
+        run: cargo test --locked --lib
+
+  kani:
+    name: Kani fee invariants
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install the pinned Kani toolchain
+        run: |
+          cargo install --locked kani-verifier --version "$KANI_VERSION"
+          cargo kani setup
+
+      - name: Prove directional paid-support clamp
+        run: >-
+          cargo kani --tests --harness
+          kani_v16_fee_supported_mark_clamp_is_directional_and_zero_support_is_noop
+
+      - name: Prove base fees cannot fund mark movement
+        run: >-
+          cargo kani --tests --harness
+          kani_v16_collected_base_fee_cannot_fund_mark_movement
+
+      - name: Run every program proof
+        if: >-
+          github.event_name == 'push' ||
+          (github.event_name == 'workflow_dispatch' && inputs.full_proofs)
+        run: cargo kani --tests
