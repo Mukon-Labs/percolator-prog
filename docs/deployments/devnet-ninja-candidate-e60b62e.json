@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "status": "candidate-not-deployed",
+  "status": "deployed-verified",
   "cluster": "devnet",
   "programId": "7C37Xn3NLknqmSaxASYy2uRkb1RQcXigPmJCANUNYnvq",
   "programData": "HcrXiD92s2ubr5oNjYb3nyEYLFeYdGCb3n5B42eadXXV",
@@ -63,13 +63,14 @@
     "solanaProgramAutofixer": "pass-with-no-private-order-findings"
   },
   "deployment": {
-    "buffer": null,
-    "upgradeTransaction": null,
-    "deploymentSlot": null,
-    "postDeployProgramDataDumpLength": null,
-    "postDeployProgramDataDumpSha256": null,
-    "prefixMatchesElf": null,
-    "trailingZeroPaddingLength": null,
-    "paddingIsAllZero": null
+    "buffer": "75PAhkggZ48qN43gGroqFoNSsHfLcZ29bbAu4TEbLY3P",
+    "bufferClosed": true,
+    "upgradeTransaction": "41mymK483n3mnxLoSZMp7ogjtWA5Sy7E5HMszBSR8cjZ753MwCpd4mR93Y8Cs1L1SvKAeKhtjAysn4zDKE6WuPRh",
+    "deploymentSlot": 488350757,
+    "postDeployProgramDataDumpLength": 1079264,
+    "postDeployProgramDataDumpSha256": "30c19e882cadd1c23853374258326384f0ac281a548de5527a69b577a6d6d4c7",
+    "prefixMatchesElf": true,
+    "trailingZeroPaddingLength": 0,
+    "paddingIsAllZero": true
   }
 }
