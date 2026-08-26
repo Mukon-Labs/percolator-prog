@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "status": "candidate-not-deployed",
+  "cluster": "devnet",
+  "programId": "7C37Xn3NLknqmSaxASYy2uRkb1RQcXigPmJCANUNYnvq",
+  "programData": "HcrXiD92s2ubr5oNjYb3nyEYLFeYdGCb3n5B42eadXXV",
+  "upgradeAuthority": "8Z9BEuwSnbuz47LHNz1deHom8SJivx1nX49hq1zz8mV9",
+  "source": {
+    "wrapperCommit": "e60b62e6a858eb0a9ff2695e70b5e795148832c5",
+    "baseWrapperCommit": "a8688958fbbf5ac95185e5073207416311415f08",
+    "engineCommit": "d7d622eb2344c31bcc4cfca700e9d52d609298c6",
+    "defaultFeatures": [
+      "anchor-v2"
+    ],
+    "cargoTomlSha256": "162cf001d4ac5738f3e3133123bd00676e69b318574d9707b9db7842eb8d7152",
+    "cargoLockSha256": "a0658b0344a79c6eedd3f8c09b6f0c896b037b6f6ebe6b1fa76a174fe6797f54",
+    "v16ProgramSha256": "b49a75db7aaedc0231b060d50a92b6789326d288f6ba208be40f7cf259f530b8",
+    "ninjaCommitmentSha256": "c3e2958c42ac87406f3e060cc67b5c0eed4c7b503de9b002d8052bfe533dbe39",
+    "bpfTestSha256": "4b7aa6fd724fc6c4e3568811fb037ceec233d6391c704ce734217899baacc0fd"
+  },
+  "build": {
+    "environment": "NO_DNA=1",
+    "command": "cargo build-sbf --sbf-out-dir target/deploy",
+    "postProcessing": [],
+    "host": "Darwin 25.5.0 arm64"
+  },
+  "toolchain": {
+    "solanaCli": "4.1.1 (6a8c724a)",
+    "cargoBuildSbf": "4.1.0",
+    "platformTools": "v1.54",
+    "sbfRust": "1.89.0-dev",
+    "llvm": "20.1.7"
+  },
+  "artifact": {
+    "path": "target/deploy/percolator_prog.so",
+    "elfLength": 1079264,
+    "elfSha256": "30c19e882cadd1c23853374258326384f0ac281a548de5527a69b577a6d6d4c7",
+    "currentProgramDataAllocationLength": 1060392,
+    "minimumExtensionBytes": 18872
+  },
+  "compatibility": {
+    "newInstructionTags": [
+      76,
+      77,
+      78,
+      79
+    ],
+    "existingAccountLayoutsChanged": false,
+    "newPrivateAuthorizationAccountLength": 256,
+    "defaultBuildOnly": true
+  },
+  "tests": {
+    "focusedBpfPrivateOrder": "pass",
+    "focusedBpfPrivateOrderCount": 1,
+    "rustFilteredTests": 568,
+    "fullRustUnitTests": "pass",
+    "fullRustUnitTestCount": 14,
+    "fullBpfIntegrationTests": "pass",
+    "fullBpfIntegrationTestCount": 569,
+    "matcherFixtureCommit": "60aac3a",
+    "matcherFixtureDescription": "upstream batched multi-fill matcher ABI tag 3",
+    "hostileMatcherFixture": "pass",
+    "solanaProgramAutofixer": "pass-with-no-private-order-findings"
+  },
+  "deployment": {
+    "buffer": null,
+    "upgradeTransaction": null,
+    "deploymentSlot": null,
+    "postDeployProgramDataDumpLength": null,
+    "postDeployProgramDataDumpSha256": null,
+    "prefixMatchesElf": null,
+    "trailingZeroPaddingLength": null,
+    "paddingIsAllZero": null
+  }
+}
