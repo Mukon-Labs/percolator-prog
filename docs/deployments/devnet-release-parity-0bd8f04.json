@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "status": "approved-candidate-tested",
+  "cluster": "devnet",
+  "programId": "7C37Xn3NLknqmSaxASYy2uRkb1RQcXigPmJCANUNYnvq",
+  "programData": "HcrXiD92s2ubr5oNjYb3nyEYLFeYdGCb3n5B42eadXXV",
+  "upgradeAuthority": "8Z9BEuwSnbuz47LHNz1deHom8SJivx1nX49hq1zz8mV9",
+  "source": {
+    "wrapperCommit": "0bd8f0471a5e9ce117439583fc80301222bef5c4",
+    "baseWrapperCommit": "bd51cde88e44b0d30310c213697c3f38d4c0f1ce",
+    "engineCommit": "d7d622eb2344c31bcc4cfca700e9d52d609298c6",
+    "defaultFeatures": [],
+    "optInFeaturesNotReleased": [
+      "anchor-v2"
+    ],
+    "cargoTomlSha256": "55d1cec9de3049ecdaa97f776ffc455de43ac9ea3862c343f1cc628d78ae44df",
+    "cargoLockSha256": "a0658b0344a79c6eedd3f8c09b6f0c896b037b6f6ebe6b1fa76a174fe6797f54",
+    "v16ProgramSha256": "ec8086b331dc21b83ffe6720126fc83dbddfa9a17f075642803bb13a9a2ab193",
+    "bpfTestSha256": "9d66bd16f411a698db3d0e43479d9abfc450bc0084a764b35fb35c03106313b0"
+  },
+  "build": {
+    "environment": "NO_DNA=1",
+    "command": "cargo build-sbf --sbf-out-dir target/deploy",
+    "postProcessing": [],
+    "host": "Darwin 25.5.0 arm64"
+  },
+  "toolchain": {
+    "solanaCli": "4.1.1 (6a8c724a)",
+    "cargoBuildSbf": "4.1.0",
+    "platformTools": "v1.54",
+    "sbfRust": "1.89.0"
+  },
+  "artifact": {
+    "path": "target/deploy/percolator_prog.so",
+    "elfLength": 1084720,
+    "elfSha256": "2fff00c365da9d8f363ba5126c3ee3903ba0cd466251d3e498b463d9e1bbb6ba"
+  },
+  "compatibility": {
+    "instructionOrAccountAbiChanged": false,
+    "entrypointChangedFromPriorDeployment": true,
+    "exactDefaultElfTested": true,
+    "terminalAssetHistoryPreserved": true
+  },
+  "tests": {
+    "focusedBpfReanchor": "6-pass",
+    "postReanchorLpCrankRegression": "pass",
+    "fullRustUnitTests": "15-pass",
+    "fullBpfCompatibilityTests": "569-pass-6-baseline-ninja-heap-failures",
+    "cargoCheckDefault": "pass",
+    "cargoCheckAnchorV2OptIn": "pass",
+    "cleanBaseReproduction": "same-6-ninja-authorization-heap-failures"
+  },
+  "deployment": null,
+  "postDeployment": {
+    "keeperRestartRequired": false,
+    "confirmedLpCrankRequired": true,
+    "healthyIndependentAuditsRequired": 2,
+    "marketTransactionAuthorized": false,
+    "ninjaInitializationAuthorized": false
+  }
+}
