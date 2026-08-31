@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 1,
+  "status": "deployed-verified-simulated-not-executed",
+  "cluster": "devnet",
+  "programId": "7C37Xn3NLknqmSaxASYy2uRkb1RQcXigPmJCANUNYnvq",
+  "programData": "HcrXiD92s2ubr5oNjYb3nyEYLFeYdGCb3n5B42eadXXV",
+  "upgradeAuthority": "8Z9BEuwSnbuz47LHNz1deHom8SJivx1nX49hq1zz8mV9",
+  "source": {
+    "wrapperCommit": "ae656300f605121c2c6d42d82c857301116c502f",
+    "baseWrapperCommit": "dd393b6e7036cdfdf70b1132b2b75cd3a343a606",
+    "engineCommit": "d7d622eb2344c31bcc4cfca700e9d52d609298c6",
+    "defaultFeatures": [
+      "anchor-v2"
+    ],
+    "cargoTomlSha256": "162cf001d4ac5738f3e3133123bd00676e69b318574d9707b9db7842eb8d7152",
+    "cargoLockSha256": "a0658b0344a79c6eedd3f8c09b6f0c896b037b6f6ebe6b1fa76a174fe6797f54",
+    "v16ProgramSha256": "ec8086b331dc21b83ffe6720126fc83dbddfa9a17f075642803bb13a9a2ab193",
+    "bpfTestSha256": "f4e154ab6fe1033273b2028aa128a648bb7ee22ca01754e4c6116a100f91c64c"
+  },
+  "build": {
+    "environment": "NO_DNA=1",
+    "command": "cargo build-sbf --sbf-out-dir target/deploy",
+    "postProcessing": [],
+    "host": "Darwin 25.5.0 arm64"
+  },
+  "toolchain": {
+    "solanaCli": "4.1.1 (6a8c724a)",
+    "cargoBuildSbf": "4.1.0",
+    "platformTools": "v1.54",
+    "sbfRust": "1.89.0-dev"
+  },
+  "artifact": {
+    "path": "target/deploy/percolator_prog.so",
+    "elfLength": 1105152,
+    "elfSha256": "30e9a8c1ce4008c9c54553c124fe3de0a55d92560573ab9088c66ad2fe9665c6"
+  },
+  "compatibility": {
+    "newInstructionTags": [
+      80
+    ],
+    "existingAccountLayoutsChanged": false,
+    "defaultBuildOnly": true,
+    "terminalAssetHistoryPreserved": true
+  },
+  "tests": {
+    "focusedBpfReanchor": "pass",
+    "focusedBpfReanchorCount": 5,
+    "fullRustUnitTests": "pass",
+    "fullRustUnitTestCount": 15,
+    "fullBpfCompatibilityTests": "568-pass-6-baseline-heap-failures",
+    "cleanBaseReproduction": "same-6-ninja-authorization-heap-failures",
+    "solanaProgramAutofixer": "pass-with-no-reanchor-findings"
+  },
+  "deployment": {
+    "upgradeTransaction": "37vrV3M7XxiP4hbsFnJtwUnm4LgkVmb6o6aBQAzXniGAy5UpRKLMy62zMhRzPLUGEy6jGjmFzxatDp6ti5wBkEf5",
+    "deploymentSlot": 490986727,
+    "postDeployProgramDataDumpLength": 1105152,
+    "postDeployProgramDataDumpSha256": "30e9a8c1ce4008c9c54553c124fe3de0a55d92560573ab9088c66ad2fe9665c6",
+    "exactElfMatch": true
+  },
+  "simulation": {
+    "instructionTag": 80,
+    "instructionDataHex": "50",
+    "authorityAndFeePayer": "8Z9BEuwSnbuz47LHNz1deHom8SJivx1nX49hq1zz8mV9",
+    "unitsConsumed": 5402,
+    "result": "success",
+    "sent": false,
+    "beforeCurrentSlot": 490986724,
+    "simulatedCurrentSlot": 490989913,
+    "activeAssetsReanchored": [
+      0,
+      1,
+      2
+    ],
+    "terminalAssetsPreserved": [
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "changedByteCount": 47,
+    "accountingMutation": false,
+    "fundingEpochMutation": false
+  }
+}
