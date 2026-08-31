@@ -10,11 +10,11 @@ name = "percolator_prog"
 path = "src/v16_program.rs"
 
 [features]
-# v16 deploys through the Anchor v2 / Pinocchio entrypoint by default. The
-# Solana 1.18 bundled SBF toolchain cannot parse the current Anchor v2
-# dependency graph; use platform-tools v1.52 or newer for deployable builds.
-# `--no-default-features` remains available for legacy local compatibility.
-default = ["anchor-v2"]
+# The legacy Solana entrypoint is the release default because it is exercised
+# by the complete LiteSVM compatibility suite. Keep Anchor v2 / Pinocchio
+# explicit until its AccountView-to-AccountInfo bridge passes the same exact-ELF
+# release gate; source-level compatibility is not sufficient for deployment.
+default = []
 no-entrypoint = []
 test-sbf = []
 cu-audit = []  # Enable compute unit checkpoints for CU auditing

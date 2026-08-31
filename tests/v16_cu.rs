@@ -14804,6 +14804,50 @@ fn v16_bpf_empty_market_reanchor_uses_fresh_staged_marks_and_preserves_value_sta
 }
 
 #[test]
+fn v16_bpf_empty_market_reanchor_keeps_zero_exposure_lp_crankable() {
+    const OLD_SLOT: u64 = 1;
+    const STAGED_SLOT: u64 = 1_000;
+    const REANCHOR_SLOT: u64 = 1_010;
+
+    let mut env = V16CuEnv::new();
+    let lp_owner = Keypair::new();
+    let lp = env.create_portfolio(&lp_owner);
+    env.deposit(&lp_owner, lp, 100_000_000);
+    env.svm.warp_to_slot(OLD_SLOT);
+    env.configure_auth_mark_with_cu(OLD_SLOT, 100);
+    env.svm.warp_to_slot(STAGED_SLOT);
+    env.push_auth_mark_with_cu(STAGED_SLOT, 125);
+    env.mutate_market(|_, group| {
+        group.current_slot = STAGED_SLOT;
+        group.slot_last = OLD_SLOT;
+        group.loss_stale_active = true;
+        group.assets[0].slot_last = OLD_SLOT;
+    });
+
+    env.svm.warp_to_slot(REANCHOR_SLOT);
+    env.reanchor_empty_market_with_cu();
+    env.crank(
+        lp,
+        ProgInstruction::PermissionlessCrank {
+            now_slot: REANCHOR_SLOT,
+            observations: crank_observations(0),
+        },
+    );
+
+    let market = env.market_state().1;
+    let portfolio = env.portfolio_state(lp);
+    assert_ne!(portfolio.health_cert.valid, 0);
+    assert_eq!(
+        portfolio.health_cert.cert_oracle_epoch.get(),
+        market.oracle_epoch
+    );
+    assert_eq!(
+        portfolio.health_cert.cert_risk_epoch.get(),
+        market.risk_epoch
+    );
+}
+
+#[test]
 fn v16_bpf_empty_market_reanchor_preserves_terminal_asset_history() {
     const OLD_ACTIVE_SLOT: u64 = 1;
     const TERMINAL_SLOT: u64 = 77;
