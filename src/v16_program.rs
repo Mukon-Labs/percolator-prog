@@ -108,6 +108,19 @@ pub mod constants {
     pub const MAX_DYNAMIC_TRADE_FEE_BPS: u64 = 10_000;
     pub const MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS: u64 = 6_480_000;
     pub const MAX_FORCE_CLOSE_DELAY_SLOTS: u64 = 10_000_000;
+    /// A zero-exposure clock re-anchor may only consume an oracle observation
+    /// that was authenticated very recently. This keeps the emergency path
+    /// from making a stopped market tradeable against an old staged mark.
+    pub const EMPTY_MARKET_REANCHOR_MAX_ORACLE_AGE_SLOTS: u64 = 300;
+    /// Keep this instruction an emergency recovery path rather than a routine
+    /// clock-update primitive. A healthy/bounded market must use the normal
+    /// push-before-crank flow.
+    pub const EMPTY_MARKET_REANCHOR_MIN_CLOCK_DEBT_SLOTS: u64 = 300;
+    /// The recovery proof scans every configured asset atomically. Bound the
+    /// scan so a permissionless large market cannot turn the instruction into
+    /// an unbounded compute sink; larger markets need a separately audited
+    /// segmented proof design.
+    pub const EMPTY_MARKET_REANCHOR_MAX_ASSETS: usize = 64;
     // v16 market slots are dynamic and bounded by SVM account allocation, but
     // one portfolio may only carry the largest active-leg count that fits the
     // audited stale-trade and crank CU envelope. Additional markets remain
@@ -2947,6 +2960,10 @@ pub mod ix {
             asset_index: u16,
             side: u8,
         },
+        /// Emergency, authority-gated clock recovery for a completely flat
+        /// live market. The program reads the Clock sysvar and fresh staged
+        /// oracle profiles; callers supply neither time nor price.
+        ReanchorEmptyMarket,
         ClaimResolvedPayoutTopup,
         SyncMaintenanceFee {
             now_slot: u64,
@@ -3276,6 +3293,7 @@ pub mod ix {
                     asset_index: read_u16(&mut rest)?,
                     side: read_u8(&mut rest)?,
                 },
+                80 => Self::ReanchorEmptyMarket,
                 46 => Self::ClaimResolvedPayoutTopup,
                 48 => Self::SyncMaintenanceFee {
                     now_slot: read_u64(&mut rest)?,
@@ -3730,6 +3748,7 @@ pub mod ix {
                     push_u16(&mut out, asset_index);
                     out.push(side);
                 }
+                Self::ReanchorEmptyMarket => out.push(80),
                 Self::ClaimResolvedPayoutTopup => out.push(46),
                 Self::SyncMaintenanceFee { now_slot } => {
                     out.push(48);
@@ -5509,6 +5528,163 @@ pub mod processor {
         Ok(())
     }
 
+    fn reanchor_empty_market_view(
+        cfg: &WrapperConfigV16,
+        group: &mut state::MarketViewMutV16<'_>,
+        now_slot: u64,
+    ) -> Result<usize, ProgramError> {
+        if group.header.mode != 0
+            || now_slot < group.header.current_slot.get()
+            || group.header.bankruptcy_hlock_active != 0
+            || group.header.threshold_stress_active != 0
+            || group.header.b_stale_account_count.get() != 0
+            || group.header.negative_pnl_account_count.get() != 0
+            || group.header.resolved_payout_blocker_count.get() != 0
+            || group.header.payout_snapshot_captured != 0
+            || group
+                .header
+                .recovery_reason
+                .try_to_runtime()
+                .map_err(map_v16_error)?
+                .is_some()
+            || group
+                .header
+                .resolved_payout_ledger
+                .try_to_runtime()
+                .map_err(map_v16_error)?
+                != percolator::ResolvedPayoutLedgerV16::EMPTY
+        {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+
+        let configured_assets = group.header.config.max_market_slots.get() as usize;
+        if configured_assets == 0
+            || configured_assets > group.markets.len()
+            || configured_assets > constants::EMPTY_MARKET_REANCHOR_MAX_ASSETS
+        {
+            return Err(PercolatorError::EngineInvalidConfig.into());
+        }
+
+        let next_oracle_epoch = group
+            .header
+            .oracle_epoch
+            .get()
+            .checked_add(1)
+            .ok_or(PercolatorError::EngineCounterOverflow)?;
+        let next_risk_epoch = group
+            .header
+            .risk_epoch
+            .get()
+            .checked_add(1)
+            .ok_or(PercolatorError::EngineCounterOverflow)?;
+        let mut active_count = 0usize;
+        let mut max_clock_debt = 0u64;
+
+        for asset_index in 0..configured_assets {
+            let lifecycle = group.markets[asset_index].engine.asset.lifecycle;
+            if lifecycle == 1 {
+                // A partially activated slot has authority and oracle state in
+                // transition; it is not part of a provably empty live market.
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            if lifecycle == 0 {
+                continue;
+            }
+
+            let asset = group.markets[asset_index].engine.asset;
+            if asset_local_has_position_or_loss_state_view(group, asset_index)
+                || asset.pending_obligation_count_long.get() != 0
+                || asset.pending_obligation_count_short.get() != 0
+                || asset.a_long.get() != percolator::ADL_ONE
+                || asset.a_short.get() != percolator::ADL_ONE
+            {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+
+            if !matches!(
+                lifecycle,
+                ASSET_LIFECYCLE_ACTIVE | ASSET_LIFECYCLE_DRAIN_ONLY
+            ) {
+                // Recovery and Retired slots remain historically anchored.
+                // Their emptiness was still proven above so hidden residue in
+                // a terminal slot cannot be bypassed by this global action.
+                continue;
+            }
+
+            if now_slot < asset.slot_last.get() {
+                return Err(PercolatorError::EngineInvalidConfig.into());
+            }
+            max_clock_debt = max_clock_debt.max(now_slot - asset.slot_last.get());
+
+            let profile = read_oracle_profile_from_view(group, cfg, asset_index)?;
+            if !oracle_v16::profile_is_price_managed(&profile)
+                || profile.last_good_oracle_slot == 0
+                || profile.last_good_oracle_slot > now_slot
+                || now_slot.saturating_sub(profile.last_good_oracle_slot)
+                    > constants::EMPTY_MARKET_REANCHOR_MAX_ORACLE_AGE_SLOTS
+                || profile.oracle_target_price_e6 == 0
+                || profile.oracle_target_price_e6 > percolator::MAX_ORACLE_PRICE
+            {
+                return Err(PercolatorError::OracleStale.into());
+            }
+
+            let asset = &mut group.markets[asset_index].engine.asset;
+            asset.raw_oracle_target_price =
+                percolator::V16PodU64::new(profile.oracle_target_price_e6);
+            asset.effective_price = percolator::V16PodU64::new(profile.oracle_target_price_e6);
+            asset.fund_px_last = percolator::V16PodU64::new(profile.oracle_target_price_e6);
+            asset.slot_last = percolator::V16PodU64::new(now_slot);
+            active_count = active_count
+                .checked_add(1)
+                .ok_or(PercolatorError::EngineCounterOverflow)?;
+        }
+
+        if active_count == 0
+            || max_clock_debt <= constants::EMPTY_MARKET_REANCHOR_MIN_CLOCK_DEBT_SLOTS
+        {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+
+        group.header.current_slot = percolator::V16PodU64::new(now_slot);
+        group.header.slot_last = percolator::V16PodU64::new(now_slot);
+        group.header.loss_stale_active = 0;
+        group.header.oracle_epoch = percolator::V16PodU64::new(next_oracle_epoch);
+        group.header.risk_epoch = percolator::V16PodU64::new(next_risk_epoch);
+        group.validate_shape().map_err(map_v16_error)?;
+        Ok(active_count)
+    }
+
+    #[inline(never)]
+    fn handle_reanchor_empty_market<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        if accounts.len() != 2 {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let authority = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        expect_signer(authority)?;
+        expect_writable(market_ai)?;
+        expect_owner(market_ai, program_id)?;
+
+        let now_slot = Clock::get()?.slot;
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+        expect_live_authority(&cfg.marketauth, authority.key)?;
+        let old_current_slot = group.header.current_slot.get();
+        let active_count = reanchor_empty_market_view(&cfg, &mut group, now_slot)?;
+        solana_program::msg!("EMPTY_MARKET_REANCHOR");
+        solana_program::log::sol_log_64(
+            old_current_slot,
+            now_slot,
+            active_count as u64,
+            group.header.oracle_epoch.get(),
+            group.header.risk_epoch.get(),
+        );
+        Ok(())
+    }
+
     fn require_asset_mark_pushable_view(
         group: &state::MarketViewMutV16<'_>,
         asset_index: usize,
@@ -5871,6 +6047,7 @@ pub mod processor {
             Instruction::ReconcileLegacyAdlPartition { asset_index, side } => {
                 handle_reconcile_legacy_adl_partition(program_id, accounts, asset_index, side)
             }
+            Instruction::ReanchorEmptyMarket => handle_reanchor_empty_market(program_id, accounts),
             Instruction::ClaimResolvedPayoutTopup => {
                 handle_claim_resolved_payout_topup(program_id, accounts)
             }
@@ -13630,6 +13807,14 @@ pub mod processor {
                 instruction
             );
             assert!(Instruction::decode(&[75, 3, 0, 1, 0]).is_err());
+        }
+
+        #[test]
+        fn empty_market_reanchor_wire_format_is_stable() {
+            let instruction = Instruction::ReanchorEmptyMarket;
+            assert_eq!(instruction.encode(), vec![80]);
+            assert_eq!(Instruction::decode(&[80]).unwrap(), instruction);
+            assert!(Instruction::decode(&[80, 0]).is_err());
         }
 
         #[test]

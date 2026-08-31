@@ -2992,6 +2992,30 @@ impl V16CuEnv {
         .expect("push auth mark")
     }
 
+    fn try_reanchor_empty_market_with_authority(
+        &mut self,
+        authority: &Keypair,
+    ) -> Result<u64, String> {
+        self.ensure_signer_account(authority.pubkey());
+        send_tx(
+            &mut self.svm,
+            self.program_id,
+            &self.payer,
+            ProgInstruction::ReanchorEmptyMarket,
+            vec![
+                AccountMeta::new_readonly(authority.pubkey(), true),
+                AccountMeta::new(self.market, false),
+            ],
+            &[authority],
+        )
+    }
+
+    fn reanchor_empty_market_with_cu(&mut self) -> u64 {
+        let admin = self.admin.insecure_clone();
+        self.try_reanchor_empty_market_with_authority(&admin)
+            .expect("reanchor empty market")
+    }
+
     fn configure_auth_mark_for_asset_as_admin(
         &mut self,
         asset_index: u16,
@@ -14725,6 +14749,176 @@ fn v16_bpf_configure_and_push_auth_mark_are_bounded_and_clock_authenticated() {
     assert_ne!(
         cfg.mark_ewma_last_slot, spoofed_slot,
         "caller-supplied PushAuthMark now_slot must not authenticate mark liveness"
+    );
+}
+
+#[test]
+fn v16_bpf_empty_market_reanchor_uses_fresh_staged_marks_and_preserves_value_state() {
+    const OLD_SLOT: u64 = 1;
+    const STAGED_SLOT: u64 = 1_000;
+    const REANCHOR_SLOT: u64 = 1_010;
+    const POSITIVE_PNL: u128 = 670_857_009;
+
+    let mut env = V16CuEnv::new();
+    env.svm.warp_to_slot(OLD_SLOT);
+    env.configure_auth_mark_with_cu(OLD_SLOT, 100);
+    env.svm.warp_to_slot(STAGED_SLOT);
+    env.push_auth_mark_with_cu(STAGED_SLOT, 125);
+
+    env.mutate_market(|_cfg, group| {
+        let bound_num = POSITIVE_PNL.checked_mul(BOUND_SCALE).unwrap();
+        group.pnl_pos_tot = POSITIVE_PNL;
+        group.pnl_pos_bound_tot_num = bound_num;
+        group.pnl_pos_bound_tot = POSITIVE_PNL;
+        group.current_slot = STAGED_SLOT;
+        group.slot_last = OLD_SLOT;
+        group.loss_stale_active = true;
+        group.assets[0].slot_last = OLD_SLOT;
+    });
+
+    let before = env.market_state();
+    env.svm.warp_to_slot(REANCHOR_SLOT);
+    let reanchor_cu = env.reanchor_empty_market_with_cu();
+    assert_cu_within("ReanchorEmptyMarket", reanchor_cu, CUSTODY_CU_LIMIT);
+
+    let after = env.market_state();
+    assert_eq!(after.1.current_slot, REANCHOR_SLOT);
+    assert_eq!(after.1.slot_last, REANCHOR_SLOT);
+    assert!(!after.1.loss_stale_active);
+    assert_eq!(after.1.assets[0].slot_last, REANCHOR_SLOT);
+    assert_eq!(after.1.assets[0].raw_oracle_target_price, 125);
+    assert_eq!(after.1.assets[0].effective_price, 125);
+    assert_eq!(after.1.assets[0].fund_px_last, 125);
+    assert_eq!(after.1.pnl_pos_tot, POSITIVE_PNL);
+    assert_eq!(
+        after.1.pnl_pos_bound_tot_num,
+        before.1.pnl_pos_bound_tot_num
+    );
+    assert_eq!(after.1.pnl_pos_bound_tot, before.1.pnl_pos_bound_tot);
+    assert_eq!(after.1.vault, before.1.vault);
+    assert_eq!(after.1.c_tot, before.1.c_tot);
+    assert_eq!(after.1.insurance, before.1.insurance);
+    assert_eq!(after.1.funding_epoch, before.1.funding_epoch);
+    assert_eq!(after.1.oracle_epoch, before.1.oracle_epoch + 1);
+    assert_eq!(after.1.risk_epoch, before.1.risk_epoch + 1);
+}
+
+#[test]
+fn v16_bpf_empty_market_reanchor_preserves_terminal_asset_history() {
+    const OLD_ACTIVE_SLOT: u64 = 1;
+    const TERMINAL_SLOT: u64 = 77;
+    const REANCHOR_SLOT: u64 = 1_010;
+
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(2, 10_000, 10_000, 10_000);
+    env.svm.warp_to_slot(OLD_ACTIVE_SLOT);
+    env.configure_auth_mark_with_cu(OLD_ACTIVE_SLOT, 100);
+    env.configure_auth_mark_for_asset_as_admin(1, 1, 777);
+    env.mutate_market(|_, group| {
+        group.assets[0].slot_last = OLD_ACTIVE_SLOT;
+        group.assets[1].lifecycle = AssetLifecycleV16::Recovery;
+        group.assets[1].slot_last = TERMINAL_SLOT;
+    });
+
+    env.svm.warp_to_slot(1_000);
+    env.push_auth_mark_with_cu(1_000, 125);
+    let terminal_before = env.market_state().1.assets[1];
+    env.svm.warp_to_slot(REANCHOR_SLOT);
+    env.reanchor_empty_market_with_cu();
+
+    let after = env.market_state().1;
+    assert_eq!(after.assets[0].slot_last, REANCHOR_SLOT);
+    assert_eq!(after.assets[1], terminal_before);
+}
+
+#[test]
+fn v16_bpf_empty_market_reanchor_rejects_bounded_market_atomically() {
+    let mut env = V16CuEnv::new();
+    env.svm.warp_to_slot(1);
+    env.configure_auth_mark_with_cu(1, 100);
+    env.svm
+        .warp_to_slot(1 + percolator_prog::constants::EMPTY_MARKET_REANCHOR_MIN_CLOCK_DEBT_SLOTS);
+    let slot = env.svm.get_sysvar::<Clock>().slot;
+    env.push_auth_mark_with_cu(slot, 101);
+
+    let before = env.svm.get_account(&env.market).unwrap();
+    let admin = env.admin.insecure_clone();
+    let bounded = env.try_reanchor_empty_market_with_authority(&admin);
+    assert!(
+        bounded.is_err(),
+        "bounded market must use the normal crank path"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        before,
+        "bounded-market rejection must be atomic"
+    );
+}
+
+#[test]
+fn v16_bpf_empty_market_reanchor_rejects_stale_mark_and_wrong_authority_atomically() {
+    let mut env = V16CuEnv::new();
+    env.svm.warp_to_slot(1);
+    env.configure_auth_mark_with_cu(1, 100);
+    env.svm.warp_to_slot(
+        1 + percolator_prog::constants::EMPTY_MARKET_REANCHOR_MAX_ORACLE_AGE_SLOTS + 1,
+    );
+
+    let before_stale = env.svm.get_account(&env.market).unwrap();
+    let admin = env.admin.insecure_clone();
+    let stale = env.try_reanchor_empty_market_with_authority(&admin);
+    assert!(stale.is_err(), "stale staged mark must reject");
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        before_stale,
+        "stale-mark rejection must be atomic"
+    );
+
+    env.svm.expire_blockhash();
+    let slot = env.svm.get_sysvar::<Clock>().slot;
+    env.push_auth_mark_with_cu(slot, 101);
+    let impostor = Keypair::new();
+    let before_impostor = env.svm.get_account(&env.market).unwrap();
+    let unauthorized = env.try_reanchor_empty_market_with_authority(&impostor);
+    assert!(unauthorized.is_err(), "non-marketauth signer must reject");
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        before_impostor,
+        "authority rejection must be atomic"
+    );
+}
+
+#[test]
+fn v16_bpf_empty_market_reanchor_rejects_live_exposure_atomically() {
+    let mut env = V16CuEnv::new();
+    env.svm.warp_to_slot(1);
+    env.configure_auth_mark_with_cu(1, 100);
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 10_000);
+    env.deposit(&short_owner, short_account, 10_000);
+    env.trade_asset_with_cu(
+        0,
+        &long_owner,
+        long_account,
+        &short_owner,
+        short_account,
+        POS_SCALE as i128,
+        100,
+        0,
+    );
+
+    env.svm.warp_to_slot(2);
+    env.push_auth_mark_with_cu(2, 100);
+    let before = env.svm.get_account(&env.market).unwrap();
+    let admin = env.admin.insecure_clone();
+    let exposed = env.try_reanchor_empty_market_with_authority(&admin);
+    assert!(exposed.is_err(), "nonzero OI/stored legs must reject");
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        before,
+        "exposure rejection must be atomic"
     );
 }
 
