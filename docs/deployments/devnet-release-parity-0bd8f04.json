@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "status": "approved-candidate-tested",
+  "status": "deployed-byte-verified-two-healthy-audits",
   "cluster": "devnet",
   "programId": "7C37Xn3NLknqmSaxASYy2uRkb1RQcXigPmJCANUNYnvq",
   "programData": "HcrXiD92s2ubr5oNjYb3nyEYLFeYdGCb3n5B42eadXXV",
@@ -50,11 +50,32 @@
     "cargoCheckAnchorV2OptIn": "pass",
     "cleanBaseReproduction": "same-6-ninja-authorization-heap-failures"
   },
-  "deployment": null,
+  "deployment": {
+    "transaction": "57KfFEYaf27W9GbggR2FtPycLtKgPEv27LieTSpbghcf8oEqybWZgahcYaW23tpcy3kLwiPTCiZWmsTT38Yuhthr",
+    "slot": 491010006,
+    "feeLamports": 5000,
+    "computeUnitsConsumed": 2370,
+    "programAccountLength": 1105152,
+    "chainDataSha256": "99e6edf3eff3cb7dc15c1717b6150c094089d69e49f1dd2eab11c96f5d862c3c",
+    "expectedPaddedElfSha256": "99e6edf3eff3cb7dc15c1717b6150c094089d69e49f1dd2eab11c96f5d862c3c",
+    "exactPaddedElfMatch": true,
+    "programDataUnchanged": true,
+    "upgradeAuthorityUnchanged": true,
+    "temporaryBufferClosed": true
+  },
   "postDeployment": {
     "keeperRestartRequired": false,
     "confirmedLpCrankRequired": true,
+    "confirmedLpCrankObserved": true,
+    "firstConfirmedPushAndCrankAt": "2026-08-31T15:56:38Z",
     "healthyIndependentAuditsRequired": 2,
+    "healthyIndependentAuditsObserved": 2,
+    "auditProfile": "operational",
+    "activeAssetMaxStateLagSlots": 0,
+    "activeAssetMaxOracleLagSlots": 30,
+    "lossStale": false,
+    "lpCertificateCurrent": true,
+    "custodyMatchesAccounting": true,
     "marketTransactionAuthorized": false,
     "ninjaInitializationAuthorized": false
   }
