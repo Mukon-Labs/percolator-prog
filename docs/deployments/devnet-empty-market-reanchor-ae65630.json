@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "status": "deployed-verified-simulated-not-executed",
+  "status": "deployed-executed-verified-pending-post-audits",
   "cluster": "devnet",
   "programId": "7C37Xn3NLknqmSaxASYy2uRkb1RQcXigPmJCANUNYnvq",
   "programData": "HcrXiD92s2ubr5oNjYb3nyEYLFeYdGCb3n5B42eadXXV",
@@ -82,5 +82,16 @@
     "changedByteCount": 47,
     "accountingMutation": false,
     "fundingEpochMutation": false
+  },
+  "execution": {
+    "transaction": "54xqPMqX19RBYJAr6XDzBa6fD7DiJHQDSw7aVgtCH8KAnMKTJyyQdrs8q3cZgcef6pK1Rn6DDj8oBBYVf4tyiZmE",
+    "slot": 490993376,
+    "feeLamports": 5000,
+    "unitsConsumed": 5402,
+    "error": null,
+    "lossStaleAfter": false,
+    "activeAssetStateDebtAfter": 0,
+    "financialMutation": false,
+    "postAuditStatus": "pending-current-lp-certificate"
   }
 }
