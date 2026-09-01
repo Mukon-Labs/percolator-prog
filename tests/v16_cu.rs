@@ -542,7 +542,10 @@ fn cu_ix() -> Instruction {
 }
 
 fn heap_ix() -> Instruction {
-    ComputeBudgetInstruction::request_heap_frame(128 * 1024)
+    // Match the production order builders. Solana permits a 256-KiB
+    // transaction-wide heap frame, and both authorization paths must be tested
+    // against the same explicit resource envelope clients submit.
+    ComputeBudgetInstruction::request_heap_frame(256 * 1024)
 }
 
 struct V16CuEnv {
@@ -2294,6 +2297,8 @@ impl V16CuEnv {
             &mut self.svm,
             &self.payer,
             vec![
+                heap_ix(),
+                cu_ix(),
                 system_instruction::create_account(
                     &self.payer.pubkey(),
                     &authorization.pubkey(),
@@ -2487,6 +2492,8 @@ impl V16CuEnv {
             &mut self.svm,
             &self.payer,
             vec![
+                heap_ix(),
+                cu_ix(),
                 system_instruction::create_account(
                     &self.payer.pubkey(),
                     &authorization.pubkey(),
@@ -2529,7 +2536,10 @@ impl V16CuEnv {
         branch_index: u8,
         reveal: Vec<u8>,
     ) -> Result<u64, String> {
-        self.send(
+        send_tx_default_heap(
+            &mut self.svm,
+            self.program_id,
+            &self.payer,
             ProgInstruction::ExecutePrivateOrder {
                 branch_index,
                 reveal,
@@ -4048,6 +4058,33 @@ fn send_tx(
     signer_refs.extend_from_slice(extra_signers);
     let tx = Transaction::new_signed_with_payer(
         &[heap_ix(), cu_ix(), instruction],
+        Some(&payer.pubkey()),
+        &signer_refs,
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(tx)
+        .map(|meta| meta.compute_units_consumed)
+        .map_err(|e| format!("{e:?}"))
+}
+
+fn send_tx_default_heap(
+    svm: &mut LiteSVM,
+    program_id: Pubkey,
+    payer: &Keypair,
+    ix: ProgInstruction,
+    accounts: Vec<AccountMeta>,
+    extra_signers: &[&Keypair],
+) -> Result<u64, String> {
+    let instruction = Instruction {
+        program_id,
+        accounts,
+        data: ix.encode(),
+    };
+    let mut signer_refs = Vec::with_capacity(1 + extra_signers.len());
+    signer_refs.push(payer);
+    signer_refs.extend_from_slice(extra_signers);
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), instruction],
         Some(&payer.pubkey()),
         &signer_refs,
         svm.latest_blockhash(),

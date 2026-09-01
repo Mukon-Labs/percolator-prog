@@ -14106,10 +14106,11 @@ pub mod entrypoint {
         pubkey::Pubkey,
     };
 
-    // The processor still materializes engine runtime structs. This remains
-    // bounded at the current fixed asset cap; larger u16-indexed markets need
-    // engine zero-copy/page APIs rather than larger fixed runtime arrays.
-    pub const V16_HEAP_FRAME_BYTES: usize = 128 * 1024;
+    // Keep the allocator inside Solana's default transaction heap so v16 can
+    // execute from CPI-based callback transactions that cannot add their own
+    // RequestHeapFrame instruction. The exact-ELF suite guards this bound for
+    // the full fixed-cap market and all order paths.
+    pub const V16_HEAP_FRAME_BYTES: usize = 32 * 1024;
 
     #[cfg(target_os = "solana")]
     #[global_allocator]
