@@ -2783,6 +2783,12 @@ pub mod ix {
         },
         RevokePrivateOrder,
         ClosePrivateOrderAuthorization,
+        /// Permissionlessly make an elapsed private order terminal. This never
+        /// closes the account or chooses a rent destination.
+        ExpirePrivateOrder,
+        /// Permissionlessly close only a terminal private authorization to its
+        /// immutable recorded owner.
+        CloseTerminalPrivateOrderAuthorization,
         /// One-time authority initialization of the scoped-order generation for this slab
         /// incarnation. A fresh non-zero random value must be used after every CloseSlab/re-init.
         InitializeOrderMarketInstance {
@@ -3096,6 +3102,8 @@ pub mod ix {
                 }
                 78 => Self::RevokePrivateOrder,
                 79 => Self::ClosePrivateOrderAuthorization,
+                81 => Self::ExpirePrivateOrder,
+                82 => Self::CloseTerminalPrivateOrderAuthorization,
                 66 => {
                     let n = read_u8(&mut rest)? as usize;
                     if n > BATCH_TRADE_DECODE_MAX_LEGS {
@@ -3453,6 +3461,8 @@ pub mod ix {
                 }
                 Self::RevokePrivateOrder => out.push(78),
                 Self::ClosePrivateOrderAuthorization => out.push(79),
+                Self::ExpirePrivateOrder => out.push(81),
+                Self::CloseTerminalPrivateOrderAuthorization => out.push(82),
                 Self::BatchTradeNoCpi { ref legs } => {
                     out.push(66);
                     out.push(legs.len() as u8);
@@ -5828,6 +5838,12 @@ pub mod processor {
             Instruction::ClosePrivateOrderAuthorization => {
                 handle_close_private_order_authorization(program_id, accounts)
             }
+            Instruction::ExpirePrivateOrder => {
+                handle_expire_private_order(program_id, accounts)
+            }
+            Instruction::CloseTerminalPrivateOrderAuthorization => {
+                handle_close_terminal_private_order_authorization(program_id, accounts)
+            }
             Instruction::BatchTradeNoCpi { legs } => {
                 handle_batch_trade_nocpi(program_id, accounts, &legs)
             }
@@ -7733,12 +7749,61 @@ pub mod processor {
         close_order_authorization_account(authorization_ai, destination)
     }
 
+    fn handle_expire_private_order<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        let authorization_ai = account(accounts, 0)?;
+        expect_writable(authorization_ai)?;
+        expect_owner(authorization_ai, program_id)?;
+        let mut authorization =
+            state::read_private_order_authorization(&authorization_ai.try_borrow_data()?)?;
+        if authorization.authorization_account_id != authorization_ai.key.to_bytes()
+            || authorization.state != constants::ORDER_AUTHORIZATION_STATE_ACTIVE
+            || Clock::get()?.slot <= authorization.expiry_slot
+        {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        authorization.state = constants::ORDER_AUTHORIZATION_STATE_REVOKED;
+        state::write_private_order_authorization(
+            &mut authorization_ai.try_borrow_mut_data()?,
+            &authorization,
+        )
+    }
+
+    fn handle_close_terminal_private_order_authorization<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        let authorization_ai = account(accounts, 0)?;
+        let destination = account(accounts, 1)?;
+        expect_writable(authorization_ai)?;
+        expect_writable(destination)?;
+        expect_owner(authorization_ai, program_id)?;
+        let authorization =
+            state::read_private_order_authorization(&authorization_ai.try_borrow_data()?)?;
+        if authorization.authorization_account_id != authorization_ai.key.to_bytes()
+            || !matches!(
+                authorization.state,
+                constants::ORDER_AUTHORIZATION_STATE_CONSUMED
+                    | constants::ORDER_AUTHORIZATION_STATE_REVOKED
+            )
+            || authorization.owner != destination.key.to_bytes()
+        {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        close_order_authorization_account(authorization_ai, destination)
+    }
+
     fn close_order_authorization_account(
         authorization_ai: &AccountInfo,
         destination: &AccountInfo,
     ) -> ProgramResult {
         expect_writable(authorization_ai)?;
         expect_writable(destination)?;
+        if authorization_ai.key == destination.key {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
         let recovered = authorization_ai.lamports();
         let destination_lamports = destination
             .lamports()
@@ -13792,6 +13857,22 @@ pub mod processor {
             assert_eq!(
                 Instruction::decode(&Instruction::ClosePrivateOrderAuthorization.encode()).unwrap(),
                 Instruction::ClosePrivateOrderAuthorization
+            );
+            assert_eq!(Instruction::ExpirePrivateOrder.encode(), vec![81]);
+            assert_eq!(
+                Instruction::decode(&Instruction::ExpirePrivateOrder.encode()).unwrap(),
+                Instruction::ExpirePrivateOrder
+            );
+            assert_eq!(
+                Instruction::CloseTerminalPrivateOrderAuthorization.encode(),
+                vec![82]
+            );
+            assert_eq!(
+                Instruction::decode(
+                    &Instruction::CloseTerminalPrivateOrderAuthorization.encode(),
+                )
+                .unwrap(),
+                Instruction::CloseTerminalPrivateOrderAuthorization
             );
         }
 

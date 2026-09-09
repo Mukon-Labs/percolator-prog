@@ -2570,6 +2570,29 @@ impl V16CuEnv {
             .expect("valid private order authorization")
     }
 
+    fn expire_private_order(&mut self, authorization: Pubkey) -> Result<u64, String> {
+        self.send(
+            ProgInstruction::ExpirePrivateOrder,
+            vec![AccountMeta::new(authorization, false)],
+            &[],
+        )
+    }
+
+    fn close_terminal_private_order_authorization(
+        &mut self,
+        authorization: Pubkey,
+        destination: Pubkey,
+    ) -> Result<u64, String> {
+        self.send(
+            ProgInstruction::CloseTerminalPrivateOrderAuthorization,
+            vec![
+                AccountMeta::new(authorization, false),
+                AccountMeta::new(destination, false),
+            ],
+            &[],
+        )
+    }
+
     fn withdraw(&mut self, owner: &Keypair, portfolio: Pubkey, amount: u128) -> Pubkey {
         self.withdraw_with_cu(owner, portfolio, amount).0
     }
@@ -4189,6 +4212,66 @@ fn assert_cu_within(label: &str, cu: u64, limit: u64) {
         cu <= limit,
         "{label} consumed {cu} CU, above the {limit} CU guardrail"
     );
+}
+
+#[test]
+fn v16_bpf_expired_private_order_can_only_refund_its_recorded_owner() {
+    let mut env = V16CuEnv::new();
+    env.initialize_order_market_instance(0x2130_4050_6070_8091);
+    let owner = Keypair::new();
+    let delegate = Keypair::new();
+    let portfolio = env.create_portfolio(&owner);
+    let current_slot = env.svm.get_sysvar::<Clock>().slot;
+    let expiry_slot = current_slot + 2;
+    let asset_market_id = env.market_state().1.assets[0].market_id;
+    let branch = OrderAuthorizationBranch {
+        asset_index: 0,
+        asset_market_id,
+        size_q: POS_SCALE as i128,
+        max_fee_bps: 100,
+        trigger_price_e6: 100,
+        limit_price_e6: 100,
+        trigger_condition: ORDER_TRIGGER_AT_OR_BELOW,
+        reduce_only: 0,
+    };
+    let (authorization, _) = env.create_private_order_authorization(
+        &owner,
+        portfolio,
+        &delegate,
+        expiry_slot,
+        1,
+        [branch, OrderAuthorizationBranch::default()],
+    );
+    assert!(
+        env.expire_private_order(authorization).is_err(),
+        "an unexpired private authorization must remain active"
+    );
+    env.svm.warp_to_slot(expiry_slot + 1);
+    env.svm.expire_blockhash();
+    env.expire_private_order(authorization)
+        .expect("permissionless expiry transition");
+    assert_eq!(
+        env.private_order_authorization_state(authorization).state,
+        ORDER_AUTHORIZATION_STATE_REVOKED
+    );
+
+    let recovered = env.svm.get_account(&authorization).unwrap().lamports;
+    let owner_before = env.svm.get_account(&owner.pubkey()).unwrap().lamports;
+    assert!(
+        env.close_terminal_private_order_authorization(authorization, delegate.pubkey())
+            .is_err(),
+        "terminal rent cannot be redirected"
+    );
+    env.close_terminal_private_order_authorization(authorization, owner.pubkey())
+        .expect("permissionless owner-pinned terminal close");
+    assert!(
+        env.svm
+            .get_account(&authorization)
+            .is_none_or(|account| account.lamports == 0 && account.data.is_empty()),
+        "closed authorization must be absent or a zero-lamport empty tombstone"
+    );
+    let owner_after = env.svm.get_account(&owner.pubkey()).unwrap().lamports;
+    assert_eq!(owner_after - owner_before, recovered);
 }
 
 #[test]
