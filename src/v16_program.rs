@@ -33,6 +33,7 @@ use solana_program::{
 declare_id!("Perco1ator111111111111111111111111111111111");
 
 pub mod ninja_order_commitment;
+pub mod trading_session;
 
 // Opt-in SBF profiling only. Default/release builds contain no checkpoint
 // instructions or log traffic; `--features cu-audit` emits phase boundaries
