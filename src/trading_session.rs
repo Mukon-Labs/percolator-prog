@@ -10,6 +10,8 @@ pub const TOTAL_NOTIONAL_E6: u64 = 1_000_000_000;
 pub const MAX_PENDING: usize = 10;
 pub const MAX_ACTIONS: u64 = 100;
 pub const QUANTITY_SCALE: u128 = 1_000_000;
+pub const ACCOUNT_LEN: usize = 704;
+pub const ACCOUNT_MAGIC: &[u8; 8] = b"MUKSESS1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -168,8 +170,138 @@ impl Fill {
 }
 
 impl Grant {
+    pub fn scope(&self) -> Scope {
+        self.scope
+    }
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+    pub fn revoked(&self) -> bool {
+        self.revoked
+    }
+
+    /// Fixed, canonical wire format shared by the program and client. Reserved
+    /// bytes and unused reservation entries must be zero, not merely ignored.
+    #[inline(never)]
+    pub fn encode(&self) -> [u8; ACCOUNT_LEN] {
+        let mut out = [0u8; ACCOUNT_LEN];
+        out[..8].copy_from_slice(ACCOUNT_MAGIC);
+        let mut offset = 8;
+        for key in [
+            self.scope.owner,
+            self.scope.signer,
+            self.scope.program,
+            self.scope.domain,
+            self.scope.market,
+            self.scope.portfolio,
+        ] {
+            out[offset..offset + 32].copy_from_slice(&key);
+            offset += 32;
+        }
+        for value in [
+            self.scope.market_instance,
+            self.scope.portfolio_instance,
+            self.scope.asset_market_ids[0],
+            self.scope.asset_market_ids[1],
+            self.scope.asset_market_ids[2],
+            self.epoch,
+            self.created_at as u64,
+            self.expires_at as u64,
+            self.next_nonce,
+            self.spent_e6,
+            self.reserved_e6,
+        ] {
+            out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            offset += 8;
+        }
+        out[288] = u8::from(self.revoked);
+        for (i, reservation) in self.reservations.iter().enumerate() {
+            if let Some(r) = reservation {
+                let start = 296 + i * 40;
+                out[start..start + 32].copy_from_slice(&r.authorization);
+                out[start + 32..start + 40].copy_from_slice(&r.nonce.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    #[inline(never)]
+    pub fn decode(data: &[u8]) -> Result<Self, Error> {
+        if data.len() != ACCOUNT_LEN
+            || &data[..8] != ACCOUNT_MAGIC
+            || data[288] > 1
+            || data[289..296].iter().any(|b| *b != 0)
+            || data[696..].iter().any(|b| *b != 0)
+        {
+            return Err(Error::Identity);
+        }
+        let key = |o: usize| -> [u8; 32] { data[o..o + 32].try_into().unwrap() };
+        let number = |o: usize| -> u64 { u64::from_le_bytes(data[o..o + 8].try_into().unwrap()) };
+        let scope = Scope {
+            owner: key(8),
+            signer: key(40),
+            program: key(72),
+            domain: key(104),
+            market: key(136),
+            portfolio: key(168),
+            market_instance: number(200),
+            portfolio_instance: number(208),
+            asset_market_ids: [number(216), number(224), number(232)],
+        };
+        let created_at = i64::try_from(number(248)).map_err(|_| Error::Identity)?;
+        let mut grant = Self::new(scope, number(240), created_at)?;
+        if grant.expires_at != i64::try_from(number(256)).map_err(|_| Error::Identity)? {
+            return Err(Error::Identity);
+        }
+        grant.revoked = data[288] == 1;
+        grant.next_nonce = number(264);
+        grant.spent_e6 = number(272);
+        grant.reserved_e6 = number(280);
+        if grant.next_nonce > MAX_ACTIONS {
+            return Err(Error::Limit);
+        }
+        let mut count = 0u64;
+        for i in 0..MAX_PENDING {
+            let start = 296 + i * 40;
+            let authorization = key(start);
+            let nonce = number(start + 32);
+            if authorization == [0; 32] {
+                if nonce != 0 {
+                    return Err(Error::Reservation);
+                }
+            } else {
+                if nonce >= grant.next_nonce
+                    || [scope.owner, scope.signer, scope.market, scope.portfolio]
+                        .contains(&authorization)
+                    || grant
+                        .reservations
+                        .iter()
+                        .flatten()
+                        .any(|r| r.authorization == authorization || r.nonce == nonce)
+                {
+                    return Err(Error::Reservation);
+                }
+                grant.reservations[i] = Some(Reservation {
+                    authorization,
+                    nonce,
+                });
+                count += 1;
+            }
+        }
+        if grant.reserved_e6 != count * PER_ACTION_NOTIONAL_E6 {
+            return Err(Error::Reservation);
+        }
+        grant.ensure_capacity(0)?;
+        Ok(grant)
+    }
+
+    pub fn validate_action(&self, action: &Action, operation: Operation) -> Result<(), Error> {
+        self.check(action, operation)
+    }
+
     /// Owner verification is a mandatory caller precondition. `epoch` comes
     /// from persistent owner-grant state and must never be reset on closure.
+    #[inline(never)]
     pub fn new(scope: Scope, epoch: u64, now: i64) -> Result<Self, Error> {
         scope.validate()?;
         if epoch == 0 || now < 0 {
@@ -250,10 +382,16 @@ impl Grant {
 
     /// Returned state must be committed in the same transaction as the fill.
     /// Taking `self` by value keeps all failures non-mutating for host callers.
-    pub fn market_fill(mut self, action: &Action, fill: &Fill) -> Result<Self, Error> {
+    #[inline(never)]
+    pub fn validate_market_fill(&self, action: &Action, fill: &Fill) -> Result<(), Error> {
         self.check(action, Operation::MarketTrade)?;
+        self.ensure_capacity(fill.notional()?)
+    }
+
+    #[inline(never)]
+    pub fn market_fill(mut self, action: &Action, fill: &Fill) -> Result<Self, Error> {
+        self.validate_market_fill(action, fill)?;
         let notional = fill.notional()?;
-        self.ensure_capacity(notional)?;
         self.spent_e6 = self.spent_e6.checked_add(notional).ok_or(Error::Overflow)?;
         self.next_nonce = self.next_nonce.checked_add(1).ok_or(Error::Overflow)?;
         Ok(self)
@@ -261,6 +399,7 @@ impl Grant {
 
     /// Reserve the full public per-order ceiling regardless of private terms.
     /// The base-chain record never contains the hidden requested size or price.
+    #[inline(never)]
     pub fn reserve_ninja(
         mut self,
         action: &Action,
@@ -303,6 +442,7 @@ impl Grant {
 
     /// Cancellation permission alone does NOT release the reservation. The
     /// authoritative terminal state must be verified separately by the caller.
+    #[inline(never)]
     pub fn request_ninja_cancel(
         mut self,
         action: &Action,
@@ -331,6 +471,7 @@ impl Grant {
     /// consuming program. `None` means proven unfilled cancellation/expiry,
     /// NEVER account absence, a timeout, an indexer status or a failed callback.
     /// Already-authorized orders may settle after session expiry/revocation.
+    #[inline(never)]
     pub fn resolve_ninja(
         mut self,
         scope: &Scope,
@@ -384,6 +525,7 @@ impl Grant {
 
     /// Cannot reset the budget while old orders retain reservations. A new
     /// approval changes the key and monotonically advances the stored epoch.
+    #[inline(never)]
     pub fn renew(
         self,
         owner: [u8; 32],
@@ -391,7 +533,31 @@ impl Grant {
         expected_epoch: u64,
         now: i64,
     ) -> Result<Self, Error> {
+        let mut scope = self.scope;
+        scope.signer = new_signer;
+        self.renew_for_scope(owner, scope, expected_epoch, now)
+    }
+
+    /// Explicit owner reapproval may bind refreshed market/portfolio instance
+    /// IDs after recovery. It cannot move the grant to another owner, program,
+    /// domain or account, or abandon any old private reservation.
+    #[inline(never)]
+    pub fn renew_for_scope(
+        self,
+        owner: [u8; 32],
+        scope: Scope,
+        expected_epoch: u64,
+        now: i64,
+    ) -> Result<Self, Error> {
         if owner != self.scope.owner {
+            return Err(Error::Identity);
+        }
+        if scope.owner != self.scope.owner
+            || scope.program != self.scope.program
+            || scope.domain != self.scope.domain
+            || scope.market != self.scope.market
+            || scope.portfolio != self.scope.portfolio
+        {
             return Err(Error::Identity);
         }
         if expected_epoch != self.epoch {
@@ -400,11 +566,9 @@ impl Grant {
         if self.reserved_e6 != 0 || self.reservations.iter().any(Option::is_some) {
             return Err(Error::Pending);
         }
-        if now < self.created_at || new_signer == self.scope.signer {
+        if now < self.created_at || scope.signer == self.scope.signer {
             return Err(Error::Identity);
         }
-        let mut scope = self.scope;
-        scope.signer = new_signer;
         Self::new(
             scope,
             self.epoch.checked_add(1).ok_or(Error::Overflow)?,
@@ -416,6 +580,73 @@ impl Grant {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owner_reapproval_after_instance_recovery_keeps_account_scope_and_epoch() {
+        let first = Grant::new(scope(), 1, 100).unwrap();
+        let mut refreshed = scope();
+        refreshed.signer = [50; 32];
+        refreshed.market_instance += 1;
+        refreshed.portfolio_instance += 1;
+        refreshed.asset_market_ids = [7, 8, 9];
+        let next = first
+            .renew_for_scope(scope().owner, refreshed, 1, 101)
+            .unwrap();
+        assert_eq!(next.scope(), refreshed);
+        assert_eq!(next.epoch(), 2);
+        let mut substituted = refreshed;
+        substituted.portfolio = [51; 32];
+        assert!(first
+            .renew_for_scope(scope().owner, substituted, 1, 101)
+            .is_err());
+        assert!(first.renew_for_scope([51; 32], refreshed, 1, 101).is_err());
+        assert!(first
+            .renew_for_scope(scope().owner, refreshed, 0, 101)
+            .is_err());
+        let action = Action {
+            scope: scope(),
+            epoch: 1,
+            nonce: 0,
+            now: 100,
+            operation: Operation::NinjaCreate,
+            asset_index: 0,
+            asset_market_id: 0,
+        };
+        let pending = first.reserve_ninja(&action, [60; 32]).unwrap();
+        assert!(pending
+            .renew_for_scope(scope().owner, refreshed, 1, 101)
+            .is_err());
+    }
+    #[test]
+    fn account_codec_rejects_noncanonical_and_roundtrips_reservations() {
+        let grant = Grant::new(scope(), 1, 100).unwrap();
+        assert_eq!(Grant::decode(&grant.encode()), Ok(grant));
+        let action = Action {
+            scope: scope(),
+            epoch: 1,
+            nonce: 0,
+            now: 101,
+            operation: Operation::NinjaCreate,
+            asset_index: 0,
+            asset_market_id: 0,
+        };
+        let reserved = grant.reserve_ninja(&action, [99; 32]).unwrap();
+        assert_eq!(Grant::decode(&reserved.encode()), Ok(reserved));
+        for index in [0, 289, 295, 696, 703] {
+            let mut bytes = reserved.encode();
+            bytes[index] ^= 1;
+            assert!(Grant::decode(&bytes).is_err(), "byte {index}");
+        }
+        let mut bytes = reserved.encode();
+        bytes[280] ^= 1;
+        assert!(Grant::decode(&bytes).is_err());
+        let mut bytes = reserved.encode();
+        bytes[288] = 2;
+        assert!(Grant::decode(&bytes).is_err());
+        let mut bytes = reserved.encode();
+        bytes[328..336].copy_from_slice(&1u64.to_le_bytes());
+        assert!(Grant::decode(&bytes).is_err());
+        assert!(Grant::decode(&reserved.encode()[..703]).is_err());
+    }
     fn scope() -> Scope {
         Scope {
             owner: [1; 32],

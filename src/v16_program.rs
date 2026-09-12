@@ -4688,6 +4688,7 @@ pub mod policy_v16 {
 
 pub mod processor {
     use super::*;
+    pub mod trading_sessions { include!("trading_session_processor.rs"); }
     use crate::{
         error::{map_v16_error, PercolatorError},
         ix::Instruction,
@@ -5714,6 +5715,9 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         instruction_data: &[u8],
     ) -> ProgramResult {
+        if matches!(instruction_data.first(), Some(83..=88)) {
+            return trading_sessions::process(program_id, accounts, instruction_data);
+        }
         match Instruction::decode(instruction_data)? {
             Instruction::InitMarket {
                 max_portfolio_assets,
@@ -7429,6 +7433,7 @@ pub mod processor {
             0,
             branch.limit_price_e6,
             Some(branch.max_fee_bps),
+            None,
         )?;
         if filled {
             authorization.state = constants::ORDER_AUTHORIZATION_STATE_CONSUMED;
@@ -7679,16 +7684,19 @@ pub mod processor {
             return Err(PercolatorError::EngineLockActive.into());
         }
         validate_exact_reduce_only_order(market_ai, portfolio_ai, &branch)?;
+        let session_binding = trading_sessions::ninja_binding(authorization_ai)?;
+        let mut session_receipt = None;
         let filled = execute_trade_cpi_scoped(
             program_id,
             accounts,
             &Pubkey::new_from_array(authorization.owner),
-            1,
+            if session_binding.is_some() { 3 } else { 1 },
             branch.asset_index,
             branch.size_q,
             0,
             branch.limit_price_e6,
             Some(branch.max_fee_bps),
+            if session_binding.is_some() { Some(&mut session_receipt) } else { None },
         )?;
         if filled {
             authorization.state = constants::ORDER_AUTHORIZATION_STATE_CONSUMED;
@@ -7696,6 +7704,17 @@ pub mod processor {
                 &mut authorization_ai.try_borrow_mut_data()?,
                 &authorization,
             )?;
+            if session_binding.is_some() {
+                let receipt = session_receipt.ok_or(ProgramError::InvalidAccountData)?;
+                trading_sessions::resolve_ninja(program_id, authorization_ai, account(accounts, 9)?,
+                    branch.asset_index, branch.asset_market_id, Some(&crate::trading_session::Fill {
+                        requested_q: branch.size_q, filled_q: receipt.size_q, price_e6: receipt.price_e6,
+                        minimum_price_e6: if branch.size_q < 0 { branch.limit_price_e6 } else { 1 },
+                        maximum_price_e6: if branch.size_q > 0 { branch.limit_price_e6 } else { u64::MAX },
+                        fee_bps: receipt.fee_bps, maximum_fee_bps: branch.max_fee_bps,
+                        position_before_q: -branch.size_q, reduce_only: branch.reduce_only == 1,
+                    }))?;
+            }
             if let Some(destination) = accounts.get(8) {
                 expect_key(destination, &Pubkey::new_from_array(authorization.owner))?;
                 close_order_authorization_account(authorization_ai, destination)?;
@@ -7747,6 +7766,7 @@ pub mod processor {
         {
             return Err(PercolatorError::Unauthorized.into());
         }
+        trading_sessions::ensure_ninja_resolved(authorization_ai)?;
         close_order_authorization_account(authorization_ai, destination)
     }
 
@@ -7793,6 +7813,7 @@ pub mod processor {
         {
             return Err(PercolatorError::Unauthorized.into());
         }
+        trading_sessions::ensure_ninja_resolved(authorization_ai)?;
         close_order_authorization_account(authorization_ai, destination)
     }
 
@@ -7844,9 +7865,12 @@ pub mod processor {
             fee_bps,
             limit_price,
             None,
+            None,
         )
         .map(|_| ())
     }
+
+    struct TradingSessionReceipt { size_q: i128, price_e6: u64, fee_bps: u64 }
 
     fn validate_authorized_order_execution_bounds<'a>(
         market_ai: &AccountInfo<'a>,
@@ -7900,6 +7924,7 @@ pub mod processor {
         fee_bps: u64,
         limit_price: u64,
         authorized_max_fee_bps: Option<u64>,
+        receipt: Option<&mut Option<TradingSessionReceipt>>,
     ) -> Result<bool, ProgramError> {
         cu_checkpoint!("trade_cpi:start");
         let signer_a = account(accounts, 0)?;
@@ -8080,6 +8105,17 @@ pub mod processor {
         if authorized_max_fee_bps.is_some() && ret.exec_size != size_q {
             return Err(PercolatorError::InvalidInstruction.into());
         }
+        // Capture accepted price and the actual fee quote before the engine
+        // mutates either portfolio. Old owner paths do not request this receipt.
+        let accepted_receipt = if receipt.is_some() {
+            let mut bytes = market_ai.try_borrow_mut_data()?;
+            let (cfg, group) = state::market_view_mut(&mut bytes)?;
+            let profile = read_oracle_profile_from_view(&group, &cfg, asset_index as usize)?;
+            let price = accepted_reported_trade_price_view(&profile, &group, asset_index as usize, ret.exec_price_e6)?;
+            let quote = hybrid_trade_fee_quote_view(&cfg, &profile, &group, asset_index as usize,
+                ret.exec_size.unsigned_abs(), price, fee_bps)?;
+            Some(TradingSessionReceipt { size_q: ret.exec_size, price_e6: price, fee_bps: quote.fee_bps })
+        } else { None };
         let (_, _, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         cu_checkpoint!("trade_cpi:before_engine");
@@ -8097,6 +8133,7 @@ pub mod processor {
             max_market_slots,
         )?;
         cu_checkpoint!("trade_cpi:end");
+        if let Some(destination) = receipt { *destination = accepted_receipt; }
         Ok(true)
     }
 

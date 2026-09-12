@@ -264,6 +264,11 @@ fn program_path() -> PathBuf {
 }
 
 fn matcher_program_path() -> PathBuf {
+    if let Some(explicit) = std::env::var_os("V16_TEST_MATCHER_ELF") {
+        let path = PathBuf::from(explicit);
+        assert!(path.is_absolute() && path.is_file(), "explicit local matcher ELF is unavailable");
+        return path;
+    }
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.pop();
     path.push("percolator-match/target/deploy/percolator_match.so");
@@ -736,8 +741,15 @@ impl V16CuEnv {
         params: V16CuMarketParams,
         market_capacity: usize,
     ) -> Self {
+        Self::new_with_init_params_capacity_and_program(params, market_capacity, percolator_prog::id())
+    }
+
+    fn new_with_init_params_capacity_and_program(
+        params: V16CuMarketParams,
+        market_capacity: usize,
+        program_id: Pubkey,
+    ) -> Self {
         let mut svm = LiteSVM::new();
-        let program_id = percolator_prog::id();
         let program_bytes = std::fs::read(program_path()).expect("read BPF");
         svm.add_program(program_id, &program_bytes);
         let token_program_bytes = std::fs::read(spl_token_program_path()).expect("read token BPF");
