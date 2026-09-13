@@ -252,6 +252,64 @@ fn canonical_retired_engine_slot(
     slot
 }
 
+#[test]
+fn v16_bpf_keeper_pre_push_maintenance_preserves_oracle_age_and_exposure() {
+    let mut env = V16CuEnv::new_with_init_params_capacity_and_program(V16CuMarketParams {
+        h_max: 20,
+        max_accrual_dt_slots: 20,
+        max_price_move_bps_per_slot: 24,
+        min_funding_lifetime_slots: 10_000_000,
+        ..V16CuMarketParams::default()
+    }, 1, "7C37Xn3NLknqmSaxASYy2uRkb1RQcXigPmJCANUNYnvq".parse().unwrap());
+    env.top_up_insurance(1_000_000);
+    env.svm.warp_to_slot(1);
+    env.configure_auth_mark_with_cu(1, 100);
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let buffer_owner = Keypair::new();
+    let long = env.create_portfolio(&long_owner);
+    let short = env.create_portfolio(&short_owner);
+    let buffer = env.create_portfolio(&buffer_owner);
+    env.deposit(&long_owner, long, 10_000);
+    env.deposit(&short_owner, short, 10_000);
+    env.trade_with_cu(&long_owner, long, &short_owner, short, POS_SCALE as i128, 100, 0);
+    let before = env.svm.get_account(&env.market).unwrap();
+    let before_oracle = state::read_asset_oracle_profile(&before.data, 0).unwrap();
+    let (_, before_group) = state::read_market(&before.data).unwrap();
+    let long_before = env.svm.get_account(&long).unwrap();
+    let short_before = env.svm.get_account(&short).unwrap();
+
+    // Model the failed-release gap, with the earlier pushed mark still stored.
+    env.svm.warp_to_slot(83);
+    for _ in 0..7 {
+        env.crank(buffer, ProgInstruction::PermissionlessCrank {
+            now_slot: 1, // deliberately old client argument; runtime Clock wins
+            observations: crank_observations(0),
+        });
+    }
+    let after = env.svm.get_account(&env.market).unwrap();
+    let after_oracle = state::read_asset_oracle_profile(&after.data, 0).unwrap();
+    let (_, after_group) = state::read_market(&after.data).unwrap();
+    assert_eq!(after_group.current_slot, 83);
+    assert_eq!(after_group.assets[0].slot_last, 83);
+    assert_eq!(after_oracle.last_good_oracle_slot, before_oracle.last_good_oracle_slot);
+    assert_eq!(after_oracle.mark_ewma_last_slot, before_oracle.mark_ewma_last_slot);
+    assert_eq!(after_oracle.mark_ewma_e6, before_oracle.mark_ewma_e6);
+    assert_eq!(after_group.assets[0].oi_eff_long_q, before_group.assets[0].oi_eff_long_q);
+    assert_eq!(after_group.assets[0].oi_eff_short_q, before_group.assets[0].oi_eff_short_q);
+    assert_eq!(after_group.insurance, before_group.insurance);
+    assert_eq!(env.svm.get_account(&long).unwrap().data, long_before.data);
+    assert_eq!(env.svm.get_account(&short).unwrap().data, short_before.data);
+
+    env.svm.warp_to_slot(113);
+    env.push_auth_mark_with_cu(83, 101);
+    let pushed = env.svm.get_account(&env.market).unwrap();
+    let pushed_oracle = state::read_asset_oracle_profile(&pushed.data, 0).unwrap();
+    assert_eq!(pushed_oracle.last_good_oracle_slot, 113);
+    assert_eq!(pushed_oracle.mark_ewma_e6, 101);
+    assert!(pushed_oracle.last_good_oracle_slot - after_group.current_slot <= 64);
+}
+
 fn program_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("target/deploy/percolator_prog.so");
