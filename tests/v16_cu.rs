@@ -310,7 +310,138 @@ fn v16_bpf_keeper_pre_push_maintenance_preserves_oracle_age_and_exposure() {
     assert!(pushed_oracle.last_good_oracle_slot - after_group.current_slot <= 64);
 }
 
+fn keeper_certificate_fixture() -> (V16CuEnv, Pubkey, Pubkey, Pubkey) {
+    let mut env = V16CuEnv::new_with_init_params_capacity_and_program(V16CuMarketParams {
+        max_portfolio_assets: 3, h_max: 20, max_accrual_dt_slots: 20,
+        max_price_move_bps_per_slot: 24, min_funding_lifetime_slots: 10_000_000,
+        ..V16CuMarketParams::default()
+    }, 3, "7C37Xn3NLknqmSaxASYy2uRkb1RQcXigPmJCANUNYnvq".parse().unwrap());
+    env.top_up_insurance(1_000_000);
+    env.svm.warp_to_slot(1);
+    env.configure_auth_mark_with_cu(1, 100);
+    let buffer_owner = Keypair::new();
+    let buffer = env.create_portfolio(&buffer_owner);
+    env.crank(buffer, ProgInstruction::PermissionlessCrank { now_slot: 1, observations: crank_observations(0) });
+    for asset in 1..3 {
+        env.configure_auth_mark_for_asset_as_admin(asset, 1, 100);
+    }
+    let long_owner = Keypair::new(); let short_owner = Keypair::new();
+    let long = env.create_portfolio(&long_owner); let short = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long, 100_000); env.deposit(&short_owner, short, 100_000);
+    for asset in 0..3 {
+        env.trade_asset_with_cu(asset, &long_owner, long, &short_owner, short, POS_SCALE as i128, 100, 0);
+    }
+    (env, long, short, buffer)
+}
+
+fn keeper_three_asset_crank(env: &V16CuEnv, portfolio: Pubkey) -> Instruction {
+    Instruction { program_id: env.program_id, accounts: vec![
+        AccountMeta::new(env.payer.pubkey(), true), AccountMeta::new(env.market, false),
+        AccountMeta::new(portfolio, false),
+    ], data: ProgInstruction::PermissionlessCrank { now_slot: 1,
+        observations: (0..3).map(|asset_index| CrankObservationHint { asset_index, oracle_accounts: 0 }).collect(),
+    }.encode() }
+}
+
+fn keeper_cert_is_current(env: &V16CuEnv, lp: Pubkey) -> bool {
+    let cert = health_cert(&env.portfolio_state(lp)); let (_, group) = env.market_state();
+    cert.valid && cert.cert_oracle_epoch == group.oracle_epoch
+        && cert.cert_funding_epoch == group.funding_epoch && cert.cert_risk_epoch == group.risk_epoch
+        && cert.cert_asset_set_epoch == group.asset_set_epoch
+}
+
+#[test]
+fn v16_bpf_keeper_split_maintenance_invalidates_lp_certificate() {
+    let (mut env, lp, _, buffer) = keeper_certificate_fixture();
+    assert!(keeper_cert_is_current(&env, lp));
+    env.svm.warp_to_slot(83);
+    for asset in 0..3 { env.push_auth_mark_for_asset_as_admin(asset, 83, 101); }
+    assert!(keeper_cert_is_current(&env, lp), "independent price pushes do not advance engine epochs");
+    let ix = keeper_three_asset_crank(&env, buffer);
+    env.svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(&[heap_ix(), cu_ix(), ix], Some(&env.payer.pubkey()), &[&env.payer], env.svm.latest_blockhash());
+    env.svm.send_transaction(tx).expect("legless maintenance succeeds");
+    assert!(!keeper_cert_is_current(&env, lp), "split maintenance exposes a stale LP certificate");
+}
+
+#[test]
+fn v16_bpf_keeper_atomic_maintenance_certifies_or_rolls_back_within_budget() {
+    for (reject_lp, price) in [(false, 101), (false, 99), (true, 101)] {
+        let (mut env, lp, trader, buffer) = keeper_certificate_fixture();
+        env.svm.warp_to_slot(163);
+        for asset in 0..3 { env.push_auth_mark_for_asset_as_admin(asset, 163, price); }
+        let keys = [env.market, lp, trader, buffer];
+        let before: Vec<_> = keys.iter().map(|key| env.svm.get_account(key).unwrap()).collect();
+        let mut ixs = vec![heap_ix(), ComputeBudgetInstruction::set_compute_unit_limit(1_400_000)];
+        ixs.extend((0..8).map(|_| keeper_three_asset_crank(&env, buffer)));
+        ixs.push(keeper_three_asset_crank(&env, if reject_lp { env.market } else { lp }));
+        env.svm.expire_blockhash();
+        let tx = Transaction::new_signed_with_payer(&ixs, Some(&env.payer.pubkey()), &[&env.payer], env.svm.latest_blockhash());
+        let packet = bincode::serialized_size(&tx).unwrap(); assert!(packet <= 1232, "packet={packet}");
+        let result = env.svm.send_transaction(tx);
+        if reject_lp {
+            let failure = result.expect_err("bad final LP must fail atomically");
+            assert!(matches!(failure.err, solana_sdk::transaction::TransactionError::InstructionError(10, _)), "must reach final LP instruction: {failure:?}");
+            for (key, account) in keys.iter().zip(&before) {
+                assert_eq!(env.svm.get_account(key).unwrap().data, account.data, "atomic rollback for {key}");
+            }
+        } else {
+            let meta = result.expect("8 legless + LP fits the existing 1.4m budget");
+            println!("keeper atomic three-asset batch: CU={} bytes={packet}", meta.compute_units_consumed);
+            assert!(meta.compute_units_consumed <= 1_400_000);
+            assert!(keeper_cert_is_current(&env, lp));
+            let (_, group) = env.market_state(); assert_eq!(group.current_slot, 163);
+            for asset in &group.assets { assert_eq!(asset.slot_last, 163); }
+            assert_eq!(env.svm.get_account(&trader).unwrap().data, before[2].data);
+            assert_eq!(group.insurance, state::read_market(&before[0].data).unwrap().1.insurance);
+            for (asset, old) in group.assets.iter().zip(state::read_market(&before[0].data).unwrap().1.assets.iter()) {
+                assert_eq!(asset.oi_eff_long_q, old.oi_eff_long_q); assert_eq!(asset.oi_eff_short_q, old.oi_eff_short_q);
+            }
+        }
+    }
+}
+
+#[test]
+fn v16_bpf_keeper_capped_recovery_progresses_before_atomic_certification() {
+    let (mut env, lp, trader, buffer) = keeper_certificate_fixture();
+    env.svm.warp_to_slot(1001);
+    // Sustained price movement forces bounded equity-active accrual instead of
+    // the engine's legitimate no-equity fast-forward after a tiny move settles.
+    for asset in 0..3 { env.push_auth_mark_for_asset_as_admin(asset, 1001, 10_000); }
+    let trader_before = env.svm.get_account(&trader).unwrap();
+    let mut previous = 1;
+    let mut finished = false;
+    for _ in 0..6 {
+        let needed = (1001 - previous + 40 + 19) / 20;
+        let capped = needed > 9;
+        let count = needed.min(9);
+        let mut ixs = vec![heap_ix(), cu_ix()];
+        ixs.extend((0..if capped { count } else { count - 1 }).map(|_| keeper_three_asset_crank(&env, buffer)));
+        if !capped { ixs.push(keeper_three_asset_crank(&env, lp)); }
+        env.svm.expire_blockhash();
+        let tx = Transaction::new_signed_with_payer(&ixs, Some(&env.payer.pubkey()), &[&env.payer], env.svm.latest_blockhash());
+        assert!(bincode::serialized_size(&tx).unwrap() <= 1232);
+        let meta = env.svm.send_transaction(tx).expect("bounded legless recovery makes progress");
+        assert!(meta.compute_units_consumed <= 1_400_000);
+        let (_, group) = env.market_state();
+        println!("keeper recovery batch: before={previous} capped={capped} clocks={:?} CU={}", group.assets.iter().map(|a| a.slot_last).collect::<Vec<_>>(), meta.compute_units_consumed);
+        assert!(group.assets.iter().all(|a| a.slot_last > previous));
+        assert!(group.assets.iter().all(|a| a.slot_last <= 1001));
+        previous = group.assets.iter().map(|a| a.slot_last).min().unwrap();
+        if capped { assert!(!keeper_cert_is_current(&env, lp)); }
+        else { assert!(keeper_cert_is_current(&env, lp)); finished = true; break; }
+    }
+    assert!(finished);
+    assert!(keeper_cert_is_current(&env, lp));
+    assert_eq!(env.svm.get_account(&trader).unwrap().data, trader_before.data);
+}
+
 fn program_path() -> PathBuf {
+    if let Some(explicit) = std::env::var_os("V16_TEST_PROGRAM_ELF") {
+        let path = PathBuf::from(explicit);
+        assert!(path.is_absolute() && path.is_file(), "explicit local v16 ELF is unavailable");
+        return path;
+    }
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("target/deploy/percolator_prog.so");
     assert!(
