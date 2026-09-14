@@ -8105,20 +8105,22 @@ pub mod processor {
         if authorized_max_fee_bps.is_some() && ret.exec_size != size_q {
             return Err(PercolatorError::InvalidInstruction.into());
         }
-        // Capture accepted price and the actual fee quote before the engine
-        // mutates either portfolio. Old owner paths do not request this receipt.
-        let accepted_receipt = if receipt.is_some() {
+        // Capture accepted price and actual fee before mutation for both session
+        // accounting and durable public fill receipts. A matcher request, limit
+        // price or external benchmark is not an execution receipt.
+        let accepted_receipt = {
             let mut bytes = market_ai.try_borrow_mut_data()?;
             let (cfg, group) = state::market_view_mut(&mut bytes)?;
             let profile = read_oracle_profile_from_view(&group, &cfg, asset_index as usize)?;
             let price = accepted_reported_trade_price_view(&profile, &group, asset_index as usize, ret.exec_price_e6)?;
             let quote = hybrid_trade_fee_quote_view(&cfg, &profile, &group, asset_index as usize,
                 ret.exec_size.unsigned_abs(), price, fee_bps)?;
-            Some(TradingSessionReceipt { size_q: ret.exec_size, price_e6: price, fee_bps: quote.fee_bps })
-        } else { None };
+            TradingSessionReceipt { size_q: ret.exec_size, price_e6: price, fee_bps: quote.fee_bps }
+        };
         let (_, _, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         cu_checkpoint!("trade_cpi:before_engine");
+        let position_before = receipt_position(market_ai, account_a_ai, asset_index, max_market_slots)?;
         handle_trade_nocpi_zero_copy(
             program_id,
             account_a_owner_key,
@@ -8133,8 +8135,63 @@ pub mod processor {
             max_market_slots,
         )?;
         cu_checkpoint!("trade_cpi:end");
-        if let Some(destination) = receipt { *destination = accepted_receipt; }
+        let position_after = receipt_position(market_ai, account_a_ai, asset_index, max_market_slots)?;
+        // Only successful transactions may be indexed. A later instruction may
+        // still roll this fill back; consumers MUST check transaction meta.err.
+        emit_trade_receipt(market_ai.key, account_a_ai.key, account_a_owner_key,
+            asset_index, &accepted_receipt, position_before, position_after);
+        if let Some(destination) = receipt { *destination = Some(accepted_receipt); }
         Ok(true)
+    }
+
+    fn receipt_position(market: &AccountInfo, portfolio: &AccountInfo, asset: u16,
+        capacity: usize) -> Result<i128, ProgramError> {
+        let mut market_data = market.try_borrow_mut_data()?;
+        let mut portfolio_data = portfolio.try_borrow_mut_data()?;
+        let (_, group) = state::market_view_mut(&mut market_data)?;
+        let pf = state::portfolio_view_mut_for_market_slots(&mut portfolio_data, capacity)?;
+        signed_position_for_asset_view(&group, &pf, asset as usize)
+    }
+
+    fn emit_trade_receipt(market: &Pubkey, portfolio: &Pubkey, owner: &Pubkey,
+        asset: u16, receipt: &TradingSessionReceipt, before: i128, after: i128) {
+        let data = encode_trade_receipt(market, portfolio, owner, asset, receipt, before, after);
+        solana_program::log::sol_log_data(&[&data]);
+    }
+
+    fn encode_trade_receipt(market: &Pubkey, portfolio: &Pubkey, owner: &Pubkey,
+        asset: u16, receipt: &TradingSessionReceipt, before: i128, after: i128) -> [u8; 170] {
+        let mut data = [0u8; 170];
+        data[..8].copy_from_slice(b"NJFILL02");
+        data[8..40].copy_from_slice(market.as_ref());
+        data[40..72].copy_from_slice(portfolio.as_ref());
+        data[72..104].copy_from_slice(owner.as_ref());
+        data[104..106].copy_from_slice(&asset.to_le_bytes());
+        data[106..122].copy_from_slice(&receipt.size_q.to_le_bytes());
+        data[122..130].copy_from_slice(&receipt.price_e6.to_le_bytes());
+        data[130..138].copy_from_slice(&receipt.fee_bps.to_le_bytes());
+        data[138..154].copy_from_slice(&before.to_le_bytes());
+        data[154..170].copy_from_slice(&after.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn fill_receipt_wire_is_exact_and_preserves_signed_quantity() {
+        let market = Pubkey::new_from_array([1; 32]);
+        let portfolio = Pubkey::new_from_array([2; 32]);
+        let owner = Pubkey::new_from_array([3; 32]);
+        let data = encode_trade_receipt(&market, &portfolio, &owner, 1,
+            &TradingSessionReceipt { size_q: -196078, price_e6: 101530307, fee_bps: 5 }, -100, -196178);
+        assert_eq!(&data[..8], b"NJFILL02");
+        assert_eq!(&data[8..40], market.as_ref());
+        assert_eq!(&data[40..72], portfolio.as_ref());
+        assert_eq!(&data[72..104], owner.as_ref());
+        assert_eq!(u16::from_le_bytes(data[104..106].try_into().unwrap()), 1);
+        assert_eq!(i128::from_le_bytes(data[106..122].try_into().unwrap()), -196078);
+        assert_eq!(u64::from_le_bytes(data[122..130].try_into().unwrap()), 101530307);
+        assert_eq!(u64::from_le_bytes(data[130..138].try_into().unwrap()), 5);
+        assert_eq!(i128::from_le_bytes(data[138..154].try_into().unwrap()), -100);
+        assert_eq!(i128::from_le_bytes(data[154..170].try_into().unwrap()), -196178);
     }
 
     #[inline(never)]

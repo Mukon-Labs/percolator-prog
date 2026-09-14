@@ -436,6 +436,55 @@ fn v16_bpf_keeper_capped_recovery_progresses_before_atomic_certification() {
     assert_eq!(env.svm.get_account(&trader).unwrap().data, trader_before.data);
 }
 
+#[test]
+fn v16_bpf_keeper_delayed_landing_requires_full_existing_batch_envelope() {
+    for (full_envelope, reversals) in [(false, false), (true, false), (true, true)] {
+        let (mut env, lp, _, buffer) = keeper_certificate_fixture();
+        let mut previous = 1u64;
+        for round in 0..16 {
+            let observed = previous + 30;
+            // Four cranks looked sufficient at planning time (30 + 40 headroom).
+            // A later landing spends more than that allowance, without changing
+            // the transaction's instruction count. Model a 15s / 90-slot delay.
+            let landing = observed + 90;
+            env.svm.warp_to_slot(landing);
+            let price = if reversals { if round % 2 == 0 {200} else {100} } else {200 + round * 100};
+            for asset in 0..3 { env.push_auth_mark_for_asset_as_admin(asset, landing, price); }
+            let before: Vec<_> = [env.market, lp, buffer].iter().map(|key| (*key, env.svm.get_account(key).unwrap().data)).collect();
+            let count = if full_envelope {9} else {4};
+            let mut ixs = vec![heap_ix(), cu_ix()];
+            ixs.extend((0..count-1).map(|_| keeper_three_asset_crank(&env, buffer)));
+            ixs.push(keeper_three_asset_crank(&env, lp));
+            env.svm.expire_blockhash();
+            let tx = Transaction::new_signed_with_payer(&ixs, Some(&env.payer.pubkey()), &[&env.payer], env.svm.latest_blockhash());
+            assert!(bincode::serialized_size(&tx).unwrap() <= 1232);
+            let result = env.svm.send_transaction(tx);
+            let (_, group) = env.market_state();
+            if !full_envelope {
+                assert!(result.is_err() || group.loss_stale_active || group.assets.iter().any(|a| a.slot_last < landing),
+                    "old planned batch must reproduce incomplete maintenance");
+                break;
+            }
+            if reversals && round == 3 {
+                // Separate financial guard: this synthetic unbacked LP cannot
+                // settle the fourth price reversal. Preserve atomic rollback;
+                // extra clock capacity must never bypass a settlement lock.
+                let err = result.expect_err("unbacked LP settlement must remain locked");
+                assert!(matches!(err.err, solana_sdk::transaction::TransactionError::InstructionError(10,
+                    solana_sdk::instruction::InstructionError::Custom(21))));
+                for (key, data) in before { assert_eq!(env.svm.get_account(&key).unwrap().data, data); }
+                break;
+            }
+            let meta = result.unwrap_or_else(|e| panic!("full batch round {round}, previous {previous}, landing {landing}: {e:?}"));
+            assert!(meta.compute_units_consumed <= 1_400_000);
+            assert!(keeper_cert_is_current(&env, lp));
+            assert!(!group.loss_stale_active);
+            assert!(group.assets.iter().all(|a| a.slot_last == landing));
+            previous = landing;
+        }
+    }
+}
+
 fn program_path() -> PathBuf {
     if let Some(explicit) = std::env::var_os("V16_TEST_PROGRAM_ELF") {
         let path = PathBuf::from(explicit);
@@ -11136,6 +11185,112 @@ fn v16_bpf_tradecpi_executes_through_external_matcher_and_is_bounded() {
         "matcher must echo the requested asset index in the v3 return slot"
     );
     assert_eq!(group.c_tot + group.insurance, group.vault);
+}
+
+#[test]
+fn v16_bpf_confirmed_fill_receipt_and_later_rollback() {
+    let mut env = V16CuEnv::new();
+    let matcher_program = Pubkey::new_unique();
+    env.svm.add_program(matcher_program, &std::fs::read(matcher_program_path()).unwrap());
+    let owner = Keypair::new();
+    let maker = Keypair::new();
+    let portfolio = env.create_portfolio(&owner);
+    let lp = env.create_portfolio(&maker);
+    env.deposit(&owner, portfolio, 1_000_000);
+    env.deposit(&maker, lp, 1_000_000);
+    let (context, delegate, _) = env.init_matcher_context_authorized(matcher_program, &maker, lp);
+    let instruction = Instruction {
+        program_id: env.program_id,
+        accounts: vec![AccountMeta::new(owner.pubkey(), true), AccountMeta::new(env.market, false),
+            AccountMeta::new(portfolio, false), AccountMeta::new(lp, false),
+            AccountMeta::new_readonly(matcher_program, false), AccountMeta::new(context, false),
+            AccountMeta::new_readonly(delegate, false)],
+        data: ProgInstruction::TradeCpi { asset_index: 0, size_q: (10 * POS_SCALE) as i128,
+            fee_bps: 100, limit_price: 0 }.encode(),
+    };
+    let tx = Transaction::new_signed_with_payer(&[heap_ix(), cu_ix(), instruction.clone()],
+        Some(&env.payer.pubkey()), &[&env.payer, &owner], env.svm.latest_blockhash());
+    let meta = env.svm.send_transaction(tx).expect("receipt trade");
+    assert!(meta.compute_units_consumed <= TRADE_CU_LIMIT);
+    let mut expected = Vec::new();
+    expected.extend_from_slice(b"NJFILL02");
+    expected.extend_from_slice(env.market.as_ref());
+    expected.extend_from_slice(portfolio.as_ref());
+    expected.extend_from_slice(owner.pubkey().as_ref());
+    expected.extend_from_slice(&0u16.to_le_bytes());
+    expected.extend_from_slice(&((10 * POS_SCALE) as i128).to_le_bytes());
+    expected.extend_from_slice(&100u64.to_le_bytes());
+    expected.extend_from_slice(&100u64.to_le_bytes());
+    expected.extend_from_slice(&0i128.to_le_bytes());
+    expected.extend_from_slice(&((10 * POS_SCALE) as i128).to_le_bytes());
+    assert_eq!(expected.len(), 170);
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let encode = |bytes: &[u8]| -> String { bytes.chunks(3).flat_map(|c| {
+        let n = ((c[0] as u32) << 16) | ((c.get(1).copied().unwrap_or(0) as u32) << 8) | c.get(2).copied().unwrap_or(0) as u32;
+        [alphabet[((n >> 18) & 63) as usize] as char, alphabet[((n >> 12) & 63) as usize] as char,
+          if c.len() > 1 {alphabet[((n >> 6) & 63) as usize] as char} else {'='},
+          if c.len() > 2 {alphabet[(n & 63) as usize] as char} else {'='}]
+    }).collect() };
+    let receipt = format!("Program data: {}", encode(&expected));
+    assert_eq!(meta.logs.iter().filter(|log| **log == receipt).count(), 1);
+    println!("receipt TradeCpi CU: {}", meta.compute_units_consumed);
+    let before = env.svm.get_account(&portfolio).unwrap().data;
+    expected[138..154].copy_from_slice(&((10 * POS_SCALE) as i128).to_le_bytes());
+    expected[154..170].copy_from_slice(&((20 * POS_SCALE) as i128).to_le_bytes());
+    let rollback_receipt = format!("Program data: {}", encode(&expected));
+    let failed = Transaction::new_signed_with_payer(&[heap_ix(), cu_ix(), instruction,
+        Instruction { program_id: env.program_id, accounts: vec![], data: vec![255] }],
+        Some(&env.payer.pubkey()), &[&env.payer, &owner], env.svm.latest_blockhash());
+    let error = env.svm.send_transaction(failed).expect_err("later instruction must fail");
+    assert!(error.meta.logs.iter().any(|log| log == &rollback_receipt),
+        "runtime logs survive rollback: indexer MUST reject failed transaction metadata");
+    assert_eq!(env.svm.get_account(&portfolio).unwrap().data, before);
+}
+
+#[test]
+fn v16_bpf_export_readonly_valuation_vectors() {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(3, 10_000, 10_000, 10_000);
+    env.top_up_insurance(1_000_000);
+    for asset in 0..3 { env.configure_auth_mark_for_asset_as_admin(asset, 0, 100); }
+    let long_owner = Keypair::new(); let short_owner = Keypair::new();
+    let long = env.create_portfolio(&long_owner); let short = env.create_portfolio(&short_owner);
+    let buffer_owner = Keypair::new(); let buffer = env.create_portfolio(&buffer_owner);
+    env.deposit(&long_owner, long, 100_000); env.deposit(&short_owner, short, 100_000);
+    for asset in 0..3 {
+        env.trade_asset_with_cu(asset, &long_owner, long, &short_owner, short, POS_SCALE as i128, 100, 100);
+    }
+    let mut vectors = Vec::new();
+    for (slot, price) in [(1, 100), (3, 102), (5, 98)] {
+        env.svm.warp_to_slot(slot);
+        for asset in 0..3 { env.push_auth_mark_for_asset_as_admin(asset, slot, price); }
+        // Settle the market first without refreshing either customer's account.
+        let ix = keeper_three_asset_crank(&env, buffer);
+        send_raw_tx(&mut env.svm, &env.payer, ix, &[]).expect("advance test market");
+        for (side, account) in [("long", long), ("short", short)] {
+            let market_before = env.svm.get_account(&env.market).unwrap().data;
+            let portfolio_before = env.svm.get_account(&account).unwrap().data;
+            let before = env.portfolio_state(account);
+            let ix = keeper_three_asset_crank(&env, account);
+            env.svm.expire_blockhash();
+            send_raw_tx(&mut env.svm, &env.payer, ix, &[]).expect("SBF account refresh");
+            let after = env.portfolio_state(account);
+            let cert = health_cert(&after);
+            assert!(cert.valid);
+            let fields = [cert.certified_equity, cert.certified_initial_req as i128,
+                cert.certified_maintenance_req as i128, after.capital.get() as i128,
+                after.pnl.get(), after.fee_credits.get().unsigned_abs() as i128,
+                after.capital.get() as i128 + after.pnl.get() - before.capital.get() as i128 - before.pnl.get(),
+                env.market_state().1.current_slot as i128];
+            vectors.push(serde_json::json!({ "name": format!("{side}-{slot}-{price}"),
+                "market": market_before, "portfolio": portfolio_before,
+                "expected": fields.map(|v| v.to_string()), "contextSlot": slot.to_string() }));
+        }
+    }
+    // Only public synthetic LiteSVM account bytes; never keypair material.
+    if let Ok(path) = std::env::var("V16_VALUATION_FIXTURE_OUTPUT") {
+        std::fs::write(path, serde_json::to_vec(&vectors).unwrap()).unwrap();
+    }
+    assert_eq!(vectors.len(), 6);
 }
 
 #[test]
