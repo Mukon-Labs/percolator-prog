@@ -14,6 +14,14 @@
     "cleanSameToolchainBuildLength": 1172040,
     "cleanSameToolchainBuildSha256": "d0b17d6a35f3492dea867846aa443b6e18dfe47928490c1c3242ac9d240ed9b2"
   },
+  "normalizedFeeClampCandidate": {
+    "baseWrapperCommit": "6e0ca331330aa32905fb1689167c88d329afa6c0",
+    "feeClampCommit": "e1cf22ee",
+    "buildCommand": "NO_DNA=1 cargo build-sbf --no-default-features --sbf-out-dir target/deploy",
+    "elfLength": 1174480,
+    "elfSha256": "9b511b5559983c76f894e2020a7d5c2cabee81667fd2349ab2031decb97799b7",
+    "exactDeployedMatch": false
+  },
   "comparison": {
     "lengthDelta": 8160,
     "exactMatch": false,
