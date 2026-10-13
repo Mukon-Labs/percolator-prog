@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "status": "deployed-bytes-do-not-match-clean-source-build",
+  "cluster": "devnet",
+  "programId": "7C37Xn3NLknqmSaxASYy2uRkb1RQcXigPmJCANUNYnvq",
+  "deployment": {
+    "slot": 498301432,
+    "observedTimestamp": "2026-09-14T15:16:33Z",
+    "dumpLength": 1180200,
+    "dumpSha256": "e7db7277f8acecf844db97ede43cc8027a8ed677cf9c7314b6c802b5a54bd13f"
+  },
+  "candidateSource": {
+    "wrapperCommit": "6e0ca331330aa32905fb1689167c88d329afa6c0",
+    "cleanSameToolchainBuildLength": 1172040,
+    "cleanSameToolchainBuildSha256": "d0b17d6a35f3492dea867846aa443b6e18dfe47928490c1c3242ac9d240ed9b2"
+  },
+  "comparison": {
+    "lengthDelta": 8160,
+    "exactMatch": false,
+    "sourceReproducible": false
+  },
+  "releaseGate": {
+    "deploymentAuthorized": false,
+    "requiredResolution": "Reconstruct and independently verify the exact deployed source, feature set, toolchain, and post-processing before any later program upgrade."
+  },
+  "evidence": {
+    "recordedBy": "repository-normalization-audit",
+    "recordedAt": "2026-10-13",
+    "scope": "Preservation of prior read-only deployment and clean-build evidence; no chain read or deployment was performed by this normalization package."
+  }
+}
