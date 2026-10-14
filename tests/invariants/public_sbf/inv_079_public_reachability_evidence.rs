@@ -1,0 +1,2815 @@
+//! INV-079 - Public reachability evidence.
+//!
+//! Normative obligation: Accepted LoF and DoS findings reproduce through valid public instructions and exact external effects.
+//!
+//! Evidence in this file (I plus invariant-specific F/M assertions):
+//! `v16_public_trace_schema_detects_out_of_band_economic_mutation`,
+//! `v16_public_trace_terminal_classifier_requires_complete_economic_evidence`,
+//! `v16_public_terminal_classifier_exhausts_normalized_outcome_space`,
+//! `v16_every_public_trace_consumer_validates_reachability_evidence`,
+//! `v16_finding_blind_violation_oracle_evidence_roster_is_source_complete`,
+//! `v16_program_fixed_blockers_remain_progressing`,
+//! `v16_program_open_lof_manifest_snapshot_is_structurally_honest`,
+//! `v16_dated_open_security_finding_benchmark_is_non_overclaiming`, and
+//! `v16_invariant_charter_and_index_are_complete`. These tests exercise the deployed public
+//! wrapper with real SBF/LiteSVM account construction and assert economic state, token,
+//! rollback, liveness, or compute outcomes appropriate to the invariant.
+//!
+//! Guarantee boundary: a quarantined counterexample demonstrates public reachability; it does
+//! not certify the invariant on an unfixed pin. Certification requires the fixed-pin assertion
+//! plus every additional verification method required by the charter.
+
+use super::*;
+use crate::support::v16_svm::{
+    MarketConfig, PublicTerminalClassification, PublicTerminalObservation, V16Svm, USER_DEPOSIT,
+};
+use solana_sdk::signature::Signer;
+
+#[path = "inv_079_lifecycle_evidence_mounts.rs"]
+mod lifecycle_evidence_mounts;
+
+#[path = "inv_079_dynamic_account_trace.rs"]
+mod dynamic_account_trace;
+
+#[test]
+fn v16_public_trace_schema_detects_out_of_band_economic_mutation() {
+    let mut env = V16Svm::new([0x79; 32], MarketConfig::default());
+    env.begin_public_trace();
+
+    let mut foreign_market = env
+        .svm
+        .get_account(&env.foreign_market)
+        .expect("foreign market fixture");
+    foreign_market.lamports = foreign_market
+        .lamports
+        .checked_add(1)
+        .expect("mutation sentinel lamports");
+    env.svm
+        .set_account(env.foreign_market, foreign_market)
+        .expect("install deliberate out-of-band mutation sentinel");
+
+    env.deposit_primary(0, 1)
+        .expect("public call after mutation sentinel");
+    env.withdraw_primary(0, u128::MAX)
+        .expect_err("unrepresentable public withdrawal must reject");
+    let trace = env.finish_public_trace();
+    assert_eq!(
+        trace.out_of_band_economic_mutations, 1,
+        "trace schema must reject hidden state-injection evidence"
+    );
+    assert!(
+        trace.validate_public_execution().is_err(),
+        "out-of-band mutation must invalidate normalized public evidence"
+    );
+    assert_eq!(trace.steps.len(), 2);
+    let step = &trace.steps[0];
+    assert_eq!(step.program_id, percolator_prog::id());
+    assert!(step.succeeded);
+    assert!(step.compute_units.is_some());
+    assert!(step
+        .transaction_signers
+        .contains(&env.actors[0].signer.pubkey()));
+    assert!(step
+        .accounts
+        .iter()
+        .any(|meta| meta.key == env.actors[0].signer.pubkey() && meta.is_signer));
+    assert!(step
+        .token_deltas
+        .contains(&(env.actors[0].source_token, -1)));
+    assert!(step.token_deltas.contains(&(env.vault, 1)));
+    assert!(!step.lamport_deltas.is_empty());
+
+    let rejected = &trace.steps[1];
+    assert_eq!(rejected.program_id, percolator_prog::id());
+    assert!(!rejected.succeeded);
+    assert_eq!(rejected.compute_units, None);
+    assert_eq!(rejected.rejected_exact_writable_rollback, Some(true));
+    assert_eq!(rejected.rejected_no_program_lamport_delta, Some(true));
+    assert!(rejected.token_deltas.iter().all(|(_, delta)| *delta == 0));
+    assert!(rejected.lamport_deltas.iter().all(|(key, delta)| {
+        if *key == rejected.fee_payer {
+            *delta < 0
+        } else {
+            *delta == 0
+        }
+    }));
+}
+
+#[test]
+fn v16_public_trace_terminal_classifier_requires_complete_economic_evidence() {
+    let mut env = V16Svm::new([0x7a; 32], MarketConfig::default());
+    let actor = 0usize;
+    let observed_value = |env: &V16Svm| {
+        let portfolio = env.primary_portfolio(actor);
+        assert_eq!(portfolio.pnl.get(), 0, "flat classifier fixture has no PnL");
+        u128::from(env.token_amount(env.actors[actor].source_token))
+            + u128::from(env.token_amount(env.actors[actor].destination_token))
+            + portfolio.capital.get()
+    };
+
+    let value_before = observed_value(&env);
+    env.begin_public_trace();
+    env.withdraw_primary(actor, USER_DEPOSIT)
+        .expect("flat funded actor has a bounded public exit");
+    let exit_trace = env.finish_public_trace();
+    let value_after = observed_value(&env);
+    assert_eq!(
+        value_after, value_before,
+        "bounded exit preserves actor value"
+    );
+    assert_eq!(
+        exit_trace
+            .classify_terminal(PublicTerminalObservation {
+                victim_loss_atoms: 0,
+                unauthorized_gain_atoms: 0,
+                funded_value_remaining: 0,
+                unresolved_obligation: 0,
+                bounded_exit_succeeded: true,
+                terminal_receipt_created: false,
+                authorized_forfeit: false,
+                required_exit_routes: 0,
+                attempted_exit_routes: 0,
+                progressing_exit_routes: 0,
+            })
+            .expect("complete public exit evidence classifies"),
+        PublicTerminalClassification::BoundedExit
+    );
+
+    env.begin_public_trace();
+    env.withdraw_primary(actor, 1)
+        .expect_err("the empty portfolio cannot withdraw another atom");
+    let rejected_trace = env.finish_public_trace();
+    let rejection = PublicTerminalObservation {
+        victim_loss_atoms: 0,
+        unauthorized_gain_atoms: 0,
+        funded_value_remaining: 0,
+        unresolved_obligation: 0,
+        bounded_exit_succeeded: false,
+        terminal_receipt_created: false,
+        authorized_forfeit: false,
+        required_exit_routes: 0,
+        attempted_exit_routes: 0,
+        progressing_exit_routes: 0,
+    };
+    assert_eq!(
+        rejected_trace
+            .classify_terminal(rejection)
+            .expect("exact rejected route classifies"),
+        PublicTerminalClassification::AtomicRejection
+    );
+
+    assert!(
+        rejected_trace
+            .classify_terminal(PublicTerminalObservation {
+                victim_loss_atoms: 1,
+                ..rejection
+            })
+            .is_err(),
+        "a rejected transaction cannot be promoted to loss of funds"
+    );
+    assert!(
+        rejected_trace
+            .classify_terminal(PublicTerminalObservation {
+                funded_value_remaining: 1,
+                unresolved_obligation: 1,
+                required_exit_routes: 0b11,
+                attempted_exit_routes: 0b01,
+                progressing_exit_routes: 0,
+                ..rejection
+            })
+            .is_err(),
+        "one rejected route cannot be promoted to persistent DoS"
+    );
+
+    assert_eq!(
+        rejected_trace
+            .classify_terminal(PublicTerminalObservation {
+                funded_value_remaining: 1,
+                unresolved_obligation: 1,
+                required_exit_routes: 0b11,
+                attempted_exit_routes: 0b11,
+                progressing_exit_routes: 0,
+                ..rejection
+            })
+            .expect("complete nonprogressing route evidence classifies"),
+        PublicTerminalClassification::PersistentFundedLock {
+            funded_value_remaining: 1,
+            unresolved_obligation: 1,
+        }
+    );
+}
+
+#[test]
+fn v16_public_terminal_classifier_exhausts_normalized_outcome_space() {
+    fn expected_classification(
+        any_success: bool,
+        observation: PublicTerminalObservation,
+    ) -> Option<PublicTerminalClassification> {
+        if observation.victim_loss_atoms != 0 || observation.unauthorized_gain_atoms != 0 {
+            return (!observation.authorized_forfeit && any_success).then_some(
+                PublicTerminalClassification::LossOfFunds {
+                    victim_loss_atoms: observation.victim_loss_atoms,
+                    unauthorized_gain_atoms: observation.unauthorized_gain_atoms,
+                },
+            );
+        }
+
+        let complete_exit_coverage = observation.required_exit_routes != 0
+            && observation.attempted_exit_routes & observation.required_exit_routes
+                == observation.required_exit_routes;
+        let no_required_route_progress =
+            observation.progressing_exit_routes & observation.required_exit_routes == 0;
+        if complete_exit_coverage && no_required_route_progress {
+            return (observation.funded_value_remaining != 0
+                && observation.unresolved_obligation != 0
+                && !observation.bounded_exit_succeeded
+                && !observation.terminal_receipt_created
+                && !observation.authorized_forfeit)
+                .then_some(PublicTerminalClassification::PersistentFundedLock {
+                    funded_value_remaining: observation.funded_value_remaining,
+                    unresolved_obligation: observation.unresolved_obligation,
+                });
+        }
+
+        if observation.bounded_exit_succeeded
+            || observation.terminal_receipt_created
+            || observation.authorized_forfeit
+        {
+            return (observation.funded_value_remaining == 0
+                && observation.unresolved_obligation == 0
+                && any_success)
+                .then_some(PublicTerminalClassification::BoundedExit);
+        }
+
+        if !any_success {
+            return (observation.funded_value_remaining == 0
+                && observation.unresolved_obligation == 0)
+                .then_some(PublicTerminalClassification::AtomicRejection);
+        }
+
+        Some(PublicTerminalClassification::Progressing)
+    }
+
+    let mut env = V16Svm::new([0x7b; 32], MarketConfig::default());
+    env.begin_public_trace();
+    env.withdraw_primary(0, 1)
+        .expect("successful wrapper trace fixture");
+    let successful_trace = env.finish_public_trace();
+    successful_trace
+        .validate_public_execution()
+        .expect("successful trace is valid public evidence");
+
+    env.begin_public_trace();
+    env.withdraw_primary(0, u128::MAX)
+        .expect_err("rejected wrapper trace fixture");
+    let rejected_trace = env.finish_public_trace();
+    rejected_trace
+        .validate_public_execution()
+        .expect("rejected trace is valid public evidence");
+
+    let representative_amounts = [0, 1, u128::MAX];
+    let mut cases = 0usize;
+    for victim_loss_atoms in representative_amounts {
+        for unauthorized_gain_atoms in representative_amounts {
+            for funded_value_remaining in representative_amounts {
+                for unresolved_obligation in representative_amounts {
+                    for terminal_flags in 0..8u8 {
+                        for required_exit_routes in 0..8u64 {
+                            for attempted_exit_routes in 0..8u64 {
+                                for progressing_exit_routes in 0..8u64 {
+                                    let observation = PublicTerminalObservation {
+                                        victim_loss_atoms,
+                                        unauthorized_gain_atoms,
+                                        funded_value_remaining,
+                                        unresolved_obligation,
+                                        bounded_exit_succeeded: terminal_flags & 1 != 0,
+                                        terminal_receipt_created: terminal_flags & 2 != 0,
+                                        authorized_forfeit: terminal_flags & 4 != 0,
+                                        required_exit_routes,
+                                        attempted_exit_routes,
+                                        progressing_exit_routes,
+                                    };
+                                    for (any_success, trace) in
+                                        [(true, &successful_trace), (false, &rejected_trace)]
+                                    {
+                                        assert_eq!(
+                                            trace.classify_terminal(observation).ok(),
+                                            expected_classification(any_success, observation),
+                                            "normalized terminal classification diverged for success={any_success}, observation={observation:?}"
+                                        );
+                                        cases += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 663_552, "normalized classifier census changed");
+}
+
+#[test]
+fn v16_every_public_trace_consumer_validates_reachability_evidence() {
+    const FINISH: &str = concat!("finish_public_", "trace()");
+    const VALIDATE: &str = concat!("validate_public_", "execution()");
+    const CLASSIFY: &str = concat!("classify_", "terminal(");
+    const TERMINAL_COHORT: &str = "build_terminal_cohort_payout_evidence(";
+    let mut pending = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests")];
+    let mut sources = Vec::new();
+    while let Some(path) = pending.pop() {
+        for entry in std::fs::read_dir(&path).unwrap_or_else(|error| {
+            panic!("read test source directory {}: {error}", path.display())
+        }) {
+            let entry = entry.expect("read test source entry");
+            let file_type = entry.file_type().expect("read test source file type");
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file()
+                && entry.path().extension().and_then(|value| value.to_str()) == Some("rs")
+            {
+                sources.push(entry.path());
+            }
+        }
+    }
+    sources.sort();
+    let mut consumers = 0usize;
+    for path in sources {
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read test source {}: {error}", path.display()));
+        let lines: Vec<&str> = source.lines().collect();
+        for (line_index, line) in lines.iter().enumerate() {
+            if !line.contains(FINISH) {
+                continue;
+            }
+            consumers += 1;
+            let end = (line_index + 31).min(lines.len());
+            let validation_window = lines[line_index + 1..end].join("\n");
+            assert!(
+                validation_window.contains(VALIDATE)
+                    || validation_window.contains(CLASSIFY)
+                    || validation_window.contains(TERMINAL_COHORT),
+                "{} public trace at source line {} is consumed without normalized public-reachability validation",
+                path.display(),
+                line_index + 1
+            );
+        }
+    }
+    assert_eq!(
+        consumers, 115,
+        "public-trace consumer inventory changed; inspect every new or removed consumer"
+    );
+}
+
+#[test]
+fn v16_finding_blind_violation_oracle_evidence_roster_is_source_complete() {
+    let source = include_str!("../../support/invariant_discovery.rs");
+    let mut current_impl = None;
+    let mut discovered = std::collections::BTreeSet::new();
+    for line in source.lines() {
+        if let Some(rest) = line.strip_prefix("impl ") {
+            current_impl = rest.split_whitespace().next();
+        }
+        if line.contains("pub fn is_violation(&self)") {
+            let oracle = current_impl.expect("is_violation must be inside a named impl");
+            assert!(
+                discovered.insert(oracle),
+                "duplicate is_violation oracle {oracle}"
+            );
+        }
+    }
+
+    let mut roster = std::collections::BTreeMap::new();
+    for line in include_str!("../inv_079_violation_oracle_coverage.tsv").lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 3, "malformed INV-079 oracle row: {line}");
+        assert!(
+            matches!(
+                fields[1],
+                "TERMINAL_LOF"
+                    | "PRIVILEGED_TRANSFER"
+                    | "ECONOMIC_DELTA_ONLY"
+                    | "LOCAL_SAFETY_ONLY"
+                    | "REPLAY_ONLY"
+            ),
+            "unknown INV-079 evidence class in row: {line}"
+        );
+        assert!(!fields[2].is_empty(), "oracle row needs a stated boundary");
+        assert!(
+            roster.insert(fields[0], fields[1]).is_none(),
+            "duplicate INV-079 oracle row {}",
+            fields[0]
+        );
+    }
+
+    assert_eq!(
+        discovered,
+        roster.keys().copied().collect(),
+        "every finding-blind is_violation oracle needs an explicit terminal-evidence disposition"
+    );
+    let terminal = roster
+        .iter()
+        .filter_map(|(oracle, evidence)| (*evidence == "TERMINAL_LOF").then_some(*oracle))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminal,
+        [
+            "AccrualOrderingDiscovery",
+            "AuthorityFundedHandoffDiscovery",
+            "AuthorityResolveTerminalDiscovery",
+            "BilateralMarkFeeDiscovery",
+            "CompositeRoundingDiscovery",
+            "DebitedIntentReplayDiscovery",
+            "FeeConsentDiscovery",
+            "FeeRedirectSupersessionDiscovery",
+            "FractionalMovementDiscovery",
+            "MatcherRevocationTerminalDiscovery",
+            "OracleSupersessionTerminalDiscovery",
+            "PendingMarkAdmissionDiscovery",
+            "PendingMarkInheritanceDiscovery",
+            "PendingZeroMoveTerminalDiscovery",
+            "ProspectiveAccrualDiscovery",
+            "ShutdownCommitOrderingDiscovery",
+            "SourceFeeConsentDiscovery",
+            "TerminalCommitOrderingDiscovery",
+            "TerminalDustDiscovery",
+            "TerminalGenerationDiscovery",
+            "TradeDrivenLiquidationDiscovery",
+            "TradeIntentReplayTerminalDiscovery",
+        ],
+        "terminal promotions require public trace plus classifier-bound exact impact"
+    );
+    for oracle in terminal {
+        let marker = format!("impl {oracle} {{");
+        let start = source
+            .find(&marker)
+            .unwrap_or_else(|| panic!("missing impl for terminal oracle {oracle}"));
+        let body = &source[start..];
+        let end = body
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("unterminated impl for terminal oracle {oracle}"));
+        let body = &body[..end];
+        let direct_terminal_evidence = body.contains("terminal_classification")
+            && body.contains("public_trace.validate_public_execution()");
+        let shared_terminal_evidence =
+            body.contains("terminal_evidence") && body.contains("certifies_exact_loss");
+        assert!(
+            direct_terminal_evidence || shared_terminal_evidence,
+            "terminal oracle {oracle} does not bind exact loss to direct or shared public evidence"
+        );
+    }
+    let shared_marker = "impl PairedTerminalPayoutEvidence {";
+    let shared_start = source
+        .find(shared_marker)
+        .expect("shared paired-terminal evidence implementation");
+    let shared_body = &source[shared_start..];
+    let shared_end = shared_body
+        .find("\n}\n")
+        .expect("terminated shared paired-terminal evidence implementation");
+    let shared_body = &shared_body[..shared_end];
+    assert!(shared_body.contains("terminal_classification"));
+    assert!(shared_body.contains("control_public_trace"));
+    assert!(shared_body.contains("public_trace"));
+    assert!(shared_body.contains("certifies_exact_loss"));
+    assert!(shared_body.matches("validate_public_execution()").count() >= 2);
+    let cohort_marker = "fn build_terminal_cohort_payout_evidence(";
+    let cohort_start = source
+        .find(cohort_marker)
+        .expect("shared terminal-cohort evidence builder");
+    let cohort_body = &source[cohort_start..];
+    let cohort_end = cohort_body
+        .find("\nfn build_paired_terminal_payout_evidence(")
+        .expect("terminated terminal-cohort evidence builder");
+    let cohort_body = &cohort_body[..cohort_end];
+    assert!(cohort_body.contains("token_delta_for_accounts"));
+    assert!(cohort_body.contains("classify_terminal"));
+    assert!(cohort_body.contains("certifies_exact_loss"));
+    assert!(cohort_body.contains("certifies_nonextraction"));
+    assert_eq!(roster.len(), 32, "finding-blind oracle inventory changed");
+}
+
+#[test]
+fn v16_retained_retry_terminal_dispositions_are_source_complete() {
+    let terminal_oracles = include_str!("../inv_079_violation_oracle_coverage.tsv")
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+        .map(|line| line.split('\t').next().expect("oracle name"))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut dispositions = std::collections::BTreeMap::new();
+    for line in include_str!("../inv_079_retry_kind_dispositions.tsv").lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 4, "malformed retained-retry row: {line}");
+        assert!(
+            matches!(
+                fields[1],
+                "TERMINAL_LOF"
+                    | "VALUE_NEUTRAL"
+                    | "CLAIM_CONVERSION_ONLY"
+                    | "RISK_REDUCING_ONLY"
+                    | "RECOVERABLE_PRINCIPAL"
+                    | "RECOVERABLE_INSURANCE"
+                    | "REPLAY_ONLY"
+            ),
+            "unknown retained-retry disposition: {line}"
+        );
+        assert!(
+            !fields[3].is_empty(),
+            "retry row requires rationale: {line}"
+        );
+        if fields[1] == "TERMINAL_LOF" {
+            assert!(
+                terminal_oracles.contains(fields[2]),
+                "retry row names an unregistered terminal oracle: {line}"
+            );
+        } else {
+            assert_eq!(fields[2], "-", "non-LoF retry row names an oracle: {line}");
+        }
+        assert!(
+            dispositions.insert(fields[0], fields[1]).is_none(),
+            "duplicate retained-retry row: {}",
+            fields[0]
+        );
+    }
+    let expected = RetryIntentKind::ALL
+        .into_iter()
+        .map(|kind| format!("{kind:?}"))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        dispositions
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected.iter().map(String::as_str).collect(),
+        "every retained retry kind needs an explicit terminal disposition"
+    );
+    assert_eq!(
+        dispositions
+            .iter()
+            .filter_map(|(kind, disposition)| (*disposition == "TERMINAL_LOF").then_some(*kind))
+            .collect::<Vec<_>>(),
+        [
+            "AssetActivation",
+            "BatchTradeCpi",
+            "BatchTradeNoCpi",
+            "TradeCpi",
+            "TradeNoCpi",
+        ]
+    );
+}
+
+#[test]
+fn v16_program_fixed_blockers_remain_progressing() {
+    for (name, scenario) in fixed_blocker_scenarios() {
+        let coverage = run_scenario(&scenario).unwrap_or_else(|error| {
+            panic!(
+                "fixed blocker scenario {name} no longer converges\nscenario={}\n{error}",
+                serde_json::to_string_pretty(&scenario).unwrap()
+            )
+        });
+        assert_ne!(
+            coverage.user_positions_closed, 0,
+            "{name} must retain a public owner exit"
+        );
+    }
+}
+
+#[test]
+fn v16_program_open_lof_manifest_snapshot_is_structurally_honest() {
+    validate_manifest().expect("open LoF manifest structure");
+    assert!(quarantined_prs().is_empty());
+    let certified = certified_prs();
+    assert_eq!(
+        certified,
+        [
+            220, 223, 224, 225, 231, 251, 253, 254, 255, 256, 259, 260, 264, 265, 267, 271, 272,
+            273, 274, 275, 276, 277, 278, 279, 280, 281, 282, 283, 284, 285, 290, 292, 293, 294,
+            295, 296, 299, 301, 303, 304, 305, 307, 309, 310, 311, 312, 313, 314, 315, 316, 317,
+            318, 320, 321, 322, 325, 326, 328, 329, 330, 331, 332, 333, 334, 335, 336, 337, 338,
+            339, 340, 343, 344, 345, 346, 347, 349, 350, 351, 353, 355, 356, 360, 362, 363, 365,
+            366, 367, 369, 375, 380, 381
+        ],
+        "fixed-pin adapters must not remain classified as vulnerable quarantines"
+    );
+    let nonqualifying = nonqualifying_prs();
+    assert_eq!(
+        nonqualifying,
+        [237, 258, 286, 287, 370, 372, 373, 374],
+        "nonqualifying rows must retain executable public-route disposition evidence"
+    );
+    let benchmark_evidence = include_str!("../open_findings.tsv")
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+        .map(|line| {
+            let fields = line.splitn(6, '\t').collect::<Vec<_>>();
+            assert_eq!(fields.len(), 6, "malformed finding row: {line}");
+            (
+                fields[0].parse::<u16>().expect("numeric finding PR"),
+                fields[4],
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for pr in certified {
+        assert!(
+            matches!(
+                benchmark_evidence.get(&pr).copied(),
+                Some("certified") | Some("independent-discovery")
+            ),
+            "LoF manifest certified PR {pr} must have fixed-pin or invariant-owned benchmark \
+             evidence"
+        );
+    }
+    for pr in nonqualifying {
+        assert_eq!(
+            benchmark_evidence.get(&pr),
+            Some(&"nonqualifying"),
+            "LoF manifest nonqualifying PR {pr} must be nonqualifying in the benchmark ledger"
+        );
+    }
+    let missing = missing_prs();
+    assert!(
+        missing.is_empty(),
+        "every finding in the dated manifest must have an executable disposition: {missing:?}"
+    );
+}
+
+#[test]
+fn v16_superseded_control_terminal_dispositions_are_source_complete() {
+    let discovery_source = include_str!("../../support/invariant_discovery.rs");
+    let terminal_oracles = include_str!("../inv_079_violation_oracle_coverage.tsv")
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+        .map(|line| line.split('\t').next().expect("oracle name"))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut dispositions = std::collections::BTreeMap::new();
+    for line in include_str!("../inv_079_supersession_kind_dispositions.tsv").lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 4, "malformed supersession row: {line}");
+        assert!(
+            matches!(
+                fields[1],
+                "TERMINAL_LOF"
+                    | "TERMINAL_VALUE_CANDIDATE"
+                    | "SIGNED_ECONOMIC_BOUND"
+                    | "ATTRIBUTION_ONLY"
+                    | "ATTRIBUTION_CANDIDATE"
+                    | "BOUNDED_LIVENESS"
+                    | "LIVENESS_CANDIDATE"
+                    | "PROVIDER_CONSENT_BOUND"
+                    | "EMPTY_GENERATION_CONTROL"
+            ),
+            "unknown supersession disposition: {line}"
+        );
+        assert!(
+            !fields[3].is_empty(),
+            "supersession row needs rationale: {line}"
+        );
+        if fields[1] == "TERMINAL_LOF" {
+            assert!(
+                terminal_oracles.contains(fields[2]),
+                "supersession row names an unregistered terminal oracle: {line}"
+            );
+        } else if fields[1] == "ATTRIBUTION_ONLY" {
+            assert_eq!(
+                fields[2], "FeeShareSupersessionDiscovery",
+                "closed attribution row needs its exact public evidence owner: {line}"
+            );
+            assert!(
+                discovery_source.contains("pub struct FeeShareSupersessionDiscovery")
+                    && discovery_source.contains("pub fn certifies_attribution_only"),
+                "closed attribution evidence owner is missing"
+            );
+        } else if fields[1] == "BOUNDED_LIVENESS" {
+            assert_eq!(
+                fields[2], "ResolvePolicyLivenessDiscovery",
+                "closed liveness row needs its exact public evidence owner: {line}"
+            );
+            assert!(
+                discovery_source.contains("pub struct ResolvePolicyLivenessDiscovery")
+                    && discovery_source.contains("pub fn certifies_bounded_liveness"),
+                "closed resolve-policy liveness evidence owner is missing"
+            );
+        } else {
+            assert_eq!(
+                fields[2], "-",
+                "unproven supersession row names an oracle: {line}"
+            );
+        }
+        assert!(
+            dispositions.insert(fields[0], fields[1]).is_none(),
+            "duplicate supersession row: {}",
+            fields[0]
+        );
+    }
+    let expected = SupersededIntentKind::ALL
+        .into_iter()
+        .map(|kind| format!("{kind:?}"))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        dispositions
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected.iter().map(String::as_str).collect(),
+        "every superseded control kind needs an explicit terminal disposition"
+    );
+    assert_eq!(
+        dispositions
+            .iter()
+            .filter_map(|(kind, disposition)| (*disposition == "TERMINAL_LOF").then_some(*kind))
+            .collect::<Vec<_>>(),
+        [
+            "ConfigureAuthMark",
+            "ConfigureEwmaMark",
+            "ConfigureHybridOracle",
+            "FeeRedirectPolicy",
+            "MatcherConfig",
+            "PushAuthMark",
+            "PushEwmaMark",
+        ]
+    );
+    assert!(
+        dispositions
+            .values()
+            .all(|disposition| *disposition != "TERMINAL_VALUE_CANDIDATE"),
+        "every terminal-value supersession candidate must have exact terminal evidence"
+    );
+    assert_eq!(
+        dispositions
+            .iter()
+            .filter_map(|(kind, disposition)| {
+                (*disposition == "ATTRIBUTION_ONLY").then_some(*kind)
+            })
+            .collect::<Vec<_>>(),
+        ["LiquidationFeePolicy", "MaintenanceFeePolicy"]
+    );
+    assert_eq!(
+        dispositions
+            .iter()
+            .filter_map(|(kind, disposition)| {
+                (*disposition == "EMPTY_GENERATION_CONTROL").then_some(*kind)
+            })
+            .collect::<Vec<_>>(),
+        ["RestartAssetOracle"]
+    );
+}
+
+#[test]
+fn v16_dated_open_security_finding_benchmark_is_non_overclaiming() {
+    let mut prior_pr = 0u16;
+    let mut rows = 0usize;
+    let mut direct = 0usize;
+    let mut missing = 0usize;
+    let mut independent = 0usize;
+    let mut nonqualifying = 0usize;
+    let mut benchmark_evidence = std::collections::BTreeMap::new();
+    let mut benchmark_invariants = std::collections::BTreeMap::new();
+
+    for line in include_str!("../open_findings.tsv").lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.splitn(6, '\t').collect();
+        assert_eq!(fields.len(), 6, "malformed finding row: {line}");
+        let pr: u16 = fields[0].parse().expect("numeric PR ID");
+        assert!(pr > prior_pr, "finding PRs must be unique and sorted");
+        prior_pr = pr;
+        assert!(matches!(fields[1], "LoF" | "DoS" | "Conformance"));
+        assert!(matches!(
+            fields[2],
+            "BLOCKER" | "REAL" | "HARDENING" | "PRIVILEGED" | "LIMIT"
+        ));
+        let invariant: u16 = fields[3]
+            .strip_prefix("INV-")
+            .expect("mapped invariant")
+            .parse()
+            .expect("numeric invariant ID");
+        assert!((1..=89).contains(&invariant));
+        match fields[4] {
+            "direct-regression" => direct += 1,
+            "missing" => missing += 1,
+            "independent-discovery" => independent += 1,
+            "nonqualifying" => nonqualifying += 1,
+            "certified" => {}
+            evidence => panic!("unknown evidence level {evidence}"),
+        }
+        benchmark_evidence.insert(pr, fields[4]);
+        benchmark_invariants.insert(pr, invariant);
+        rows += 1;
+    }
+
+    assert_eq!(rows, 166, "refresh the dated GitHub finding snapshot");
+    assert_eq!(direct, 0, "direct adapter inventory changed");
+    assert_eq!(
+        missing, 0,
+        "post-PR135 counterexamples must retain generic invariant-owned discovery coverage"
+    );
+    assert_eq!(
+        independent, 149,
+        "promote only genuinely finding-agnostic invariant discoveries"
+    );
+    assert_eq!(nonqualifying, 17, "nonqualifying evidence roster changed");
+
+    let independent_sources: &[(u16, &[u16], &str)] = &[
+        (
+            1,
+            &[1, 14],
+            include_str!("../stateful/inv_001_market_incarnation_binding.rs"),
+        ),
+        (
+            2,
+            &[2],
+            include_str!("../stateful/inv_002_asset_generation_binding.rs"),
+        ),
+        (
+            3,
+            &[3],
+            include_str!("../stateful/inv_003_portfolio_incarnation_binding.rs"),
+        ),
+        (
+            4,
+            &[4],
+            include_str!("../stateful/inv_004_position_episode_binding.rs"),
+        ),
+        (
+            5,
+            &[5],
+            include_str!("../stateful/inv_005_authority_incarnation_binding.rs"),
+        ),
+        (
+            5,
+            &[5],
+            include_str!("../cu/inv_005_authority_incarnation_binding.rs"),
+        ),
+        (
+            8,
+            &[8],
+            include_str!("../stateful/inv_008_intent_uniqueness_and_bounded_replay.rs"),
+        ),
+        (
+            8,
+            &[8, 64],
+            include_str!("../cu/inv_008_generated_insurance_stock_epochs.rs"),
+        ),
+        (
+            8,
+            &[8],
+            include_str!("../cu/inv_014_reserve_debit_epoch.rs"),
+        ),
+        (
+            10,
+            &[10],
+            include_str!("../stateful/inv_010_out_of_order_safety.rs"),
+        ),
+        (
+            12,
+            &[12],
+            include_str!("../stateful/inv_012_capability_and_delegate_scope.rs"),
+        ),
+        (
+            12,
+            &[12],
+            include_str!("../cu/inv_012_reused_asset_return_binding.rs"),
+        ),
+        (
+            14,
+            &[14, 36],
+            include_str!("../stateful/inv_014_delayed_policy_and_policy_epoch_safety.rs"),
+        ),
+        (
+            20,
+            &[20],
+            include_str!("../stateful/inv_020_authenticated_clock_slot_and_oracle_provenance.rs"),
+        ),
+        (
+            24,
+            &[24],
+            include_str!("../cu/inv_024_attributed_quote_value_conservation.rs"),
+        ),
+        (
+            56,
+            &[20, 56],
+            include_str!(
+                "../cu/inv_056_hints_are_discovery_only_favorable_actions_fully_refresh.rs"
+            ),
+        ),
+        (
+            27,
+            &[27, 39],
+            include_str!("../stateful/inv_027_protected_principal_seniority.rs"),
+        ),
+        (
+            27,
+            &[27],
+            include_str!("../cu/inv_027_joint_admission_liabilities.rs"),
+        ),
+        (
+            27,
+            &[27],
+            include_str!("../cu/inv_027_protected_principal_seniority.rs"),
+        ),
+        (
+            28,
+            &[28],
+            include_str!("../stateful/inv_028_source_domain_realizability_cap.rs"),
+        ),
+        (
+            28,
+            &[28, 30],
+            include_str!("../cu/inv_028_source_domain_realizability_cap.rs"),
+        ),
+        (
+            28,
+            &[28],
+            include_str!("../cu/inv_028_generation_capacity_admission.rs"),
+        ),
+        (
+            31,
+            &[31],
+            include_str!(
+                "../stateful/inv_031_no_double_use_of_claim_backing_or_insurance_atoms.rs"
+            ),
+        ),
+        (
+            34,
+            &[34],
+            include_str!("../stateful/inv_034_domain_and_instance_isolation.rs"),
+        ),
+        (
+            35,
+            &[35],
+            include_str!("../stateful/inv_035_no_global_b_pool_residuals_remain_local.rs"),
+        ),
+        (
+            36,
+            &[36, 14],
+            include_str!("../stateful/inv_036_fee_destination_and_policy_version_integrity.rs"),
+        ),
+        (
+            36,
+            &[36],
+            include_str!("../cu/inv_036_fee_destination_and_policy_version_integrity.rs"),
+        ),
+        (
+            38,
+            &[38],
+            include_str!("../stateful/inv_038_rounding_and_ratio_conservation.rs"),
+        ),
+        (
+            39,
+            &[39],
+            include_str!("../stateful/inv_039_pending_loss_obligation_durability.rs"),
+        ),
+        (
+            39,
+            &[39, 73],
+            include_str!("../cu/inv_039_pending_loss_obligation_durability.rs"),
+        ),
+        (
+            39,
+            &[39],
+            include_str!("../cu/inv_039_pending_loss_mixed_roles.rs"),
+        ),
+        (
+            45,
+            &[45],
+            include_str!("../stateful/inv_045_no_free_mark_movement.rs"),
+        ),
+        (45, &[45], include_str!("inv_045_no_free_mark_movement.rs")),
+        (
+            51,
+            &[51, 73],
+            include_str!("../cu/inv_051_canonical_adl_effective_quantity.rs"),
+        ),
+        (
+            53,
+            &[53],
+            include_str!("../stateful/inv_053_full_health_recertification_equivalence.rs"),
+        ),
+        (
+            61,
+            &[61],
+            include_str!("../stateful/inv_061_deterministic_bounded_liquidation.rs"),
+        ),
+        (
+            61,
+            &[61],
+            include_str!("../cu/inv_061_deterministic_bounded_liquidation.rs"),
+        ),
+        (
+            63,
+            &[63],
+            include_str!("../stateful/inv_063_backing_expiry_normalization.rs"),
+        ),
+        (
+            63,
+            &[63],
+            include_str!("../cu/inv_063_backing_expiry_normalization.rs"),
+        ),
+        (
+            67,
+            &[67],
+            include_str!(
+                "../stateful/inv_067_terminal_payout_completeness_and_exact_once_settlement.rs"
+            ),
+        ),
+        (
+            67,
+            &[67],
+            include_str!("../cu/inv_067_terminal_payout_completeness_and_exact_once_settlement.rs"),
+        ),
+        (
+            70,
+            &[70],
+            include_str!("../cu/inv_070_native_booked_residue_cleanup.rs"),
+        ),
+        (
+            70,
+            &[70, 24, 25, 33, 41, 63, 69, 71, 86, 88],
+            include_str!("../cu/inv_070_terminal_scan_recredit.rs"),
+        ),
+        (
+            70,
+            &[70, 73],
+            include_str!("../cu/inv_070_zero_unattributed_terminal_residue_and_close_slab.rs"),
+        ),
+        (
+            71,
+            &[71, 45],
+            include_str!("../cu/inv_071_crank_progress.rs"),
+        ),
+        (
+            73,
+            &[73],
+            include_str!("../cu/inv_073_no_permanent_user_lock.rs"),
+        ),
+        (74, &[74], include_str!("../cu/inv_074_scope_locality.rs")),
+        (
+            77,
+            &[77],
+            include_str!("../cu/inv_077_bounded_work_and_maximum_shape_compute.rs"),
+        ),
+    ];
+    let mut fingerprints = std::collections::BTreeSet::new();
+    let mut mapped_prs = std::collections::BTreeSet::new();
+    for line in include_str!("../independent_discoveries.tsv").lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.splitn(5, '\t').collect();
+        assert_eq!(fields.len(), 5, "malformed discovery row: {line}");
+        let invariant: u16 = fields[0]
+            .strip_prefix("INV-")
+            .expect("mapped discovery invariant")
+            .parse()
+            .expect("numeric discovery invariant ID");
+        assert!((1..=89).contains(&invariant));
+        assert!(
+            fingerprints.insert((invariant, fields[1])),
+            "duplicate invariant discovery fingerprint: {} {}",
+            fields[0],
+            fields[1]
+        );
+        let discovery_matches = independent_sources
+            .iter()
+            .filter(|(owner, covered, source)| {
+                covered.contains(&invariant)
+                    && source_defines_test(source, fields[2])
+                    && (*owner == invariant
+                        || source.contains(&format!("Secondary coverage: INV-{invariant:03}")))
+            })
+            .count();
+        assert!(
+            discovery_matches == 1,
+            "discovery generator is not an executable INV-{invariant:03}-owned or explicitly \
+             secondary test, or resolves ambiguously: {}",
+            fields[2],
+        );
+        assert!(
+            include_str!("../README.md").lines().any(|line| {
+                line.starts_with(&format!("| INV-{invariant:03} |"))
+                    && line
+                        .split('|')
+                        .nth(2)
+                        .is_some_and(|methods| methods.contains("Independent"))
+            }),
+            "INV-{invariant:03} has discovery metadata but its coverage row is not Independent"
+        );
+        assert!(
+            matches!(
+                fields[3],
+                "stale-intent-must-reject-and-roll-back-exactly"
+                    | "same-economic-intent-executes-at-most-once-and-rejection-rolls-back"
+                    | "successful-insurance-debit-consumes-authorizing-reserve-authority-epoch"
+                    | "newer-authorized-control-cannot-be-overwritten-by-stale-intent"
+                    | "signer-debit-never-exceeds-consented-fee-terms"
+                    | "provider-approved-fee-split-is-durable-and-attributed"
+                    | "account-oriented-fees-must-map-to-economic-side-before-terminal-use"
+                    | "pending-balanced-transfer-cannot-be-erased-by-operation-order"
+                    | "pending-value-must-commit-before-terminal-snapshot"
+                    | "prospective-accrual-cannot-be-rewritten-by-trade-order"
+                    | "pending-mark-cannot-authorize-stale-price-risk-increase"
+                    | "mark-movement-cost-must-cover-later-third-party-transfer"
+                    | "later-trade-cannot-cheaply-rewrite-prior-pending-mark"
+                    | "fee-reward-cannot-outrank-uncommitted-adverse-value"
+                    | "mark-movement-reserve-must-remain-encumbered"
+                    | "mark-movement-cost-must-cover-liquidation-extraction"
+                    | "mark-movement-fees-must-be-bilaterally-supported"
+                    | "fresh-hybrid-report-cannot-reclassify-stale-trade-effective-price-as-reward-eligible"
+                    | "all-economic-routes-preserve-canonical-fractional-accrual-carry"
+                    | "current-hybrid-health-refresh-requires-fresh-authenticated-observation"
+                    | "composite-price-is-rounded-once-after-exact-composition"
+                    | "omitted-observation-cannot-erase-balanced-rounded-transfer"
+                    | "fractional-cap-residue-must-accumulate-to-target"
+                    | "canonical-price-remainder-makes-eager-and-delayed-cranks-equivalent"
+                    | "composite-oracle-legs-must-share-one-coherent-observation-epoch"
+                    | "terminal-payout-is-invariant-to-flattened-dust-position"
+                    | "resolved-receipt-must-survive-late-backing-expiry-and-pay-exactly-once"
+                    | "terminal-residual-cannot-double-charge-provider-principal"
+                    | "insurance-spend-remains-source-domain-local"
+                    | "backing-atoms-cannot-support-claims-from-another-source"
+                    | "b-loss-reduces-only-the-originating-source-domain-and-owner-exits"
+                    | "liquidation-certificate-cannot-be-healthier-than-full-refresh"
+                    | "expired-backing-cannot-create-withdrawable-provider-value"
+                    | "expired-backing-cannot-capitalize-and-extract-independent-principal"
+                    | "expired-retained-operation-cannot-consume-principal-and-lock-terminal-users"
+                    | "lapsed-backing-must-not-lock-resolved-user-exit"
+                    | "impaired-domain-prospective-loss-must-have-bounded-terminal-reconciliation"
+                    | "vanished-source-claim-must-have-a-bounded-public-unwind"
+                    | "expired-source-lien-must-have-bounded-public-reconciliation"
+                    | "fractional-source-domains-must-have-a-bounded-public-unwind"
+                    | "flat-backed-claim-must-have-bounded-terminal-conversion"
+                    | "admitted-live-leg-must-reserve-a-settlement-source-slot"
+                    | "surviving-live-legs-reserve-latent-domains-before-risk-admission"
+                    | "expired-provider-lien-retirement-must-preserve-provenance-and-terminal-progress"
+                    | "max-source-backed-claim-conversion-must-fit-one-bounded-step"
+                    | "max-source-terminal-claim-must-have-a-bounded-close-step"
+                    | "max-source-liquidatable-account-must-have-a-bounded-public-reduction"
+                    | "old-generation-terminal-capability-cannot-crystallize-replacement-value"
+                    | "stale-position-episode-consent-cannot-transfer-or-orphan-value"
+                    | "retained-capability-cannot-cross-any-authority-revoking-state-transition"
+                    | "stale-matcher-enable-cannot-revive-revoked-value-authority"
+                    | "funded-role-principal-cannot-be-redirected-without-incumbent-consent"
+                    | "funded-oracle-mark-authority-cannot-be-redirected-without-incumbent-consent"
+                    | "committed-funding-must-accrue-before-lifecycle-terminalization"
+                    | "pending-mark-boundary-must-activate-before-post-boundary-funding"
+                    | "stale-shutdown-must-retain-a-bounded-public-progress-path"
+                    | "terminal-snapshot-must-use-current-authenticated-oracle-state"
+                    | "funded-resolved-adl-winner-has-bounded-public-exit"
+                    | "fractional-reset-carry-cannot-block-permissionless-liquidation"
+                    | "fractional-reset-carry-cannot-block-liquidation-effective-owner-exits-or-provider-settlement"
+                    | "post-adl-split-cannot-increase-withdrawable-backing-funded-value"
+                    | "zero-effective-oi-funded-residue-must-enter-bounded-cleanup"
+                    | "exact-effective-owner-exit-clears-retained-basis-and-leaves-bounded-side-finalization"
+                    | "exact-effective-crossed-exit-clears-retained-basis-and-leaves-bounded-side-finalization"
+                    | "partial-adl-recovery-residue-has-permissionless-bounded-cleanup"
+                    | "partial-adl-recovery-effective-close-clears-both-legs-in-one-bounded-call"
+                    | "fractional-social-loss-carry-cannot-lock-funded-owner-exit"
+                    | "fragmented-recovery-must-have-a-permissionless-pairwise-close-path"
+                    | "forfeit-order-cannot-lock-provider-backed-recovery"
+                    | "recovered-provider-backing-must-have-withdraw-or-restart-progress"
+                    | "permissionless-asset-local-close-cannot-freeze-unrelated-funded-users"
+                    | "account-local-expired-close-preserves-unrelated-resolved-exit"
+                    | "recovery-escalation-reaches-public-resolved-continuation"
+                    | "native-booked-residue-must-not-burn-native-mint-or-block-terminal-close"
+                    | "terminal-scan-must-rediscover-earlier-actionable-reserves-after-expiry"
+                    | "successful-crank-cannot-consume-zero-delta-price-time"
+                    | "recovery-required-transition-must-not-rollback-funded-survivor-progress"
+                    | "prospective-loss-in-lapsed-domain-must-have-bounded-terminal-continuation"
+                    | "prospective-loss-must-not-create-backing-in-lapsed-domain"
+                    | "asset-local-bankruptcy-cannot-lock-unrelated-backed-claim"
+                    | "funded-terminal-insurance-must-have-permissionless-payout-to-configured-authority"
+                    | "unsigned-lp-cannot-inherit-preexisting-settlement-cohort"
+                    | "fresh-counterparty-must-not-inherit-preexisting-settlement-cohort"
+                    | "all-accrued-liabilities-precede-every-risk-increasing-admission"
+                    | "all-accrued-liabilities-precede-every-risk-increasing-admission-even-after-flat-account-history"
+                    | "mixed-role-resolved-debt-attribution-preserves-owner-obligation-through-resolution"
+                    | "resolved-close-must-retain-pending-loss-weight-until-opposing-debt-settles"
+                    | "resolved-reserve-payouts-preserve-beneficiary-value-without-beneficiary-signatures"
+                    | "shutdown-submitters-cannot-receive-or-relabel-another-role-attributed-reserve"
+            ),
+            "unknown independent oracle: {}",
+            fields[3]
+        );
+        for raw_pr in fields[4].split(',') {
+            let pr: u16 = raw_pr.parse().expect("numeric discovery PR ID");
+            assert_eq!(
+                benchmark_evidence.get(&pr),
+                Some(&"independent-discovery"),
+                "discovery mapping must point to a promoted benchmark row"
+            );
+            assert_eq!(
+                benchmark_invariants.get(&pr),
+                Some(&invariant),
+                "discovery and benchmark must agree on PR {pr}'s primary invariant"
+            );
+            mapped_prs.insert(pr);
+        }
+    }
+
+    let promoted_prs: std::collections::BTreeSet<_> = benchmark_evidence
+        .iter()
+        .filter_map(|(pr, evidence)| (*evidence == "independent-discovery").then_some(*pr))
+        .collect();
+    assert_eq!(
+        mapped_prs, promoted_prs,
+        "every promoted benchmark row needs a finding-agnostic fingerprint"
+    );
+
+    let nonqualifying_sources = [
+        include_str!("inv_079_public_reachability_evidence.rs"),
+        include_str!("../cu/inv_005_authority_incarnation_binding.rs"),
+        include_str!("../cu/inv_028_source_domain_realizability_cap.rs"),
+        include_str!("../cu/inv_051_canonical_adl_effective_quantity.rs"),
+        include_str!("../cu/inv_061_deterministic_bounded_liquidation.rs"),
+        include_str!("../cu/inv_063_backing_expiry_normalization.rs"),
+        include_str!("../cu/inv_067_terminal_payout_completeness_and_exact_once_settlement.rs"),
+        include_str!("../cu/inv_071_crank_progress.rs"),
+        include_str!("../cu/inv_073_no_permanent_user_lock.rs"),
+        include_str!("../cu/inv_077_bounded_work_and_maximum_shape_compute.rs"),
+    ];
+    let mut classified_prs = std::collections::BTreeSet::new();
+    for line in include_str!("../nonqualifying_findings.tsv").lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.splitn(4, '\t').collect();
+        assert_eq!(fields.len(), 4, "malformed nonqualifying row: {line}");
+        let pr: u16 = fields[0].parse().expect("numeric nonqualifying PR ID");
+        assert!(
+            classified_prs.insert(pr),
+            "duplicate nonqualifying PR row: {pr}"
+        );
+        assert!(matches!(
+            fields[1],
+            "current-pin-safe"
+                | "bounded-public-exit"
+                | "correct-input-progress"
+                | "nonextractable"
+                | "privileged-self-action"
+                | "duplicate"
+                | "prerequisite-unreachable"
+                | "transient-only"
+        ));
+        let claim_matches = nonqualifying_sources
+            .iter()
+            .filter(|source| source_defines_test(source, fields[2]))
+            .count();
+        assert!(
+            claim_matches == 1,
+            "nonqualifying claim lacks executable public-route evidence: {}",
+            fields[2]
+        );
+        assert!(
+            !fields[3].trim().is_empty(),
+            "nonqualifying reason is empty"
+        );
+        assert_eq!(
+            benchmark_evidence.get(&pr),
+            Some(&"nonqualifying"),
+            "classification must point to a nonqualifying benchmark row"
+        );
+    }
+    let benchmark_nonqualifying: std::collections::BTreeSet<_> = benchmark_evidence
+        .iter()
+        .filter_map(|(pr, evidence)| (*evidence == "nonqualifying").then_some(*pr))
+        .collect();
+    assert_eq!(
+        classified_prs, benchmark_nonqualifying,
+        "every nonqualifying benchmark row needs machine-checked evidence"
+    );
+}
+
+fn source_defines_test(source: &str, function: &str) -> bool {
+    let expected = format!("fn {function}");
+    let mut test_attribute = false;
+
+    for line in source.lines() {
+        let line = line.trim();
+        if line == "#[test]" {
+            test_attribute = true;
+        } else if line.starts_with("fn ") {
+            if test_attribute
+                && line
+                    .strip_prefix(&expected)
+                    .is_some_and(|tail| tail.trim_start().starts_with('('))
+            {
+                return true;
+            }
+            test_attribute = false;
+        } else if test_attribute && !line.is_empty() && !line.starts_with("#") {
+            test_attribute = false;
+        }
+    }
+
+    false
+}
+
+fn source_defines_function(source: &str, function: &str) -> bool {
+    let expected = format!("fn {function}");
+    source.lines().any(|line| {
+        let line = line.trim_start();
+        line.strip_prefix(&expected).is_some_and(|tail| {
+            let tail = tail.trim_start();
+            tail.starts_with('(') || tail.starts_with('<')
+        }) || line
+            .strip_prefix("pub ")
+            .and_then(|tail| tail.strip_prefix(&expected))
+            .is_some_and(|tail| {
+                let tail = tail.trim_start();
+                tail.starts_with('(') || tail.starts_with('<')
+            })
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicInstructionRoute {
+    tag: u8,
+    variant: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicInstructionDispatch {
+    tag: u8,
+    variant: String,
+    handler: String,
+}
+
+#[derive(Debug)]
+struct PublicInstructionCoverageRow<'a> {
+    tag: u8,
+    variant: &'a str,
+    public_route_coverage: &'a str,
+    cu_coverage: &'a str,
+    omission_reason: &'a str,
+}
+
+#[test]
+fn v16_public_instruction_coverage_registry_matches_production_roster() {
+    let production_roster =
+        production_public_instruction_roster(include_str!("../../../src/v16_program.rs"));
+    let registry = parse_public_instruction_coverage_registry(include_str!(
+        "../public_instruction_coverage.tsv"
+    ));
+
+    let registry_roster: Vec<PublicInstructionRoute> = registry
+        .iter()
+        .map(|row| PublicInstructionRoute {
+            tag: row.tag,
+            variant: row.variant.to_string(),
+        })
+        .collect();
+
+    assert_eq!(
+        registry_roster, production_roster,
+        "public instruction coverage registry must have exactly one row per production \
+         ProgInstruction tag/variant"
+    );
+}
+
+#[test]
+fn v16_public_instruction_coverage_registry_points_to_executable_evidence() {
+    let registry = parse_public_instruction_coverage_registry(include_str!(
+        "../public_instruction_coverage.tsv"
+    ));
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut source_cache = std::collections::BTreeMap::<String, String>::new();
+
+    for row in registry {
+        for (column, evidence) in [
+            ("public_route_coverage", row.public_route_coverage),
+            ("cu_coverage", row.cu_coverage),
+        ] {
+            let (kind, target) = evidence.split_once(':').unwrap_or_else(|| {
+                panic!("{} {} evidence lacks TYPE:path#test", row.variant, column)
+            });
+            assert!(
+                matches!(kind, "OWNED" | "SHARED" | "CROSS"),
+                "{} {} evidence has unknown coverage kind {kind}",
+                row.variant,
+                column
+            );
+            let (path, test) = target
+                .split_once('#')
+                .unwrap_or_else(|| panic!("{} {} evidence lacks path#test", row.variant, column));
+            assert!(
+                path.starts_with("tests/invariants/"),
+                "{} {} evidence must stay inside tests/invariants: {path}",
+                row.variant,
+                column
+            );
+            let source = source_cache.entry(path.to_owned()).or_insert_with(|| {
+                std::fs::read_to_string(root.join(path)).unwrap_or_else(|error| {
+                    panic!("read {} {} evidence {path}: {error}", row.variant, column)
+                })
+            });
+            assert!(
+                source_defines_test(source, test),
+                "{} {} evidence points to a missing executable test {path}#{test}",
+                row.variant,
+                column
+            );
+        }
+        assert_eq!(
+            row.omission_reason, "-",
+            "{} has executable route/CU evidence and must not carry an omission reason",
+            row.variant
+        );
+    }
+}
+
+#[test]
+fn v16_public_instruction_dispatch_registry_matches_reviewed_handlers() {
+    let production = include_str!("../../../src/v16_program.rs");
+    let dispatch_roster = production_public_instruction_dispatch_roster(production);
+    let expected = [
+        (0, "InitMarket", "handle_init_market"),
+        (1, "InitPortfolio", "handle_init_portfolio"),
+        (3, "Deposit", "handle_deposit"),
+        (4, "Withdraw", "handle_withdraw"),
+        (5, "PermissionlessCrank", "handle_permissionless_crank"),
+        (6, "TradeNoCpi", "handle_trade_nocpi"),
+        (8, "ClosePortfolio", "handle_close_portfolio"),
+        (9, "TopUpInsurance", "handle_top_up_insurance"),
+        (10, "TradeCpi", "handle_trade_cpi"),
+        (13, "CloseSlab", "handle_close_slab"),
+        (19, "ResolveMarket", "handle_resolve_market"),
+        (24, "TopUpBackingBucket", "handle_top_up_backing_bucket"),
+        (28, "ConvertReleasedPnl", "handle_convert_released_pnl"),
+        (30, "CloseResolved", "handle_close_resolved"),
+        (32, "UpdateAuthority", "handle_update_authority"),
+        (
+            34,
+            "ConfigureHybridOracle",
+            "handle_configure_hybrid_oracle",
+        ),
+        (35, "ConfigureEwmaMark", "handle_configure_managed_mark"),
+        (36, "PushEwmaMark", "handle_push_managed_mark"),
+        (
+            37,
+            "UpdateLiquidationFeePolicy",
+            "handle_update_market_authority_policy",
+        ),
+        (
+            38,
+            "ConfigurePermissionlessResolve",
+            "handle_configure_permissionless_resolve",
+        ),
+        (
+            39,
+            "ResolveStalePermissionless",
+            "handle_resolve_stale_permissionless",
+        ),
+        (40, "UpdateAssetLifecycle", "handle_update_asset_lifecycle"),
+        (42, "CureAndCancelClose", "handle_cure_and_cancel_close"),
+        (43, "ForfeitRecoveryLeg", "handle_forfeit_recovery_leg"),
+        (44, "RebalanceReduce", "handle_rebalance_reduce"),
+        (45, "FinalizeResetSide", "handle_finalize_reset_side"),
+        (
+            46,
+            "ClaimResolvedPayoutTopup",
+            "handle_claim_resolved_payout_topup",
+        ),
+        (48, "SyncMaintenanceFee", "handle_sync_maintenance_fee"),
+        (
+            49,
+            "UpdateMaintenanceFeePolicy",
+            "handle_update_market_authority_policy",
+        ),
+        (
+            50,
+            "WithdrawBackingBucket",
+            "handle_withdraw_backing_bucket",
+        ),
+        (
+            51,
+            "UpdateBackingFeePolicy",
+            "handle_update_backing_fee_policy",
+        ),
+        (
+            52,
+            "WithdrawBackingBucketEarnings",
+            "handle_withdraw_backing_bucket_earnings",
+        ),
+        (
+            53,
+            "SyncBackingDomainLedger",
+            "handle_sync_backing_domain_ledger",
+        ),
+        (54, "SyncInsuranceLedger", "handle_sync_insurance_ledger"),
+        (55, "UpdateTradeFeePolicy", "handle_update_trade_fee_policy"),
+        (56, "TopUpInsuranceDomain", "handle_top_up_insurance"),
+        (
+            57,
+            "WithdrawInsuranceAsset",
+            "handle_withdraw_insurance_asset",
+        ),
+        (
+            58,
+            "UpdateFeeRedirectPolicy",
+            "handle_update_market_authority_policy",
+        ),
+        (
+            59,
+            "UpdateMarketInitFeePolicy",
+            "handle_update_market_authority_policy",
+        ),
+        (60, "UpdateBaseUnitMints", "handle_update_base_unit_mints"),
+        (
+            61,
+            "SwapSecondaryForPrimary",
+            "handle_swap_secondary_for_primary",
+        ),
+        (62, "ConfigureAuthMark", "handle_configure_managed_mark"),
+        (63, "PushAuthMark", "handle_push_managed_mark"),
+        (
+            64,
+            "ForceCloseAbandonedAsset",
+            "handle_force_close_abandoned_asset",
+        ),
+        (65, "UpdateAssetAuthority", "handle_update_asset_authority"),
+        (66, "BatchTradeNoCpi", "handle_batch_trade_nocpi"),
+        (67, "BatchTradeCpi", "handle_batch_trade_cpi"),
+        (68, "SetMatcherConfig", "handle_set_matcher_config"),
+        (69, "RestartAssetOracle", "handle_restart_asset_oracle"),
+    ]
+    .into_iter()
+    .map(|(tag, variant, handler)| PublicInstructionDispatch {
+        tag,
+        variant: variant.to_owned(),
+        handler: handler.to_owned(),
+    })
+    .collect::<Vec<_>>();
+
+    assert_eq!(
+        dispatch_roster, expected,
+        "a public instruction changed dispatch handler; review its invariant evidence and \
+         registry row before accepting the route change"
+    );
+    for row in &dispatch_roster {
+        assert!(
+            source_defines_function(production, &row.handler),
+            "{} dispatches to missing handler {}",
+            row.variant,
+            row.handler,
+        );
+    }
+}
+
+fn production_public_instruction_roster(source: &str) -> Vec<PublicInstructionRoute> {
+    let variants = instruction_enum_variants(source);
+    let tags = instruction_decode_tags(source);
+    assert_eq!(
+        variants.len(),
+        tags.len(),
+        "every Instruction enum variant must have a decode tag"
+    );
+
+    let mut roster = Vec::with_capacity(variants.len());
+    for variant in variants {
+        let tag = tags
+            .get(&variant)
+            .unwrap_or_else(|| panic!("Instruction::{variant} lacks a decode tag"));
+        roster.push(PublicInstructionRoute { tag: *tag, variant });
+    }
+    roster.sort_by_key(|route| route.tag);
+    roster
+}
+
+fn production_public_instruction_dispatch_roster(source: &str) -> Vec<PublicInstructionDispatch> {
+    let routes = production_public_instruction_roster(source);
+    let block = braced_block_after(source, "match Instruction::decode(instruction_data)?");
+    let mut arms = std::collections::BTreeMap::<String, String>::new();
+    let mut current: Option<(String, String)> = None;
+
+    for raw_line in block.lines() {
+        let line = raw_line.split("//").next().unwrap_or("").trim();
+        if let Some(variant) = instruction_arm_variant(line) {
+            if let Some((prior_variant, prior_body)) = current.replace((variant, line.to_owned())) {
+                let handler = dispatch_handler_from_arm(&prior_body)
+                    .unwrap_or_else(|| panic!("Instruction::{prior_variant} lacks handler"));
+                assert!(
+                    arms.insert(prior_variant.clone(), handler).is_none(),
+                    "duplicate dispatch arm for Instruction::{prior_variant}"
+                );
+            }
+        } else if let Some((_, body)) = &mut current {
+            body.push('\n');
+            body.push_str(line);
+        }
+    }
+    if let Some((prior_variant, prior_body)) = current {
+        let handler = dispatch_handler_from_arm(&prior_body)
+            .unwrap_or_else(|| panic!("Instruction::{prior_variant} lacks handler"));
+        assert!(
+            arms.insert(prior_variant.clone(), handler).is_none(),
+            "duplicate dispatch arm for Instruction::{prior_variant}"
+        );
+    }
+
+    routes
+        .into_iter()
+        .map(|route| {
+            let handler = arms
+                .remove(&route.variant)
+                .unwrap_or_else(|| panic!("Instruction::{} lacks dispatch arm", route.variant));
+            PublicInstructionDispatch {
+                tag: route.tag,
+                variant: route.variant,
+                handler,
+            }
+        })
+        .collect()
+}
+
+fn instruction_arm_variant(line: &str) -> Option<String> {
+    let tail = line.strip_prefix("Instruction::")?;
+    let name: String = tail
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+fn dispatch_handler_from_arm(body: &str) -> Option<String> {
+    let tail = body.split_once("=>")?.1;
+    let handler_start = tail.find("handle_")?;
+    let handler = tail[handler_start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect::<String>();
+    (!handler.is_empty()).then_some(handler)
+}
+
+fn instruction_enum_variants(source: &str) -> Vec<String> {
+    let block = braced_block_after(source, "pub enum Instruction");
+    let mut variants = Vec::new();
+    let mut depth = 0i32;
+
+    for raw_line in block.lines() {
+        let line = raw_line.split("//").next().unwrap_or("").trim();
+        if depth == 0 {
+            let name: String = line
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                .collect();
+            if name
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphabetic())
+            {
+                variants.push(name);
+            }
+        }
+        depth += brace_delta(line);
+        assert!(depth >= 0, "Instruction enum parser underflowed at {line}");
+    }
+    assert_eq!(depth, 0, "Instruction enum parser ended inside a variant");
+    variants
+}
+
+fn instruction_decode_tags(source: &str) -> std::collections::BTreeMap<String, u8> {
+    let block = braced_block_after(source, "pub fn decode(input: &[u8])");
+    let mut tags = std::collections::BTreeMap::new();
+    let mut pending_tag = None;
+
+    for raw_line in block.lines() {
+        let line = raw_line.split("//").next().unwrap_or("").trim();
+        if let Some((tag, tail)) = parse_decode_tag_arm(line) {
+            if let Some(variant) =
+                decode_helper_variant(source, tail).or_else(|| self_variant_name(tail))
+            {
+                assert!(
+                    tags.insert(variant.clone(), tag).is_none(),
+                    "duplicate decode tag for Instruction::{variant}"
+                );
+                pending_tag = None;
+            } else {
+                pending_tag = Some(tag);
+            }
+            continue;
+        }
+
+        if let Some(tag) = pending_tag {
+            if let Some(variant) = self_variant_name(line) {
+                assert!(
+                    tags.insert(variant.clone(), tag).is_none(),
+                    "duplicate decode tag for Instruction::{variant}"
+                );
+                pending_tag = None;
+            }
+        }
+    }
+
+    tags
+}
+
+fn decode_helper_variant(source: &str, line: &str) -> Option<String> {
+    let helper = line.split_once("Self::decode_")?.1;
+    let helper: String = helper
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect();
+    let block = braced_block_after(source, &format!("fn decode_{helper}"));
+    block.lines().find_map(self_variant_name)
+}
+
+fn braced_block_after<'a>(source: &'a str, marker: &str) -> &'a str {
+    let start = source
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing source marker {marker}"));
+    let open = start
+        + source[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("missing opening brace after {marker}"));
+    let mut depth = 0i32;
+    for (offset, ch) in source[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[(open + 1)..(open + offset)];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unterminated source block after {marker}");
+}
+
+fn brace_delta(line: &str) -> i32 {
+    line.chars().filter(|ch| *ch == '{').count() as i32
+        - line.chars().filter(|ch| *ch == '}').count() as i32
+}
+
+fn parse_decode_tag_arm(line: &str) -> Option<(u8, &str)> {
+    let (raw_tag, tail) = line.split_once("=>")?;
+    let raw_tag = raw_tag.trim();
+    if raw_tag.chars().all(|ch| ch.is_ascii_digit()) {
+        Some((raw_tag.parse().expect("decode tag fits in u8"), tail.trim()))
+    } else {
+        None
+    }
+}
+
+fn self_variant_name(line: &str) -> Option<String> {
+    let tail = line.split_once("Self::")?.1;
+    let name: String = tail
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+fn parse_public_instruction_coverage_registry(tsv: &str) -> Vec<PublicInstructionCoverageRow<'_>> {
+    const HEADER: &str = "tag\tvariant\tpublic_route_coverage\tcu_coverage\tomission_reason";
+    let mut rows = Vec::new();
+    let mut seen_tags = std::collections::BTreeSet::new();
+    let mut seen_variants = std::collections::BTreeSet::new();
+    let mut prior_tag = None;
+    let mut saw_header = false;
+
+    for (line_index, line) in tsv.lines().enumerate() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if !saw_header {
+            assert_eq!(line, HEADER, "public instruction registry header changed");
+            saw_header = true;
+            continue;
+        }
+
+        let fields: Vec<_> = line.split('\t').collect();
+        assert_eq!(
+            fields.len(),
+            5,
+            "malformed public instruction registry row {}: {line}",
+            line_index + 1
+        );
+        let tag: u8 = fields[0]
+            .parse()
+            .unwrap_or_else(|_| panic!("non-numeric instruction tag on row {}", line_index + 1));
+        let row = PublicInstructionCoverageRow {
+            tag,
+            variant: fields[1],
+            public_route_coverage: fields[2],
+            cu_coverage: fields[3],
+            omission_reason: fields[4],
+        };
+
+        if let Some(prior) = prior_tag {
+            assert!(
+                row.tag > prior,
+                "public instruction registry rows must be sorted by tag"
+            );
+        }
+        prior_tag = Some(row.tag);
+        assert!(
+            seen_tags.insert(row.tag),
+            "duplicate public instruction tag {}",
+            row.tag
+        );
+        assert!(
+            seen_variants.insert(row.variant),
+            "duplicate public instruction variant {}",
+            row.variant
+        );
+        assert!(
+            row.variant
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_uppercase()),
+            "variant names must be Rust enum variants: {}",
+            row.variant
+        );
+
+        let public_omitted = validate_public_instruction_coverage_cell(
+            row.public_route_coverage,
+            "public_route_coverage",
+            row.variant,
+        );
+        let cu_omitted =
+            validate_public_instruction_coverage_cell(row.cu_coverage, "cu_coverage", row.variant);
+        if public_omitted || cu_omitted {
+            assert!(
+                !matches!(row.omission_reason, "" | "-"),
+                "{} omits coverage but lacks an explicit omission reason",
+                row.variant
+            );
+        } else {
+            assert_eq!(
+                row.omission_reason, "-",
+                "{} has no omitted coverage; keep omission_reason as '-'",
+                row.variant
+            );
+        }
+        rows.push(row);
+    }
+
+    assert!(!rows.is_empty(), "public instruction registry is empty");
+    rows
+}
+
+fn validate_public_instruction_coverage_cell(cell: &str, column: &str, variant: &str) -> bool {
+    if cell == "OMITTED" {
+        return true;
+    }
+
+    for evidence in cell.split(';') {
+        let (kind, rest) = evidence
+            .split_once(':')
+            .unwrap_or_else(|| panic!("{variant} {column} evidence lacks prefix: {evidence}"));
+        assert!(
+            matches!(kind, "OWNED" | "SHARED" | "CROSS"),
+            "{variant} {column} has unknown evidence prefix {kind}"
+        );
+        let (path, function) = rest
+            .split_once('#')
+            .unwrap_or_else(|| panic!("{variant} {column} evidence lacks function: {evidence}"));
+        if kind == "SHARED" {
+            let fixed_route_oracle = path
+                == "tests/invariants/cu/inv_081_success_state_validity_over_complete_public_routes.rs"
+                && function
+                    == "v16_program_public_route_oracle_checks_success_and_reject_frames_fixed_case"
+                && matches!(
+                    variant,
+                    "Deposit"
+                        | "Withdraw"
+                        | "PermissionlessCrank"
+                        | "TradeNoCpi"
+                        | "TradeCpi"
+                        | "BatchTradeNoCpi"
+                        | "BatchTradeCpi"
+                );
+            let stateful_route_oracle = variant == "SetMatcherConfig"
+                && path
+                    == "tests/invariants/stateful/inv_081_success_state_validity_over_complete_public_routes.rs"
+                && function == "v16_program_stateful_public_interface_fuzz";
+            assert!(
+                column == "public_route_coverage" && (fixed_route_oracle || stateful_route_oracle),
+                "{variant} {column} cannot claim broad SHARED coverage from {path}#{function}"
+            );
+        }
+        assert!(
+            path.starts_with("tests/invariants/") && path.ends_with(".rs") && !path.contains(".."),
+            "{variant} {column} evidence must stay under tests/invariants: {path}"
+        );
+        assert!(
+            function.starts_with("v16_"),
+            "{variant} {column} evidence must name a v16 test function: {function}"
+        );
+        let full_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+        let source = std::fs::read_to_string(&full_path)
+            .unwrap_or_else(|error| panic!("read evidence source {path}: {error}"));
+        assert!(
+            source_defines_test(&source, function),
+            "{variant} {column} evidence {path} does not define #[test] fn {function}"
+        );
+    }
+
+    false
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SpecialMethodRequirement {
+    invariant: String,
+    method: String,
+}
+
+#[test]
+fn v16_special_verification_method_registry_matches_charter() {
+    let required = charter_special_method_requirements(include_str!("../../../INVARIANTS.md"));
+    let indexed = parse_special_method_registry(include_str!("../special_method_coverage.tsv"));
+    let indexed_requirements = indexed
+        .iter()
+        .map(|row| SpecialMethodRequirement {
+            invariant: row.invariant.to_string(),
+            method: row.method.to_string(),
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(
+        indexed_requirements, required,
+        "every charter-required M/R/C method must have exactly one explicit registry row"
+    );
+    assert_eq!(
+        indexed.len(),
+        required.len(),
+        "duplicate method registry row"
+    );
+}
+
+#[test]
+fn v16_special_method_cross_invariant_evidence_is_reviewed() {
+    let indexed = parse_special_method_registry(include_str!("../special_method_coverage.tsv"));
+    let reviewed_cross_invariant_evidence = [
+        (
+            "INV-008",
+            "M",
+            "tests/invariants/cu/inv_009_partial_fill_and_retry_accounting.rs",
+            "v16_program_one_shot_trade_consent_composition_is_source_complete",
+        ),
+        (
+            "INV-038",
+            "M",
+            "tests/invariants/stateful/inv_052_split_merge_invariance.rs",
+            "v16_program_backing_fee_partitions_are_conservative_and_value_exact",
+        ),
+        (
+            "INV-051",
+            "M",
+            "tests/invariants/cu/inv_077_bounded_work_and_maximum_shape_compute.rs",
+            "v16_attack_public_14_leg_28_source_equal_risk_liquidation_stays_bounded",
+        ),
+        (
+            "INV-029",
+            "R",
+            "tests/invariants/stateful/inv_086_reference_model_and_deployed_transition_equivalence.rs",
+            "v16_program_bounded_reference_graph_exhausts_public_action_words",
+        ),
+        (
+            "INV-046",
+            "R",
+            "tests/invariants/cu/inv_045_no_free_mark_movement.rs",
+            "v16_program_mark_writer_and_trade_exit_composition_is_source_complete",
+        ),
+        (
+            "INV-057",
+            "R",
+            "tests/invariants/cu/inv_071_crank_progress.rs",
+            "v16_program_crank_progress_and_recovery_composition_is_source_complete",
+        ),
+        (
+            "INV-067",
+            "R",
+            "tests/invariants/cu/inv_066_resolved_payout_fairness_and_order_independence.rs",
+            "v16_program_resolved_payout_induction_composition_is_source_complete",
+        ),
+        (
+            "INV-073",
+            "R",
+            "tests/invariants/cu/inv_071_crank_progress.rs",
+            "v16_program_crank_progress_and_recovery_composition_is_source_complete",
+        ),
+        (
+            "INV-078",
+            "R",
+            "tests/invariants/cu/inv_071_crank_progress.rs",
+            "v16_program_crank_progress_and_recovery_composition_is_source_complete",
+        ),
+        (
+            "INV-082",
+            "R",
+            "tests/invariants/cu/inv_071_crank_progress.rs",
+            "v16_program_crank_progress_and_recovery_composition_is_source_complete",
+        ),
+    ]
+    .into_iter()
+    .collect::<std::collections::BTreeSet<_>>();
+    let mut observed_cross_invariant_evidence = std::collections::BTreeSet::new();
+
+    for row in indexed.iter().filter(|row| row.status != "OMITTED") {
+        let path = row
+            .evidence_path
+            .expect("covered or partial method row has evidence path");
+        let function = row
+            .evidence_function
+            .expect("covered or partial method row has evidence function");
+        let evidence_invariant = evidence_path_invariant_id(path)
+            .unwrap_or_else(|| panic!("method evidence path lacks invariant id: {path}"));
+        if evidence_invariant == row.invariant {
+            continue;
+        }
+
+        let claim = (row.invariant, row.method, path, function);
+        assert!(
+            reviewed_cross_invariant_evidence.contains(&claim),
+            "{} {} borrows {}#{} without an explicit reviewed cross-invariant allowance",
+            row.invariant,
+            row.method,
+            path,
+            function
+        );
+        observed_cross_invariant_evidence.insert(claim);
+    }
+
+    assert_eq!(
+        observed_cross_invariant_evidence, reviewed_cross_invariant_evidence,
+        "reviewed cross-invariant method evidence allowlist is stale"
+    );
+}
+
+fn evidence_path_invariant_id(path: &str) -> Option<String> {
+    let file_name = path.rsplit('/').next()?;
+    let digits = file_name.strip_prefix("inv_")?.get(..3)?;
+    digits
+        .chars()
+        .all(|ch| ch.is_ascii_digit())
+        .then(|| format!("INV-{digits}"))
+}
+
+fn charter_special_method_requirements(
+    charter: &str,
+) -> std::collections::BTreeSet<SpecialMethodRequirement> {
+    let mut current_invariant = None;
+    let mut required = std::collections::BTreeSet::new();
+
+    for line in charter.lines() {
+        if let Some(rest) = line.strip_prefix("### INV-") {
+            let digits = rest
+                .chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>();
+            assert_eq!(digits.len(), 3, "malformed invariant heading: {line}");
+            current_invariant = Some(format!("INV-{digits}"));
+            continue;
+        }
+        let Some(methods) = line.strip_prefix("**Verification:** ") else {
+            continue;
+        };
+        let invariant = current_invariant
+            .as_ref()
+            .unwrap_or_else(|| panic!("verification methods precede an invariant heading"));
+        for method in methods.split(',').map(str::trim) {
+            if matches!(method, "M" | "R" | "C") {
+                assert!(
+                    required.insert(SpecialMethodRequirement {
+                        invariant: invariant.clone(),
+                        method: method.to_string(),
+                    }),
+                    "duplicate {method} requirement for {invariant}"
+                );
+            }
+        }
+    }
+
+    assert_eq!(required.iter().filter(|row| row.method == "M").count(), 32);
+    assert_eq!(required.iter().filter(|row| row.method == "R").count(), 22);
+    assert_eq!(required.iter().filter(|row| row.method == "C").count(), 2);
+    required
+}
+
+#[derive(Debug)]
+struct SpecialMethodCoverageRow<'a> {
+    invariant: &'a str,
+    method: &'a str,
+    status: &'a str,
+    evidence_path: Option<&'a str>,
+    evidence_function: Option<&'a str>,
+}
+
+fn parse_special_method_registry(tsv: &str) -> Vec<SpecialMethodCoverageRow<'_>> {
+    const HEADER: &str = "invariant\tmethod\tstatus\tevidence\tremaining_gap";
+    let mut rows = Vec::new();
+    let mut saw_header = false;
+
+    for (line_index, line) in tsv.lines().enumerate() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if !saw_header {
+            assert_eq!(line, HEADER, "special method registry header changed");
+            saw_header = true;
+            continue;
+        }
+
+        let fields = line.split('\t').collect::<Vec<_>>();
+        assert_eq!(
+            fields.len(),
+            5,
+            "malformed special method registry row {}: {line}",
+            line_index + 1
+        );
+        let (invariant, method, status, evidence, remaining_gap) =
+            (fields[0], fields[1], fields[2], fields[3], fields[4]);
+        assert!(
+            invariant.len() == 7
+                && invariant.starts_with("INV-")
+                && invariant[4..].chars().all(|ch| ch.is_ascii_digit()),
+            "invalid invariant id on row {}: {invariant}",
+            line_index + 1
+        );
+        assert!(
+            matches!(method, "M" | "R" | "C"),
+            "invalid method on row {}: {method}",
+            line_index + 1
+        );
+        assert!(
+            !remaining_gap.trim().is_empty(),
+            "row {} must name the remaining completion gap",
+            line_index + 1
+        );
+
+        let mut evidence_path = None;
+        let mut evidence_function = None;
+
+        match status {
+            "PARTIAL" | "COVERED" => {
+                let (path, function) = evidence.split_once('#').unwrap_or_else(|| {
+                    panic!(
+                        "row {} {status} evidence lacks path#function",
+                        line_index + 1
+                    )
+                });
+                assert!(
+                    path.starts_with("tests/invariants/")
+                        && path.ends_with(".rs")
+                        && !path.contains(".."),
+                    "row {} evidence is not invariant-owned: {path}",
+                    line_index + 1
+                );
+                assert!(
+                    function.starts_with("v16_"),
+                    "row {} evidence must name a reviewed v16 test: {path}#{function}",
+                    line_index + 1
+                );
+                let full_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+                let source = std::fs::read_to_string(&full_path)
+                    .unwrap_or_else(|error| panic!("read method evidence {path}: {error}"));
+                assert!(
+                    source_defines_test(&source, function),
+                    "row {} evidence {path} does not define #[test] fn {function}",
+                    line_index + 1
+                );
+                evidence_path = Some(path);
+                evidence_function = Some(function);
+                if status == "COVERED" {
+                    assert_eq!(
+                        remaining_gap,
+                        "-",
+                        "row {} COVERED method cannot name a remaining gap",
+                        line_index + 1
+                    );
+                } else {
+                    assert_ne!(
+                        remaining_gap,
+                        "-",
+                        "row {} PARTIAL method must name a remaining gap",
+                        line_index + 1
+                    );
+                }
+            }
+            "OMITTED" => assert_eq!(
+                evidence,
+                "-",
+                "row {} OMITTED method cannot claim evidence",
+                line_index + 1
+            ),
+            _ => panic!(
+                "row {} status must be COVERED, PARTIAL, or OMITTED, got {status}",
+                line_index + 1
+            ),
+        }
+
+        rows.push(SpecialMethodCoverageRow {
+            invariant,
+            method,
+            status,
+            evidence_path,
+            evidence_function,
+        });
+    }
+
+    assert!(saw_header, "special method registry header is missing");
+    rows
+}
+
+fn invariant_ids(markdown: &str, prefix: &str) -> Vec<u16> {
+    markdown
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix(prefix)
+                .and_then(|tail| tail.get(..3))
+                .and_then(|digits| digits.parse().ok())
+        })
+        .collect()
+}
+
+fn audit_verdict_counts(markdown: &str) -> std::collections::BTreeMap<&str, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    for line in markdown.lines().filter(|line| line.starts_with("| AUDIT-")) {
+        let verdict = line
+            .split('|')
+            .nth(2)
+            .map(str::trim)
+            .expect("every audit row has a verdict column");
+        assert!(
+            matches!(verdict, "CONDITIONAL" | "REOPENED" | "N/A"),
+            "unknown audit verdict {verdict}"
+        );
+        *counts.entry(verdict).or_insert(0) += 1;
+    }
+    counts
+}
+
+#[derive(Debug)]
+struct InvariantStatusRow<'a> {
+    id: u16,
+    disposition: &'a str,
+    required_scope: &'a str,
+    evidence_scope: &'a str,
+    quantification: &'a str,
+    assumption_profile: &'a str,
+    counterexamples: std::collections::BTreeSet<u16>,
+}
+
+fn parse_invariant_status(tsv: &str) -> Vec<InvariantStatusRow<'_>> {
+    const HEADER: &str = "invariant\tdisposition\trequired_scope\tevidence_scope\tquantification\tassumption_profile\tcounterexamples";
+
+    let mut rows = Vec::new();
+    let mut saw_header = false;
+    for (line_index, line) in tsv.lines().enumerate() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if !saw_header {
+            assert_eq!(line, HEADER, "invariant status header changed");
+            saw_header = true;
+            continue;
+        }
+
+        let fields = line.split('\t').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 7, "malformed invariant status row: {line}");
+        let id = fields[0]
+            .strip_prefix("INV-")
+            .expect("invariant status id prefix")
+            .parse::<u16>()
+            .expect("numeric invariant status id");
+        let counterexamples = if fields[6] == "-" {
+            std::collections::BTreeSet::new()
+        } else {
+            fields[6]
+                .split(',')
+                .map(|pr| pr.parse::<u16>().expect("numeric counterexample PR"))
+                .collect()
+        };
+        let row = InvariantStatusRow {
+            id,
+            disposition: fields[1],
+            required_scope: fields[2],
+            evidence_scope: fields[3],
+            quantification: fields[4],
+            assumption_profile: fields[5],
+            counterexamples,
+        };
+
+        assert!(
+            matches!(
+                row.disposition,
+                "REFUTED_CURRENT"
+                    | "OPEN_IMPLEMENTATION"
+                    | "OPEN_EVIDENCE"
+                    | "SUPPORTED"
+                    | "PROVEN"
+                    | "N_A"
+            ),
+            "unknown invariant disposition on row {}: {}",
+            line_index + 1,
+            row.disposition
+        );
+        assert_eq!(row.required_scope, "TRANSITION_SYSTEM");
+        match row.disposition {
+            "REFUTED_CURRENT" | "OPEN_EVIDENCE" => {
+                assert!(!row.counterexamples.is_empty());
+            }
+            "SUPPORTED" => {
+                assert!(row.counterexamples.is_empty());
+                assert_ne!(row.assumption_profile, "-");
+            }
+            "PROVEN" => {
+                assert!(row.counterexamples.is_empty());
+                assert_eq!(row.evidence_scope, "TRANSITION_SYSTEM");
+                assert_eq!(row.quantification, "FULL_DOMAIN");
+                assert_eq!(row.assumption_profile, "-");
+            }
+            "N_A" => {
+                assert!(row.counterexamples.is_empty());
+                assert_eq!(row.evidence_scope, "N_A");
+                assert_eq!(row.quantification, "N_A");
+                assert_eq!(row.assumption_profile, "-");
+            }
+            "OPEN_IMPLEMENTATION" => {}
+            _ => unreachable!(),
+        }
+        rows.push(row);
+    }
+
+    assert!(saw_header, "invariant status header is missing");
+    assert_eq!(
+        rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+        (1..=89).collect::<Vec<_>>(),
+        "invariant status must cover INV-001 through INV-089 exactly once and in order"
+    );
+    rows
+}
+
+fn stated_audit_count(summary: &str, verdict: &str) -> usize {
+    let marker = format!(" **{verdict}**");
+    let marker_index = summary
+        .find(&marker)
+        .unwrap_or_else(|| panic!("audit summary omits {verdict}"));
+    summary[..marker_index]
+        .split_whitespace()
+        .last()
+        .unwrap_or_else(|| panic!("audit summary omits the {verdict} count"))
+        .parse()
+        .unwrap_or_else(|_| panic!("audit summary has a nonnumeric {verdict} count"))
+}
+
+#[test]
+fn v16_invariant_charter_and_index_are_complete() {
+    let expected: Vec<u16> = (1..=89).collect();
+    assert_eq!(
+        invariant_ids(include_str!("../../../INVARIANTS.md"), "### INV-"),
+        expected,
+        "the normative charter must define INV-001 through INV-089 exactly once and in order"
+    );
+    assert_eq!(
+        invariant_ids(include_str!("../README.md"), "| INV-"),
+        expected,
+        "the executable coverage index must account for every normative invariant"
+    );
+    assert_eq!(
+        invariant_ids(include_str!("../README.md"), "| AUDIT-"),
+        expected,
+        "the exhaustiveness audit must classify every normative invariant exactly once"
+    );
+}
+
+#[test]
+fn v16_invariant_audit_summary_matches_every_verdict_row() {
+    let markdown = include_str!("../README.md");
+    let counts = audit_verdict_counts(markdown);
+    assert_eq!(counts.values().sum::<usize>(), 89);
+
+    let summary = markdown
+        .lines()
+        .skip_while(|line| !line.starts_with("The current ledger is "))
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        summary.starts_with("The current ledger is "),
+        "the invariant audit must publish its current verdict totals"
+    );
+    for verdict in ["CONDITIONAL", "REOPENED", "N/A"] {
+        assert_eq!(
+            stated_audit_count(&summary, verdict),
+            counts.get(verdict).copied().unwrap_or(0),
+            "stale invariant audit summary for {verdict}"
+        );
+    }
+}
+
+#[test]
+fn v16_machine_invariant_status_is_authoritative_and_nonoverclaiming() {
+    let statuses = parse_invariant_status(include_str!("../invariant_status.tsv"));
+    let markdown_verdicts = include_str!("../README.md")
+        .lines()
+        .filter(|line| line.starts_with("| AUDIT-"))
+        .map(|line| {
+            let fields = line.split('|').map(str::trim).collect::<Vec<_>>();
+            let id = fields[1]
+                .strip_prefix("AUDIT-")
+                .expect("audit prefix")
+                .parse::<u16>()
+                .expect("numeric audit id");
+            (id, fields[2])
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let mut affected_prs =
+        std::collections::BTreeMap::<u16, std::collections::BTreeSet<u16>>::new();
+    let mut primary_invariants = std::collections::BTreeSet::new();
+    for line in include_str!("../coverage_reopenings.tsv")
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+        .skip(1)
+    {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields[7] == "COVERED" {
+            continue;
+        }
+        let pr = fields[0].parse::<u16>().expect("numeric reopening PR");
+        let primary = fields[3]
+            .strip_prefix("INV-")
+            .expect("primary invariant prefix")
+            .parse::<u16>()
+            .expect("numeric primary invariant");
+        primary_invariants.insert(primary);
+        for affected in fields[4].split(',') {
+            let id = affected
+                .strip_prefix("INV-")
+                .expect("affected invariant prefix")
+                .parse::<u16>()
+                .expect("numeric affected invariant");
+            affected_prs.entry(id).or_default().insert(pr);
+        }
+    }
+
+    for row in &statuses {
+        let expected_counterexamples = affected_prs.get(&row.id).cloned().unwrap_or_default();
+        assert_eq!(
+            row.counterexamples, expected_counterexamples,
+            "stale counterexample projection for INV-{:03}",
+            row.id
+        );
+        let expected_disposition = if primary_invariants.contains(&row.id) {
+            "REFUTED_CURRENT"
+        } else if !expected_counterexamples.is_empty() {
+            "OPEN_EVIDENCE"
+        } else if matches!(row.id, 42 | 43) {
+            "N_A"
+        } else {
+            "SUPPORTED"
+        };
+        assert_eq!(
+            row.disposition, expected_disposition,
+            "stale disposition for INV-{:03}",
+            row.id
+        );
+        let expected_markdown = match row.disposition {
+            "REFUTED_CURRENT" | "OPEN_IMPLEMENTATION" | "OPEN_EVIDENCE" => "REOPENED",
+            "SUPPORTED" => "CONDITIONAL",
+            "PROVEN" => "PROVEN",
+            "N_A" => "N/A",
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            markdown_verdicts.get(&row.id).copied(),
+            Some(expected_markdown),
+            "README is not a projection of invariant_status.tsv for INV-{:03}",
+            row.id
+        );
+    }
+    assert!(
+        statuses.iter().all(|row| row.disposition != "PROVEN"),
+        "current bounded evidence cannot support a whole-system PROVEN disposition"
+    );
+}
+
+#[test]
+fn v16_post_pr135_counterexamples_reopen_every_affected_invariant() {
+    const HEADER: &str = "pr\tkind\tseverity\tprimary_invariant\taffected_invariants\tomitted_dimension\trequired_generic_property\tstatus";
+
+    let audit_verdicts = include_str!("../README.md")
+        .lines()
+        .filter(|line| line.starts_with("| AUDIT-"))
+        .map(|line| {
+            let fields = line.split('|').map(str::trim).collect::<Vec<_>>();
+            let id = fields[1]
+                .strip_prefix("AUDIT-")
+                .expect("audit prefix")
+                .parse::<u16>()
+                .expect("numeric audit id");
+            (id, fields[2])
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let benchmark_rows = include_str!("../open_findings.tsv")
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+        .map(|line| {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            assert_eq!(fields.len(), 6, "malformed open finding row: {line}");
+            (
+                fields[0].parse::<u16>().expect("numeric finding PR"),
+                (fields[1], fields[2], fields[3], fields[4]),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let benchmark_evidence = benchmark_rows
+        .iter()
+        .map(|(pr, row)| (*pr, row.3))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let missing_findings = benchmark_evidence
+        .iter()
+        .filter_map(|(pr, evidence)| (*evidence == "missing").then_some(*pr))
+        .collect::<std::collections::BTreeSet<_>>();
+    for pr in [415u16, 428] {
+        assert_eq!(
+            benchmark_evidence.get(&pr),
+            Some(&"independent-discovery"),
+            "retained value-debit coverage must be invariant-owned for row {pr}"
+        );
+    }
+
+    let mut saw_header = false;
+    let mut prior_pr = 0u16;
+    let mut reopening_prs = std::collections::BTreeSet::new();
+    let mut conformance_prs = std::collections::BTreeSet::new();
+    let mut affected = std::collections::BTreeSet::new();
+    let mut properties = std::collections::BTreeSet::new();
+    for line in include_str!("../coverage_reopenings.tsv").lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if !saw_header {
+            assert_eq!(line, HEADER, "coverage-reopening header changed");
+            saw_header = true;
+            continue;
+        }
+
+        let fields = line.split('\t').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 8, "malformed reopening row: {line}");
+        let pr = fields[0].parse::<u16>().expect("numeric reopening PR");
+        assert!(pr > prior_pr, "reopening PRs must be unique and sorted");
+        prior_pr = pr;
+        assert!(matches!(fields[1], "LoF" | "DoS" | "Conformance"));
+        assert!(matches!(
+            fields[2],
+            "BLOCKER" | "REAL" | "HARDENING" | "PRIVILEGED" | "LIMIT"
+        ));
+        assert!(
+            matches!(fields[7], "OPEN" | "COVERED"),
+            "coverage-reopening status must be OPEN or COVERED"
+        );
+        if fields[1] == "Conformance" {
+            assert!(
+                !benchmark_rows.contains_key(&pr),
+                "conformance-only reopening {pr} must not masquerade as an open LoF/DoS benchmark row"
+            );
+        } else {
+            let benchmark = benchmark_rows.get(&pr).unwrap_or_else(|| {
+                panic!("LoF/DoS reopening row {pr} is missing from the holdout benchmark")
+            });
+            assert_eq!(benchmark.0, fields[1], "benchmark kind drift for row {pr}");
+            assert_eq!(
+                benchmark.1, fields[2],
+                "benchmark severity drift for row {pr}"
+            );
+            assert_eq!(
+                benchmark.2, fields[3],
+                "benchmark primary invariant drift for row {pr}"
+            );
+            assert!(
+                matches!(
+                    benchmark.3,
+                    "independent-discovery" | "missing" | "nonqualifying"
+                ),
+                "unknown benchmark evidence classification for row {pr}: {}",
+                benchmark.3
+            );
+            if fields[7] == "COVERED" {
+                assert_eq!(
+                    benchmark.3, "independent-discovery",
+                    "covered reopening row {pr} must have invariant-owned independent discovery evidence"
+                );
+            }
+        }
+        assert!(
+            fields[5].split("+x-").count() >= 3,
+            "omitted dimension must name a cross-product, not one example: {line}"
+        );
+        assert!(
+            properties.insert(fields[6]),
+            "generic properties must be unique: {}",
+            fields[6]
+        );
+
+        let primary = fields[3]
+            .strip_prefix("INV-")
+            .expect("primary invariant prefix")
+            .parse::<u16>()
+            .expect("numeric primary invariant");
+        let row_affected = fields[4]
+            .split(',')
+            .map(|value| {
+                value
+                    .strip_prefix("INV-")
+                    .expect("affected invariant prefix")
+                    .parse::<u16>()
+                    .expect("numeric affected invariant")
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(row_affected.contains(&primary));
+        assert!(row_affected.iter().all(|id| (1..=89).contains(id)));
+        if fields[7] == "OPEN" {
+            affected.extend(row_affected);
+            reopening_prs.insert(pr);
+            if fields[1] == "Conformance" {
+                conformance_prs.insert(pr);
+            }
+        }
+    }
+    assert!(saw_header, "coverage-reopening header is missing");
+    // Independent mechanism coverage does not close these broader obligations.
+    let independently_discovered_open_findings = reopening_prs
+        .iter()
+        .filter(|pr| benchmark_evidence.get(pr) == Some(&"independent-discovery"))
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        independently_discovered_open_findings,
+        [411, 416, 417, 420, 421, 422, 423, 424, 433]
+            .into_iter()
+            .collect(),
+        "only explicitly qualified discoveries retain broader OPEN obligations"
+    );
+    let expected_reopenings = missing_findings
+        .union(&conformance_prs)
+        .chain(&independently_discovered_open_findings)
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(reopening_prs, expected_reopenings);
+
+    let reopened = audit_verdicts
+        .iter()
+        .filter_map(|(id, verdict)| (*verdict == "REOPENED").then_some(*id))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        reopened, affected,
+        "every and only counterexample-affected invariant must remain REOPENED"
+    );
+    assert!(
+        audit_verdicts
+            .values()
+            .all(|verdict| !matches!(*verdict, "CLOSED" | "PROVEN")),
+        "harness-relative evidence cannot be promoted to a whole-system proof label"
+    );
+}
+
+#[test]
+fn v16_traceability_gap_ledger_points_to_executable_evidence() {
+    const HEADER: &str = "invariant\troute_family\tclaim_source\texisting_generic_entrypoints\tmissing_generator_link\tmissing_oracle_link\trecommended_next_test_owner\tnext_action";
+
+    let statuses = parse_invariant_status(include_str!("../invariant_status.tsv"))
+        .into_iter()
+        .map(|row| (row.id, row.disposition))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let mut saw_header = false;
+    let mut rows = 0usize;
+    let mut row_keys = std::collections::BTreeSet::new();
+    for (line_index, line) in include_str!("../traceability_gaps.tsv").lines().enumerate() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if !saw_header {
+            assert_eq!(line, HEADER, "traceability gap header changed");
+            saw_header = true;
+            continue;
+        }
+
+        let fields = line.split('\t').collect::<Vec<_>>();
+        assert_eq!(
+            fields.len(),
+            8,
+            "malformed traceability gap row {}: {line}",
+            line_index + 1
+        );
+        let invariant = fields[0];
+        let id = invariant
+            .strip_prefix("INV-")
+            .expect("traceability invariant prefix")
+            .parse::<u16>()
+            .expect("numeric traceability invariant id");
+        assert!((1..=89).contains(&id));
+        assert_ne!(fields[1], "-", "{invariant} route family must be named");
+        assert!(
+            fields[2].contains("README.md") || fields[2].contains("INVARIANTS.md"),
+            "{invariant} claim source must point at the charter or README"
+        );
+        assert_ne!(
+            statuses.get(&id).copied(),
+            Some("PROVEN"),
+            "{invariant} has an explicit traceability gap and cannot be marked PROVEN"
+        );
+
+        for evidence in fields[3].split("; ") {
+            let (path, function) = evidence.split_once('#').unwrap_or_else(|| {
+                panic!(
+                    "traceability row {} evidence lacks path#function: {evidence}",
+                    line_index + 1
+                )
+            });
+            assert!(
+                path.starts_with("tests/invariants/")
+                    && path.ends_with(".rs")
+                    && !path.contains(".."),
+                "traceability row {} evidence is not invariant-owned: {path}",
+                line_index + 1
+            );
+            assert!(
+                function.starts_with("v16_"),
+                "traceability row {} evidence must name a reviewed v16 test: {path}#{function}",
+                line_index + 1
+            );
+            let full_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+            let source = std::fs::read_to_string(&full_path)
+                .unwrap_or_else(|error| panic!("read traceability evidence {path}: {error}"));
+            assert!(
+                source_defines_test(&source, function),
+                "traceability row {} evidence {path} does not define #[test] fn {function}",
+                line_index + 1
+            );
+        }
+
+        assert!(
+            fields[4].len() > 32 && fields[5].len() > 32,
+            "{invariant} must spell out generator and oracle gaps"
+        );
+        for owner in fields[6].split("; ") {
+            assert!(
+                owner.starts_with("tests/invariants/")
+                    && owner.ends_with(".rs")
+                    && !owner.contains(".."),
+                "traceability row {} owner is not invariant-owned: {owner}",
+                line_index + 1
+            );
+            let full_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(owner);
+            assert!(
+                full_path.is_file(),
+                "traceability row {} owner file is missing: {owner}",
+                line_index + 1
+            );
+        }
+        assert!(
+            fields[7].len() > 32,
+            "{invariant} must retain a concrete next action"
+        );
+        assert!(
+            row_keys.insert((id, fields[1])),
+            "duplicate traceability gap row for {invariant} {}",
+            fields[1]
+        );
+        rows += 1;
+    }
+
+    assert!(saw_header, "traceability gap header is missing");
+    assert_eq!(
+        rows, 36,
+        "traceability gap ledger size changed; update this guard deliberately"
+    );
+}
+
+#[test]
+fn v16_program_invariant_harnesses_are_test_free_roots() {
+    for (name, source) in [
+        (
+            "deterministic",
+            include_str!("../../v16_program_fuzz_regressions.rs"),
+        ),
+        (
+            "stateful",
+            include_str!("../../v16_program_stateful_fuzz.rs"),
+        ),
+    ] {
+        assert!(
+            source.lines().all(|line| line.trim() != "#[test]"),
+            "{} harness contains an unowned test; move it to \
+             tests/invariants/<suite>/INV-NNN",
+            name
+        );
+    }
+}

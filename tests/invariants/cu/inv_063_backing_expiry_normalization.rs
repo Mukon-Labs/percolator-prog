@@ -1,0 +1,1341 @@
+//! INV-063 - Backing-expiry normalization.
+//!
+//! Normative obligation: Expired backing is normalized before every consumer and cannot remain economically fresh.
+//!
+//! Evidence in this file (I/C plus invariant-specific M assertions): `v16_program_retained_recovery_expiry_prerequisite_matrix_avoids_provider_capitalization`, `v16_program_post_snapshot_expiry_rejects_stale_trade_then_owner_progresses`, `v16_probe_post_expiry_trade_cannot_charge_backing_fee`, `v16_attack_lapsed_live_source_backing_expires_bounded_and_owner_can_reduce`, `v16_program_retire_normalizes_unreferenced_lapsed_backing`. These tests exercise the deployed public
+//! wrapper with real SBF/LiteSVM account construction and assert economic state, token,
+//! rollback, liveness, or compute outcomes appropriate to the invariant.
+//!
+//! Guarantee boundary: the post-expiry trade test certifies the minimized PR367 trace on the fixed
+//! program and checks exact rollback plus a surviving risk-reducing trade. The stateful INV-063
+//! module supplies nonvacuous `expiry-1`/`expiry`/`expiry+1` matrices for all four trade routes and
+//! released-PnL conversion; this CU module retains the finding-specific and bounded-crank evidence.
+//! The lapsed-Live test is also whole-route SVM/CU evidence for INV-030, INV-071, and INV-073: it
+//! proves one bounded expiry step, one bounded certification step, custody preservation, and a
+//! subsequent owner reduction.
+//! The retirement boundary uses only public activation, backing top-up, and lifecycle instructions.
+//! It proves a funded bucket blocks retirement while fresh, but an unreferenced lapsed bucket is
+//! normalized at the authenticated expiry boundary without moving custody and cannot permanently
+//! consume the asset slot merely because no portfolio carries its source domain.
+//! A source-complete composition census additionally classifies every production processor
+//! function that names backing. Each class is bound to a public expiry, lifecycle, accounting, or
+//! policy witness; adding a new direct wrapper backing consumer fails this invariant until it is
+//! classified. INV-088 independently source-locks wrapper-to-engine transition calls, so this
+//! census owns wrapper composition without duplicating engine arithmetic proofs.
+
+use super::*;
+
+#[path = "inv_063_spent_backing_expiry.rs"]
+mod spent_backing_expiry;
+
+struct Inv063BackingSurfaceClass {
+    disposition: &'static str,
+    witness: &'static str,
+    functions: &'static [&'static str],
+}
+
+fn inv063_production_processor_function_bodies() -> std::collections::BTreeMap<String, String> {
+    let production = include_str!("../../../src/v16_program.rs")
+        .split("    #[cfg(test)]\n    mod tests")
+        .next()
+        .expect("production source prefix");
+    let processor = production
+        .split_once("pub mod processor {")
+        .expect("v16 processor module")
+        .1;
+
+    let mut starts = Vec::new();
+    let mut absolute = 0usize;
+    for line in processor.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if let Some(fn_offset) = trimmed.find("fn ") {
+            let prefix = &trimmed[..fn_offset];
+            if prefix.is_empty() || prefix.starts_with("pub") {
+                let rest = &trimmed[fn_offset + 3..];
+                let end = rest
+                    .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                    .unwrap_or(rest.len());
+                starts.push((
+                    rest[..end].to_string(),
+                    absolute + line.len() - trimmed.len() + fn_offset,
+                ));
+            }
+        }
+        absolute += line.len();
+    }
+
+    let bytes = processor.as_bytes();
+    let mut functions = std::collections::BTreeMap::new();
+    for (name, start) in starts {
+        let open = processor[start..]
+            .find('{')
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("function {name} has no body"));
+        let mut depth = 0usize;
+        let mut end = None;
+        for (offset, byte) in bytes[open..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth
+                        .checked_sub(1)
+                        .unwrap_or_else(|| panic!("function {name} has malformed braces"));
+                    if depth == 0 {
+                        end = Some(open + offset + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end.unwrap_or_else(|| panic!("function {name} body is unterminated"));
+        assert!(
+            functions
+                .insert(name.clone(), processor[start..end].to_string())
+                .is_none(),
+            "duplicate production function {name}"
+        );
+    }
+    functions
+}
+
+fn inv063_source_defines_test(source: &str, function: &str) -> bool {
+    let expected = format!("fn {function}");
+    let mut test_attribute = false;
+
+    for line in source.lines() {
+        let line = line.trim();
+        if line == "#[test]" {
+            test_attribute = true;
+        } else if line.starts_with("fn ") {
+            if test_attribute
+                && line
+                    .strip_prefix(&expected)
+                    .is_some_and(|tail| tail.trim_start().starts_with('('))
+            {
+                return true;
+            }
+            test_attribute = false;
+        } else if test_attribute && !line.is_empty() && !line.starts_with("#") {
+            test_attribute = false;
+        }
+    }
+
+    false
+}
+
+#[test]
+fn v16_program_backing_expiry_consumer_composition_is_source_complete() {
+    const CLASSES: &[Inv063BackingSurfaceClass] = &[
+        Inv063BackingSurfaceClass {
+            disposition: "policy/profile metadata; no principal consumption",
+            witness: "v16_program_backing_provider_exit_unfreezes_policy_change",
+            functions: &[
+                "add_backing_fee_policy_count",
+                "advance_backing_fee_sequence_view",
+                "backing_fee_policy_count_from_profile",
+                "backing_fee_policy_for_domain_view",
+                "control_sequence_mut",
+                "handle_configure_hybrid_oracle",
+                "handle_configure_managed_mark",
+                "handle_update_backing_fee_policy",
+                "preserve_backing_fee_policy",
+                "subtract_backing_fee_policy_count",
+            ],
+        },
+        Inv063BackingSurfaceClass {
+            disposition: "authority/shape gate; funded value remains conservatively locked",
+            witness: "v16_attack_update_asset_authority_rejects_zero_domain_authority",
+            functions: &[
+                "asset_authority_role_has_funded_value_view",
+                "domain_authorities_from_profile",
+                "domain_authority_fields_complete",
+                "handle_update_asset_authority",
+                "handle_update_authority",
+            ],
+        },
+        Inv063BackingSurfaceClass {
+            disposition: "trade lien admission and fee attribution; landing-time freshness gate",
+            witness: "v16_program_backing_expiry_trade_route_boundary_matrix",
+            functions: &[
+                "apply_backing_domain_fees_after_trade_view",
+                "charge_account_backing_domain_fees_view",
+                "collect_backing_domain_fees_for_account_view",
+                "ensure_new_counterparty_backed_liens_fresh_for_trade_view",
+                "handle_batch_execute_zero_copy",
+                "handle_batch_trade_cpi",
+                "handle_trade_cpi",
+                "handle_trade_nocpi",
+                "handle_trade_nocpi_zero_copy",
+                "source_counterparty_backing_snapshot_view",
+                "source_credit_has_live_amounts",
+            ],
+        },
+        Inv063BackingSurfaceClass {
+            disposition: "bounded terminal/lifecycle normalization",
+            witness: "v16_program_retire_normalizes_unreferenced_lapsed_backing",
+            functions: &[
+                "canonicalize_retired_asset_slot_view",
+                "handle_close_slab",
+                "handle_update_asset_lifecycle",
+            ],
+        },
+        Inv063BackingSurfaceClass {
+            disposition:
+                "resolved payout consumption; authenticated expiry normalized before close",
+            witness: "v16_program_resolved_close_normalizes_backing_at_expiry",
+            functions: &["handle_close_resolved"],
+        },
+        Inv063BackingSurfaceClass {
+            disposition: "permissionless lapsed-backing expiry and bounded account progress",
+            witness: "v16_attack_lapsed_live_source_backing_expires_bounded_and_owner_can_reduce",
+            functions: &["handle_permissionless_crank"],
+        },
+        Inv063BackingSurfaceClass {
+            disposition: "initialization/reactivation structural preservation",
+            witness: "v16_program_reused_slot_matches_fresh_persisted_state_after_public_history",
+            functions: &["handle_init_market", "handle_restart_asset_oracle"],
+        },
+        Inv063BackingSurfaceClass {
+            disposition: "released-PnL conversion; lapsed source rejects before mutation",
+            witness: "v16_program_backing_expiry_conversion_boundary_matrix",
+            functions: &[
+                "handle_convert_released_pnl",
+                "reject_lapsed_source_backing_for_conversion_view",
+            ],
+        },
+        Inv063BackingSurfaceClass {
+            disposition: "fresh top-up; authenticated expiry is strict",
+            witness: "v16_program_retained_backing_topup_boundary_matrix",
+            functions: &["handle_top_up_backing_bucket"],
+        },
+        Inv063BackingSurfaceClass {
+            disposition: "provider-principal release; authenticated expiry is strict",
+            witness: "v16_program_backing_principal_release_respects_authenticated_expiry",
+            functions: &[
+                "handle_withdraw_backing_bucket",
+                "verify_domain_withdrawal_preflight",
+            ],
+        },
+        Inv063BackingSurfaceClass {
+            disposition: "earned fee stock; expiry-independent exact withdrawal",
+            witness: "v16_program_backing_earnings_summary_tracks_public_accrual_and_withdrawal",
+            functions: &["handle_withdraw_backing_bucket_earnings"],
+        },
+        Inv063BackingSurfaceClass {
+            disposition: "read-only/accounting ledger projection; no economic freshness decision",
+            witness: "v16_bpf_accounting_ledger_tags_are_bounded_and_update_state",
+            functions: &[
+                "backing_domain_parts_view",
+                "backing_unavailable_principal_atoms",
+                "handle_sync_backing_domain_ledger",
+                "read_or_new_backing_domain_ledger",
+                "sync_backing_domain_ledger",
+                "write_or_init_backing_domain_ledger",
+            ],
+        },
+        Inv063BackingSurfaceClass {
+            disposition: "instruction dispatch only; handler owns expiry semantics",
+            witness: "v16_program_backing_expiry_trade_route_boundary_matrix",
+            functions: &["process_instruction"],
+        },
+    ];
+
+    let witness_sources = [
+        include_str!("../public_sbf/inv_014_delayed_policy_and_policy_epoch_safety.rs"),
+        include_str!("../stateful/inv_063_backing_expiry_normalization.rs"),
+        include_str!("../stateful/inv_086_reference_model_and_deployed_transition_equivalence.rs"),
+        include_str!("../stateful/inv_088_global_summaries_are_not_account_local_proofs.rs"),
+        include_str!("inv_005_authority_incarnation_binding.rs"),
+        include_str!("inv_025_exact_stock_reconciliation.rs"),
+        include_str!("inv_063_backing_expiry_normalization.rs"),
+        include_str!("inv_089_activation_reactivation_and_initialization_equivalence.rs"),
+    ];
+
+    let functions = inv063_production_processor_function_bodies();
+    let actual = functions
+        .iter()
+        .filter_map(|(name, body)| {
+            body.to_ascii_lowercase()
+                .contains("backing")
+                .then_some(name.clone())
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut expected = std::collections::BTreeSet::new();
+    let mut witnesses = std::collections::BTreeSet::new();
+    for class in CLASSES {
+        assert!(!class.disposition.is_empty());
+        assert!(
+            class.witness.starts_with("v16_"),
+            "INV-063 backing class '{}' uses an unreviewed witness name {}",
+            class.disposition,
+            class.witness,
+        );
+        witnesses.insert(class.witness);
+        let matches = witness_sources
+            .iter()
+            .filter(|source| inv063_source_defines_test(source, class.witness))
+            .count();
+        assert!(
+            matches == 1,
+            "INV-063 backing class '{}' lost executable witness {}",
+            class.disposition,
+            class.witness,
+        );
+        for function in class.functions {
+            assert!(
+                expected.insert((*function).to_string()),
+                "duplicate INV-063 backing-function classification for {function}"
+            );
+        }
+    }
+    assert_eq!(witnesses.len(), 12, "INV-063 backing witness roster drift");
+    assert_eq!(
+        actual, expected,
+        "every production processor function that names backing needs an INV-063 expiry disposition and executable witness"
+    );
+
+    let transitions = include_str!("inv_088_global_summaries_are_not_account_local_proofs.rs");
+    let transition_witness =
+        "v16_program_every_wrapper_engine_transition_callsite_has_summary_disposition_and_witness";
+    let transition_path =
+        "tests/invariants/cu/inv_088_global_summaries_are_not_account_local_proofs.rs";
+    assert!(
+        transition_path.starts_with("tests/invariants/") && transition_path.ends_with(".rs"),
+        "INV-063 transition witness must resolve to an invariant source file: {transition_path}"
+    );
+    assert!(
+        transition_witness.starts_with("v16_"),
+        "INV-063 transition witness must be a reviewed v16 regression"
+    );
+    assert!(
+        inv063_source_defines_test(transitions, transition_witness),
+        "INV-063 lost transition-census witness {transition_path}#{transition_witness}"
+    );
+    crate::assert_certified_engine_pin("INV-063 engine expiry-transition composition");
+}
+
+#[test]
+fn v16_program_retained_recovery_expiry_prerequisite_matrix_avoids_provider_capitalization() {
+    const PRICE: u64 = 1_000_000;
+    const FIRST_MARK: u64 = 952_000;
+    const SECOND_MARK: u64 = 932_000;
+    const ASSET: u16 = 1;
+    const SOURCE_DOMAIN: u16 = ASSET * 2;
+    const INITIAL_CAPITAL: u128 = 1_000_000;
+    const RETAINED_CAPITAL: u128 = 5_000;
+    const BACKING: u128 = 100_000;
+    const EXPIRY_SLOT: u64 = 41;
+
+    let mut params = production_risk_params();
+    params.max_portfolio_assets = 2;
+    params.max_abs_funding_e9_per_slot = 0;
+    let mut env = V16CuEnv::new_with_init_params(params);
+    env.configure_permissionless_resolve_with_cu(100, 5);
+    env.configure_auth_mark_for_asset_as_admin(0, 0, PRICE);
+    env.configure_auth_mark_for_asset_as_admin(ASSET, 0, PRICE);
+
+    let admin = env.admin.insecure_clone();
+    let provider = Keypair::new();
+    env.try_update_per_asset_authority_with_cu(
+        &admin,
+        Some(&provider),
+        ASSET,
+        processor::ASSET_AUTH_BACKING_BUCKET,
+        provider.pubkey().to_bytes(),
+    )
+    .expect("install independent backing provider");
+    let provider_source =
+        env.top_up_backing_bucket_with_authority(&provider, SOURCE_DOMAIN, BACKING, EXPIRY_SLOT);
+    assert_eq!(env.token_amount(provider_source), 0);
+
+    let victim_owner = Keypair::new();
+    let first_peer_owner = Keypair::new();
+    let attacker_owner = Keypair::new();
+    let victim = env.create_portfolio(&victim_owner);
+    let first_peer = env.create_portfolio(&first_peer_owner);
+    let attacker = env.create_portfolio(&attacker_owner);
+    for (owner, portfolio) in [
+        (&victim_owner, victim),
+        (&first_peer_owner, first_peer),
+        (&attacker_owner, attacker),
+    ] {
+        env.deposit(owner, portfolio, INITIAL_CAPITAL);
+    }
+
+    env.trade_asset_with_cu(
+        ASSET,
+        &first_peer_owner,
+        first_peer,
+        &victim_owner,
+        victim,
+        POS_SCALE as i128,
+        PRICE,
+        0,
+    );
+    env.svm.warp_to_slot(20);
+    env.push_auth_mark_for_asset_as_admin(ASSET, 20, FIRST_MARK);
+    env.crank(
+        victim,
+        ProgInstruction::PermissionlessCrank {
+            now_slot: 20,
+            observations: crank_observations(ASSET),
+        },
+    );
+    env.trade_asset_with_cu(
+        ASSET,
+        &first_peer_owner,
+        first_peer,
+        &victim_owner,
+        victim,
+        -(POS_SCALE as i128),
+        FIRST_MARK,
+        0,
+    );
+    let historical_claim =
+        state::portfolio_source_domain(&env.portfolio_state(victim), SOURCE_DOMAIN as usize)
+            .source_claim_bound_num
+            .get();
+    assert_eq!(historical_claim, 48_000 * BOUND_SCALE);
+
+    env.withdraw(&victim_owner, victim, INITIAL_CAPITAL - RETAINED_CAPITAL);
+    env.trade_asset_with_cu(
+        ASSET,
+        &attacker_owner,
+        attacker,
+        &victim_owner,
+        victim,
+        POS_SCALE as i128,
+        FIRST_MARK,
+        0,
+    );
+    env.svm.warp_to_slot(40);
+    env.push_auth_mark_for_asset_as_admin(ASSET, 40, SECOND_MARK);
+    for portfolio in [victim, attacker] {
+        env.crank(
+            portfolio,
+            ProgInstruction::PermissionlessCrank {
+                now_slot: 40,
+                observations: crank_observations(ASSET),
+            },
+        );
+    }
+    env.trade_asset_with_cu(
+        ASSET,
+        &attacker_owner,
+        attacker,
+        &victim_owner,
+        victim,
+        (POS_SCALE / 2) as i128,
+        SECOND_MARK,
+        0,
+    );
+    let source =
+        state::portfolio_source_domain(&env.portfolio_state(victim), SOURCE_DOMAIN as usize);
+    assert!(source.source_claim_bound_num.get() > historical_claim);
+    assert!(source.source_claim_liened_num.get() > historical_claim);
+
+    env.update_asset_lifecycle_as_admin_with_cu(processor::ASSET_ACTION_SHUTDOWN, ASSET, 40, 0);
+    env.forfeit_recovery_leg_with_cu(&attacker_owner, attacker, ASSET, u128::MAX);
+    let before = env.market_state().1;
+    assert_eq!(before.current_slot, 40);
+    assert_eq!(
+        before.source_backing_buckets[SOURCE_DOMAIN as usize].status,
+        BackingBucketStatusV16::Fresh
+    );
+    assert!(
+        before.source_backing_buckets[SOURCE_DOMAIN as usize].valid_liened_backing_num
+            >= historical_claim
+    );
+
+    let retained_forfeit = Transaction::new_signed_with_payer(
+        &[
+            heap_ix(),
+            cu_ix(),
+            Instruction {
+                program_id: env.program_id,
+                accounts: vec![
+                    AccountMeta::new(victim_owner.pubkey(), true),
+                    AccountMeta::new(env.market, false),
+                    AccountMeta::new(victim, false),
+                ],
+                data: ProgInstruction::ForfeitRecoveryLeg {
+                    portfolio_id: env.portfolio_id(victim),
+                    position_epoch: env.portfolio_position_epoch(victim),
+                    asset_index: ASSET,
+                    b_delta_budget: u128::MAX,
+                }
+                .encode(),
+            },
+        ],
+        Some(&env.payer.pubkey()),
+        &[&env.payer, &victim_owner],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.warp_to_slot(EXPIRY_SLOT + 1);
+    env.svm
+        .send_transaction(retained_forfeit)
+        .expect("retained forfeit lands after authenticated backing expiry");
+    let after_forfeit = env.portfolio_state(victim);
+    assert!(!has_active_leg_for_asset(&after_forfeit, ASSET as usize));
+    assert_eq!(after_forfeit.capital.get(), RETAINED_CAPITAL);
+    assert_eq!(after_forfeit.pnl.get(), 68_000);
+    assert!(
+        state::portfolio_source_domain(&after_forfeit, SOURCE_DOMAIN as usize)
+            .source_claim_bound_num
+            .get()
+            >= historical_claim
+    );
+    assert_eq!(
+        env.market_state().1.source_backing_buckets[SOURCE_DOMAIN as usize]
+            .consumed_liened_backing_num
+            / BOUND_SCALE,
+        0
+    );
+}
+
+#[test]
+fn v16_program_post_snapshot_expiry_rejects_stale_trade_then_owner_progresses() {
+    const CAPITAL: u128 = 1_000;
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(2, 10_000, 10_000, 10_000);
+    env.configure_auth_mark_for_asset_as_admin(0, 0, 100);
+    env.configure_auth_mark_for_asset_as_admin(1, 0, 100);
+
+    let victim_owner = Keypair::new();
+    let victim_loser_owner = Keypair::new();
+    let attacker_owner = Keypair::new();
+    let attacker_loser_owner = Keypair::new();
+    let keeper_owner = Keypair::new();
+    let victim = env.create_portfolio(&victim_owner);
+    let victim_loser = env.create_portfolio(&victim_loser_owner);
+    let attacker = env.create_portfolio(&attacker_owner);
+    let attacker_loser = env.create_portfolio(&attacker_loser_owner);
+    let keeper = env.create_portfolio(&keeper_owner);
+    for (owner, portfolio) in [
+        (&victim_owner, victim),
+        (&victim_loser_owner, victim_loser),
+        (&attacker_owner, attacker),
+        (&attacker_loser_owner, attacker_loser),
+    ] {
+        env.deposit(owner, portfolio, CAPITAL);
+    }
+    env.trade_asset_with_cu(
+        0,
+        &victim_owner,
+        victim,
+        &victim_loser_owner,
+        victim_loser,
+        POS_SCALE as i128,
+        100,
+        0,
+    );
+    env.trade_asset_with_cu(
+        1,
+        &attacker_owner,
+        attacker,
+        &attacker_loser_owner,
+        attacker_loser,
+        POS_SCALE as i128,
+        100,
+        0,
+    );
+
+    env.svm.warp_to_slot(2);
+    env.push_auth_mark_for_asset_as_admin(0, 2, 140);
+    env.push_auth_mark_for_asset_as_admin(1, 2, 140);
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::PermissionlessCrank {
+            now_slot: 2,
+            observations: vec![
+                CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                },
+                CrankObservationHint {
+                    asset_index: 1,
+                    oracle_accounts: 0,
+                },
+            ],
+        },
+        vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(keeper, false),
+        ],
+        &[],
+    )
+    .expect("public keeper publishes both marks");
+    for portfolio in [victim_loser, victim] {
+        env.crank(
+            portfolio,
+            ProgInstruction::PermissionlessCrank {
+                now_slot: 2,
+                observations: crank_observations(0),
+            },
+        );
+    }
+    for portfolio in [attacker_loser, attacker] {
+        env.crank(
+            portfolio,
+            ProgInstruction::PermissionlessCrank {
+                now_slot: 2,
+                observations: crank_observations(1),
+            },
+        );
+    }
+    env.trade_asset_with_cu(
+        0,
+        &victim_owner,
+        victim,
+        &victim_loser_owner,
+        victim_loser,
+        -(POS_SCALE as i128),
+        140,
+        0,
+    );
+    assert!(env.portfolio_state(victim).pnl.get() > 0);
+    assert!(env.portfolio_state(attacker).pnl.get() > 0);
+
+    let flat = env.market_state().1;
+    let lapse_slot = flat.source_backing_buckets[3]
+        .expiry_slot
+        .max(flat.source_backing_buckets[1].expiry_slot)
+        .checked_add(1)
+        .unwrap();
+    env.svm.warp_to_slot(lapse_slot);
+    env.push_auth_mark_for_asset_as_admin(1, lapse_slot, 130);
+    env.crank(
+        keeper,
+        ProgInstruction::PermissionlessCrank {
+            now_slot: lapse_slot,
+            observations: crank_observations(1),
+        },
+    );
+    assert_eq!(
+        env.market_state().1.source_backing_buckets[3].status,
+        BackingBucketStatusV16::Fresh
+    );
+    assert!(env.market_state().1.source_backing_buckets[3].expiry_slot < lapse_slot);
+
+    let close_slot = lapse_slot + 1;
+    env.svm.warp_to_slot(close_slot);
+    env.push_auth_mark_for_asset_as_admin(1, close_slot, 140);
+    env.crank(
+        keeper,
+        ProgInstruction::PermissionlessCrank {
+            now_slot: close_slot,
+            observations: crank_observations(1),
+        },
+    );
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let attacker_before = env.svm.get_account(&attacker).unwrap();
+    let loser_before = env.svm.get_account(&attacker_loser).unwrap();
+    let vault_before = env.svm.get_account(&env.vault).unwrap();
+    env.svm.expire_blockhash();
+    let close = env.try_trade_asset_with_cu(
+        1,
+        &attacker_owner,
+        attacker,
+        &attacker_loser_owner,
+        attacker_loser,
+        -(POS_SCALE as i128),
+        140,
+        0,
+    );
+    assert!(
+        close.is_err(),
+        "the PR204 prerequisite unexpectedly progressed"
+    );
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(env.svm.get_account(&attacker).unwrap(), attacker_before);
+    assert_eq!(env.svm.get_account(&attacker_loser).unwrap(), loser_before);
+    assert_eq!(env.svm.get_account(&env.vault).unwrap(), vault_before);
+    assert!(has_active_leg_for_asset(&env.portfolio_state(attacker), 1));
+
+    let exposure_before = active_leg_for_asset(&env.portfolio_state(attacker), 1)
+        .basis_pos_q
+        .unsigned_abs();
+    for (step, label) in [
+        "post-snapshot backing expiry",
+        "post-snapshot account recertification",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let market_before_crank = env.svm.get_account(&env.market).unwrap();
+        let account_before_crank = env.svm.get_account(&attacker).unwrap();
+        env.svm.expire_blockhash();
+        let crank_cu = env
+            .send(
+                ProgInstruction::PermissionlessCrank {
+                    now_slot: close_slot,
+                    observations: vec![],
+                },
+                vec![
+                    AccountMeta::new(env.payer.pubkey(), true),
+                    AccountMeta::new(env.market, false),
+                    AccountMeta::new(attacker, false),
+                ],
+                &[],
+            )
+            .expect("the canonical permissionless path must advance after backing expiry");
+        assert_cu_within(label, crank_cu, CRANK_CU_LIMIT);
+        assert!(
+            env.svm.get_account(&env.market).unwrap() != market_before_crank
+                || env.svm.get_account(&attacker).unwrap() != account_before_crank,
+            "successful expiry continuation {step} must mutate toward the exit"
+        );
+        if step == 0 {
+            assert_eq!(
+                env.market_state().1.source_backing_buckets[3].status,
+                BackingBucketStatusV16::Expired,
+                "the first continuation must normalize the lapsed source bucket"
+            );
+        } else {
+            assert!(
+                health_cert(&env.portfolio_state(attacker)).valid,
+                "the second continuation must recertify the owner after normalization"
+            );
+        }
+    }
+    let exit_cu = env.rebalance_reduce_with_cu(&attacker_owner, attacker, 1, exposure_before);
+    assert_cu_within(
+        "post-expiry owner reduction after stale bilateral close",
+        exit_cu,
+        CUSTODY_CU_LIMIT,
+    );
+    assert!(
+        !has_active_leg_for_asset(&env.portfolio_state(attacker), 1),
+        "the expired backing dependency must not strand the owner's position"
+    );
+}
+
+#[test]
+fn v16_probe_post_expiry_trade_cannot_charge_backing_fee() {
+    const PRICE: u64 = 100;
+    const WINNING_MARK: u64 = 105;
+    const OPEN_Q: i128 = 1_000 * POS_SCALE as i128;
+    const INCREASE_Q: i128 = 50 * POS_SCALE as i128;
+    const WINNING_DOMAIN: usize = 1;
+    const EXPIRY_SLOT: u64 = 2;
+
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(1, 1_000, 5_000, 500);
+    env.configure_auth_mark_for_asset_as_admin(0, 0, PRICE);
+    env.update_backing_fee_policy_with_cu(WINNING_DOMAIN as u16, 5_000, 0);
+    env.top_up_backing_bucket(WINNING_DOMAIN as u16, 100_000, EXPIRY_SLOT);
+
+    let trader_owner = Keypair::new();
+    let counterparty_owner = Keypair::new();
+    let trader = env.create_portfolio(&trader_owner);
+    let counterparty = env.create_portfolio(&counterparty_owner);
+    env.deposit(&trader_owner, trader, 52_501);
+    env.deposit(&counterparty_owner, counterparty, 1_000_000);
+    env.trade_asset_with_cu(
+        0,
+        &trader_owner,
+        trader,
+        &counterparty_owner,
+        counterparty,
+        OPEN_Q,
+        PRICE,
+        0,
+    );
+
+    env.svm.warp_to_slot(1);
+    env.push_auth_mark_for_asset_as_admin(0, 1, WINNING_MARK);
+    for portfolio in [counterparty, trader] {
+        env.crank(
+            portfolio,
+            ProgInstruction::PermissionlessCrank {
+                now_slot: 1,
+                observations: crank_observations(0),
+            },
+        );
+    }
+    assert_eq!(env.portfolio_state(trader).pnl.get(), 5_000);
+    let (_, before) = env.market_state();
+    assert_eq!(before.current_slot, 1);
+    assert_eq!(
+        before.source_backing_buckets[WINNING_DOMAIN].expiry_slot,
+        EXPIRY_SLOT
+    );
+    let trader_capital_before = env.portfolio_state(trader).capital.get();
+    let provider_earnings_before =
+        before.source_backing_buckets[WINNING_DOMAIN].utilization_fee_earnings;
+    let market_account_before = env.svm.get_account(&env.market).unwrap();
+    let trader_account_before = env.svm.get_account(&trader).unwrap();
+    let counterparty_account_before = env.svm.get_account(&counterparty).unwrap();
+
+    env.svm.expire_blockhash();
+    let retained_trade = Transaction::new_signed_with_payer(
+        &[
+            heap_ix(),
+            cu_ix(),
+            Instruction {
+                program_id: env.program_id,
+                accounts: vec![
+                    AccountMeta::new(trader_owner.pubkey(), true),
+                    AccountMeta::new(counterparty_owner.pubkey(), true),
+                    AccountMeta::new(env.market, false),
+                    AccountMeta::new(trader, false),
+                    AccountMeta::new(counterparty, false),
+                ],
+                data: env
+                    .trade_no_cpi_ix(trader, counterparty, 0, INCREASE_Q, WINNING_MARK, 0)
+                    .encode(),
+            },
+        ],
+        Some(&env.payer.pubkey()),
+        &[&env.payer, &trader_owner, &counterparty_owner],
+        env.svm.latest_blockhash(),
+    );
+
+    env.svm.warp_to_slot(EXPIRY_SLOT + 1);
+    let trade = env.svm.send_transaction(retained_trade);
+
+    let trader_after = env.portfolio_state(trader);
+    let (_, after) = env.market_state();
+    let provider_earnings_after =
+        after.source_backing_buckets[WINNING_DOMAIN].utilization_fee_earnings;
+    let charged = provider_earnings_after - provider_earnings_before;
+    let mut extracted = 0;
+    if charged != 0 {
+        let ledger = env.backing_domain_ledger_account();
+        let provider_dest = env.token_account(env.admin.pubkey(), 0);
+        env.withdraw_backing_bucket_earnings_to_admin_token_with_cu(
+            ledger,
+            provider_dest,
+            WINNING_DOMAIN as u16,
+            charged,
+        );
+        extracted = env.token_amount(provider_dest);
+    }
+    assert!(
+        trade.is_err(),
+        "retained post-expiry trade charged {charged} backing-fee atoms, extracted {extracted} real SPL atoms, and reduced trader capital {} -> {} while authenticated slot {} exceeded expiry {} and engine slot stayed {}",
+        trader_capital_before,
+        trader_after.capital.get(),
+        EXPIRY_SLOT + 1,
+        EXPIRY_SLOT,
+        after.current_slot,
+    );
+    assert_eq!(extracted, 0, "expired support may not earn a trade fee");
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_account_before,
+        "the rejected stale trade must roll back the market"
+    );
+    assert_eq!(
+        env.svm.get_account(&trader).unwrap(),
+        trader_account_before,
+        "the rejected stale trade must roll back the trader"
+    );
+    assert_eq!(
+        env.svm.get_account(&counterparty).unwrap(),
+        counterparty_account_before,
+        "the rejected stale trade must roll back the counterparty"
+    );
+
+    env.trade_asset_with_cu(
+        0,
+        &trader_owner,
+        trader,
+        &counterparty_owner,
+        counterparty,
+        -INCREASE_Q,
+        WINNING_MARK,
+        0,
+    );
+}
+
+#[test]
+fn v16_attack_lapsed_live_source_backing_expires_bounded_and_owner_can_reduce() {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(1, 1_000, 1_000, 500);
+    env.configure_permissionless_resolve_with_cu(10_000, 1);
+    env.configure_auth_mark_with_cu(0, 100);
+    let long_owner = Keypair::new();
+    let long = env.create_portfolio(&long_owner);
+    let short_owner = Keypair::new();
+    let short = env.create_portfolio(&short_owner);
+    let keeper_owner = Keypair::new();
+    let keeper = env.create_portfolio(&keeper_owner);
+    env.deposit(&long_owner, long, 40);
+    env.deposit(&short_owner, short, 410);
+    env.trade_asset_with_cu(
+        0,
+        &long_owner,
+        long,
+        &short_owner,
+        short,
+        (2 * POS_SCALE) as i128,
+        100,
+        0,
+    );
+
+    for slot in 2..=30 {
+        env.svm.warp_to_slot(slot);
+        env.push_auth_mark_with_cu(slot, 300);
+        env.crank(
+            keeper,
+            ProgInstruction::PermissionlessCrank {
+                now_slot: slot,
+                observations: crank_observations(0),
+            },
+        );
+    }
+    for portfolio in [short, long, short] {
+        env.crank(
+            portfolio,
+            ProgInstruction::PermissionlessCrank {
+                now_slot: 30,
+                observations: crank_observations(0),
+            },
+        );
+    }
+    let after_adl = env.market_state().1;
+    let long_leg = active_leg_for_asset(&env.portfolio_state(long), 0);
+    let short_leg = active_leg_for_asset(&env.portfolio_state(short), 0);
+    assert_eq!(after_adl.assets[0].b_long_num, 0);
+    assert_eq!(after_adl.assets[0].b_short_num, 0);
+    assert!(!long_leg.b_stale && !short_leg.b_stale);
+    let generated_backing = after_adl.source_backing_buckets[1];
+    assert_eq!(generated_backing.status, BackingBucketStatusV16::Fresh);
+    assert!(generated_backing.fresh_unliened_backing_num > 0);
+
+    for slot in 31..=160 {
+        env.svm.warp_to_slot(slot);
+        env.push_auth_mark_with_cu(slot, 300);
+        env.crank(
+            keeper,
+            ProgInstruction::PermissionlessCrank {
+                now_slot: slot,
+                observations: crank_observations(0),
+            },
+        );
+    }
+    let before_expiry = env.market_state().1;
+    let lapsed = before_expiry.source_backing_buckets[1];
+    assert_eq!(lapsed.status, BackingBucketStatusV16::Fresh);
+    assert!(lapsed.expiry_slot < 160);
+    assert!(env.portfolio_state(long).pnl.get() > 0);
+    let vault_before = before_expiry.vault;
+    let vault_tokens_before = env.token_amount(env.vault);
+
+    env.svm.expire_blockhash();
+    let expiry_cu = env
+        .send(
+            ProgInstruction::PermissionlessCrank {
+                now_slot: 160,
+                observations: vec![],
+            },
+            vec![
+                AccountMeta::new(env.payer.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(long, false),
+            ],
+            &[],
+        )
+        .expect("permissionless refresh must commit one lapsed-backing expiry step");
+    assert_cu_within("lapsed source-backing expiry", expiry_cu, CRANK_CU_LIMIT);
+
+    let after_expiry = env.market_state().1;
+    let expired = after_expiry.source_backing_buckets[1];
+    assert_eq!(expired.status, BackingBucketStatusV16::Expired);
+    assert_eq!(expired.fresh_unliened_backing_num, 0);
+    assert_ne!(
+        health_cert(&env.portfolio_state(long)).cert_risk_epoch,
+        after_expiry.risk_epoch,
+        "expiry advances risk state and leaves one bounded certification step"
+    );
+    assert_eq!(after_expiry.vault, vault_before);
+    assert_eq!(env.token_amount(env.vault), vault_tokens_before);
+
+    env.svm.expire_blockhash();
+    let certify_cu = env
+        .send(
+            ProgInstruction::PermissionlessCrank {
+                now_slot: 160,
+                observations: vec![],
+            },
+            vec![
+                AccountMeta::new(env.payer.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(long, false),
+            ],
+            &[],
+        )
+        .expect("the next bounded auto-crank must certify after expiry");
+    assert_cu_within(
+        "post-expiry account certification",
+        certify_cu,
+        CRANK_CU_LIMIT,
+    );
+    assert!(health_cert(&env.portfolio_state(long)).valid);
+
+    let position_before = active_leg_for_asset(&env.portfolio_state(long), 0)
+        .basis_pos_q
+        .unsigned_abs();
+    let exit_cu = env.rebalance_reduce_with_cu(&long_owner, long, 0, POS_SCALE / 4);
+    assert_cu_within("post-expiry owner reduction", exit_cu, CUSTODY_CU_LIMIT);
+    assert_eq!(
+        active_leg_for_asset(&env.portfolio_state(long), 0)
+            .basis_pos_q
+            .unsigned_abs(),
+        position_before - POS_SCALE / 4
+    );
+    let done = env.market_state().1;
+    assert_eq!(done.vault, vault_before);
+    assert_eq!(done.vault as u64, env.token_amount(env.vault));
+}
+
+// security.md sweep — backing-bucket expiry (#33): a winner's positive pnl backed by a backing bucket
+// with an expiry. After the expiry passes, the payout must still be CONSERVING — the winner is paid at
+// most the (still-available) backing, never more, and the system never over-pays expired backing.
+// (Engine e833b7f / commit 6433346 "Expire lapsed backing at resolved close" makes the realize step
+// expire past-expiry backing instead of stranding the winner with Stale — see the prior finding.)
+#[test]
+fn v16_attack_backing_expiry_no_overpay() {
+    let mut env = V16CuEnv::new();
+    let ledger = env.backing_domain_ledger_account();
+    env.top_up_backing_bucket_with_ledger_with_cu(ledger, 1, 40, 5); // backing expires at slot 5
+    let owner = Keypair::new();
+    let p = env.create_portfolio(&owner);
+    env.deposit(&owner, p, 1_000);
+    env.add_source_positive_pnl(p, 1, 40);
+    // advance PAST the backing expiry.
+    env.svm.warp_to_slot(20);
+    let _ = env.send_crank_if_actionable(
+        ProgInstruction::PermissionlessCrank {
+            now_slot: 20,
+            observations: crank_observations(0),
+        },
+        vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(p, false),
+        ],
+        &[],
+    );
+    let vault_before = env.market_state().1.vault;
+    env.resolve();
+    // two close passes to converge.
+    let mut out = 0u128;
+    for _ in 0..2 {
+        let d = env.close_resolved(&owner, p);
+        out += env.token_amount(d) as u128;
+    }
+    let (_, g) = env.market_state();
+    // winner gets at least its senior capital (1000) and at most capital + backing (1040) -- no over-pay.
+    assert!(out >= 1_000, "winner recovers at least its senior capital");
+    assert!(
+        out <= 1_040,
+        "winner paid at most capital + backing (no over-pay against expired backing): out={}",
+        out
+    );
+    assert!(g.vault <= vault_before, "vault not over-credited");
+    assert!(g.vault >= g.c_tot + g.insurance, "senior conservation");
+    assert_eq!(
+        g.vault as u64,
+        env.token_amount(env.vault),
+        "accounting == real vault"
+    );
+}
+
+#[test]
+fn v16_program_retire_normalizes_unreferenced_lapsed_backing() {
+    const ASSET: u16 = 1;
+    const DOMAIN: u16 = ASSET * 2;
+    const BACKING: u128 = 700;
+    const EXPIRY_SLOT: u64 = 5;
+
+    let mut env = V16CuEnv::new();
+    env.activate_asset(ASSET, 1, 100);
+    env.top_up_backing_bucket(DOMAIN, BACKING, EXPIRY_SLOT);
+    let admin = env.admin.insecure_clone();
+    let market_id = env.asset_market_id(ASSET);
+    let retire = |env: &mut V16CuEnv, now_slot: u64| {
+        env.svm.warp_to_slot(now_slot);
+        env.svm.expire_blockhash();
+        env.send(
+            ProgInstruction::UpdateAssetLifecycle {
+                action: processor::ASSET_ACTION_RETIRE,
+                asset_index: ASSET,
+                market_id,
+                authority_epoch: 0,
+                now_slot,
+                initial_price: 0,
+                max_init_fee: u128::MAX,
+                insurance_authority: admin.pubkey().to_bytes(),
+                insurance_operator: admin.pubkey().to_bytes(),
+                backing_bucket_authority: admin.pubkey().to_bytes(),
+                oracle_authority: admin.pubkey().to_bytes(),
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+            &[&admin],
+        )
+    };
+
+    let funded = env.market_state().1;
+    assert_eq!(
+        funded.source_backing_buckets[DOMAIN as usize].status,
+        BackingBucketStatusV16::Fresh
+    );
+    assert_eq!(
+        funded.source_backing_buckets[DOMAIN as usize].fresh_unliened_backing_num,
+        BACKING * BOUND_SCALE
+    );
+    assert_eq!(
+        funded.source_credit[DOMAIN as usize].fresh_reserved_backing_num,
+        BACKING * BOUND_SCALE
+    );
+    let vault_tokens = env.token_amount(env.vault);
+    let accounting_vault = funded.vault;
+
+    let before_fresh_retire = env.svm.get_account(&env.market).unwrap();
+    retire(&mut env, EXPIRY_SLOT - 1)
+        .expect_err("fresh provider principal must block asset retirement");
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        before_fresh_retire,
+        "pre-expiry retirement must roll back exactly"
+    );
+    assert_eq!(env.token_amount(env.vault), vault_tokens);
+
+    let retire_cu = retire(&mut env, EXPIRY_SLOT)
+        .expect("retirement must normalize an unreferenced lapsed bucket in bounded work");
+    assert_cu_within(
+        "lapsed-backing retirement normalization",
+        retire_cu,
+        CUSTODY_CU_LIMIT,
+    );
+    let retired = env.market_state().1;
+    assert_eq!(
+        retired.assets[ASSET as usize].lifecycle,
+        AssetLifecycleV16::Retired
+    );
+    assert_eq!(
+        retired.source_backing_buckets[DOMAIN as usize].status,
+        BackingBucketStatusV16::Empty
+    );
+    assert_eq!(
+        retired.source_backing_buckets[DOMAIN as usize].expiry_slot,
+        0
+    );
+    assert_eq!(
+        retired.source_backing_buckets[DOMAIN as usize].fresh_unliened_backing_num,
+        0
+    );
+    assert_eq!(
+        retired.source_credit[DOMAIN as usize].fresh_reserved_backing_num,
+        0
+    );
+    assert_eq!(retired.vault, accounting_vault);
+    assert_eq!(env.token_amount(env.vault), vault_tokens);
+}
+
+// INV-063 / INV-069: the existing consumer matrices cover expiry-1/equal/+1, and
+// v16_program_retire_normalizes_unreferenced_lapsed_backing covers one funded domain.
+// This is the mixed-maturity boundary: retirement must roll back normalization of
+// an expired domain while its funded sibling remains fresh, then normalize BOTH
+// still-Fresh stored tags once both deadlines pass. Reverse which side expires
+// first and finish at the later deadline or one slot late. Unlike INV-069's
+// insurance/backing drain lattice, no provider withdrawal clears either blocker.
+// All state comes from public instructions and valid initial accounts; only Clock
+// advances between retirement attempts. Exact rollback, an unrelated funded asset
+// and senior portfolio frame, and unchanged SPL custody distinguish normalization
+// from erasing a live obligation. This does not cover liens, claims, implicit
+// refill normalization, Recovery, or permissionless terminal scans.
+#[test]
+fn v16_program_retire_staggered_backing_expiry_is_atomic_across_siblings() {
+    const ASSET: u16 = 1;
+    const DOMAINS: [u16; 2] = [ASSET * 2, ASSET * 2 + 1];
+    const BACKING: [u128; 2] = [700, 311];
+    const EARLY_EXPIRY: u64 = 5;
+    const LATE_EXPIRY: u64 = 9;
+    const OTHER_BACKING: u128 = 113;
+    const SENIOR_CAPITAL: u128 = 101;
+
+    for early_side in 0..2 {
+        for finish_late in [false, true] {
+            let mut env = V16CuEnv::new();
+            env.activate_asset(ASSET, 1, 100);
+            let admin = env.admin.insecure_clone();
+            let owner = Keypair::new();
+            let portfolio = env.create_portfolio(&owner);
+            let deposit_source = env.deposit(&owner, portfolio, SENIOR_CAPITAL);
+            let other_source = env.top_up_backing_bucket(0, OTHER_BACKING, 100);
+            let expiries = std::array::from_fn::<_, 2, _>(|side| {
+                if side == early_side {
+                    EARLY_EXPIRY
+                } else {
+                    LATE_EXPIRY
+                }
+            });
+            let sources = std::array::from_fn::<_, 2, _>(|side| {
+                env.top_up_backing_bucket(DOMAINS[side], BACKING[side], expiries[side])
+            });
+            let (config_before, funded) = env.market_state();
+            let market_id = funded.assets[ASSET as usize].market_id;
+            let authority_epoch = env.control_sequences(0).authority_epoch;
+            let retire = |env: &mut V16CuEnv, now_slot: u64| {
+                env.svm.expire_blockhash();
+                env.send(
+                    ProgInstruction::UpdateAssetLifecycle {
+                        action: processor::ASSET_ACTION_RETIRE,
+                        asset_index: ASSET,
+                        market_id,
+                        authority_epoch,
+                        now_slot,
+                        initial_price: 0,
+                        max_init_fee: u128::MAX,
+                        insurance_authority: admin.pubkey().to_bytes(),
+                        insurance_operator: admin.pubkey().to_bytes(),
+                        backing_bucket_authority: admin.pubkey().to_bytes(),
+                        oracle_authority: admin.pubkey().to_bytes(),
+                    },
+                    vec![
+                        AccountMeta::new(admin.pubkey(), true),
+                        AccountMeta::new(env.market, false),
+                    ],
+                    &[&admin],
+                )
+            };
+            let custody = SENIOR_CAPITAL + OTHER_BACKING + BACKING.iter().sum::<u128>();
+            assert_eq!(funded.vault, custody);
+            assert_eq!(u128::from(env.token_amount(env.vault)), custody);
+            for side in 0..2 {
+                let domain = DOMAINS[side] as usize;
+                assert_eq!(env.token_amount(sources[side]), 0);
+                assert_eq!(
+                    funded.source_backing_buckets[domain].status,
+                    BackingBucketStatusV16::Fresh
+                );
+                assert_eq!(
+                    funded.source_backing_buckets[domain].expiry_slot,
+                    expiries[side]
+                );
+                assert_eq!(
+                    funded.source_backing_buckets[domain].fresh_unliened_backing_num,
+                    BACKING[side] * BOUND_SCALE
+                );
+                assert_eq!(
+                    funded.source_credit[domain].fresh_reserved_backing_num,
+                    BACKING[side] * BOUND_SCALE
+                );
+                assert_eq!(funded.source_credit[domain].positive_claim_bound_num, 0);
+                assert_eq!(funded.source_credit[domain].valid_liened_backing_num, 0);
+            }
+
+            let market_before = env.svm.get_account(&env.market).unwrap();
+            let framed_keys = [
+                env.vault,
+                env.mint,
+                admin.pubkey(),
+                owner.pubkey(),
+                portfolio,
+                deposit_source,
+                other_source,
+                sources[0],
+                sources[1],
+            ];
+            let frame = |env: &V16CuEnv| {
+                framed_keys.map(|key| env.svm.get_account(&key).expect("framed account"))
+            };
+            let frame_before = frame(&env);
+            let other_slot_start = percolator_prog::constants::MARKET_GROUP_OFF
+                + core::mem::size_of::<percolator::MarketGroupV16HeaderAccount>();
+            let other_slot_end = other_slot_start
+                + core::mem::size_of::<percolator::Market<state::AssetOracleStorageV16>>();
+
+            for now_slot in [
+                EARLY_EXPIRY - 1,
+                EARLY_EXPIRY,
+                EARLY_EXPIRY + 1,
+                LATE_EXPIRY - 1,
+            ] {
+                env.svm.warp_to_slot(now_slot);
+                assert_eq!(env.svm.get_sysvar::<Clock>().slot, now_slot);
+                assert_eq!(
+                    env.svm.get_account(&env.market).unwrap(),
+                    market_before,
+                    "Clock alone must leave both funded stored tags Fresh"
+                );
+                assert!(now_slot < expiries[1 - early_side]);
+                let error = retire(&mut env, now_slot)
+                    .expect_err("an unexpired funded sibling must still block retirement");
+                assert!(
+                    error.contains("Custom(21)"),
+                    "expected EngineLockActive, side={early_side} slot={now_slot}: {error}"
+                );
+                assert_eq!(
+                    env.svm.get_account(&env.market).unwrap(),
+                    market_before,
+                    "side={early_side} slot={now_slot}: roll back both normalization and retirement"
+                );
+                assert_eq!(frame(&env), frame_before);
+            }
+
+            let now_slot = LATE_EXPIRY + u64::from(finish_late);
+            env.svm.warp_to_slot(now_slot);
+            assert_eq!(env.svm.get_sysvar::<Clock>().slot, now_slot);
+            assert!(expiries.iter().all(|expiry| *expiry <= now_slot));
+            assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+            let cu = retire(&mut env, now_slot)
+                .expect("both lapsed Fresh buckets must normalize in one retirement instruction");
+            assert_cu_within("paired lapsed-backing retirement", cu, CUSTODY_CU_LIMIT);
+
+            let (config_after, retired) = env.market_state();
+            assert_eq!(
+                retired.assets[ASSET as usize].lifecycle,
+                AssetLifecycleV16::Retired
+            );
+            assert_eq!(retired.assets[ASSET as usize].market_id, market_id);
+            assert_eq!(retired.assets[ASSET as usize].retired_slot, now_slot);
+            assert_eq!(
+                config_after.free_market_slot_count,
+                config_before.free_market_slot_count + 1
+            );
+            for domain in DOMAINS {
+                assert_eq!(
+                    retired.source_backing_buckets[domain as usize],
+                    percolator::BackingBucketV16 {
+                        market_id,
+                        ..percolator::BackingBucketV16::EMPTY
+                    }
+                );
+                assert_eq!(
+                    retired.source_credit[domain as usize],
+                    percolator::SourceCreditStateV16::EMPTY
+                );
+            }
+            assert_eq!(
+                retired
+                    .source_credit
+                    .iter()
+                    .map(|source| source.fresh_reserved_backing_num)
+                    .sum::<u128>(),
+                OTHER_BACKING * BOUND_SCALE,
+                "only the unrelated, unexpired principal remains available as backing"
+            );
+            assert_eq!(retired.c_tot, SENIOR_CAPITAL);
+            assert_eq!(retired.insurance, 0);
+            assert_eq!(retired.vault, custody);
+            assert_eq!(frame(&env), frame_before);
+            let market_after = env.svm.get_account(&env.market).unwrap();
+            assert_eq!(market_after.lamports, market_before.lamports);
+            assert_eq!(
+                &market_after.data[other_slot_start..other_slot_end],
+                &market_before.data[other_slot_start..other_slot_end],
+                "retirement must frame the unrelated funded asset's complete stored slot"
+            );
+            eprintln!(
+                "INV-063 staggered retirement: early_side={early_side} slot={now_slot}, \
+                 4 exact rollbacks, 2 normalized buckets, unchanged custody={custody}, {cu} CU"
+            );
+        }
+    }
+}

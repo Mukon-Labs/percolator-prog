@@ -1,0 +1,1823 @@
+//! INV-056 - hints are discovery only; favorable actions fully refresh.
+//! Secondary coverage: INV-020 authenticated oracle provenance.
+//!
+//! Normative obligation: a user-favorable route must not trust a caller-provided
+//! subset of work or omit an active stale liability. Before authorizing a
+//! favorable new position, it must fully discover the bounded active portfolio
+//! state or use a proven-equivalent exact certificate.
+//!
+//! Evidence in this file (I/C plus invariant-specific route assertions): a source-complete caller
+//! input roster guard proves only PermissionlessCrank exposes discovery hints. A second gate
+//! classifies all 49 canonical public instructions and requires executable public witnesses for
+//! every current-certificate/full-refresh route, flat-only value exit, immutable terminal payout,
+//! refreshing cure, and stale-safe risk reduction; a new instruction cannot silently inherit a
+//! favorable-action exemption. Matched forward and
+//! reverse two-asset Pyth hint/account-tail orders normalize identically; mismatched tails reject
+//! with exact rollback and a live canonical retry. A separate liquidation trace proves a caller
+//! cannot omit a current-slot external rescue report or replay a prior-slot adverse report; the
+//! authenticated rescue preserves the victim's full position. BatchTradeNoCpi and BatchTradeCpi
+//! open a new
+//! asset-0 leg for an account that already has a stale active asset-1 leg, and must discover and
+//! refresh that stale leg before admitting the new favorable leg. Pending-close and Recovery
+//! selector traces prove hostile hints roll back before an honest retry progresses; once Resolved,
+//! duplicate hints are economically inert and produce the same payout as an empty-hint close.
+//! A public two-atom bankruptcy/forfeit trace proves B settlement budgets are collateral atoms,
+//! not B-index ticks: one owner step exposes the SettleB selector, duplicate external hints roll
+//! back, and one authenticated-tail crank consumes the remaining atom at bounded CU. INV-077
+//! composes a three-feed tail with selected max-shape liquidation after exact duplicate/order
+//! rollback.
+//! INV-053 owns the single-leg TradeNoCpi/TradeCpi variants and every single-omitted max-shape
+//! refresh case.
+//! A mixed AuthMark/Pyth history compares full, empty-hint, and trade-time refresh through
+//! both no-CPI trade transports at a one-atom margin boundary. Independent stock arithmetic,
+//! exact account equality, and rejection frames bind the observations to favorable admission.
+
+use super::*;
+
+#[path = "inv_056_observation_membership.rs"]
+mod observation_membership;
+
+#[test]
+fn v16_program_discovery_hint_surface_is_permissionless_crank_only() {
+    const CALLER_INPUT_ROSTER: &str = include_str!("../inv_023_caller_input_roster.tsv");
+    let mut hint_fields = std::collections::BTreeSet::new();
+
+    for line in CALLER_INPUT_ROSTER.lines() {
+        if line.is_empty() || line.starts_with('#') || line.starts_with("type\t") {
+            continue;
+        }
+        let columns: Vec<_> = line.split('\t').collect();
+        assert_eq!(
+            columns.len(),
+            4,
+            "malformed caller-input roster row: {line}"
+        );
+        if columns[2] == "DISCOVERY_HINT" {
+            for field in columns[1].split(',') {
+                assert!(
+                    hint_fields.insert((columns[0].to_owned(), field.to_owned())),
+                    "duplicate discovery-hint field {}.{field}",
+                    columns[0]
+                );
+            }
+        }
+    }
+
+    let expected = [
+        ("CrankObservationHint".to_owned(), "asset_index".to_owned()),
+        (
+            "CrankObservationHint".to_owned(),
+            "oracle_accounts".to_owned(),
+        ),
+        ("PermissionlessCrank".to_owned(), "observations".to_owned()),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        hint_fields, expected,
+        "a new caller-controlled discovery hint requires an INV-056 public omission/order matrix"
+    );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Inv056PublicRouteDisposition {
+    DiscoveryHint,
+    CurrentCertificateOrFullRefresh,
+    FlatOnlyValueExit,
+    ImmutableTerminalPayout,
+    RefreshingCure,
+    StaleSafeRiskReduction,
+    InboundValueOnly,
+    ScopedNonPortfolioValue,
+    ControlOrBookkeeping,
+}
+
+#[derive(Clone, Copy)]
+struct Inv056RouteEvidence {
+    disposition: Inv056PublicRouteDisposition,
+    witness_path: Option<&'static str>,
+    witness_test: Option<&'static str>,
+}
+
+fn inv056_evidence(
+    disposition: Inv056PublicRouteDisposition,
+    witness: Option<(&'static str, &'static str)>,
+) -> Inv056RouteEvidence {
+    Inv056RouteEvidence {
+        disposition,
+        witness_path: witness.map(|(path, _)| path),
+        witness_test: witness.map(|(_, test)| test),
+    }
+}
+
+fn inv056_public_route_evidence(variant: &str) -> Option<Inv056RouteEvidence> {
+    use Inv056PublicRouteDisposition::*;
+
+    let evidence = match variant {
+        "PermissionlessCrank" => inv056_evidence(
+            DiscoveryHint,
+            Some((
+                "tests/invariants/cu/inv_056_hints_are_discovery_only_favorable_actions_fully_refresh.rs",
+                "v16_program_external_oracle_hint_and_account_order_is_normalized_or_atomic",
+            )),
+        ),
+        "TradeNoCpi" => inv056_evidence(
+            CurrentCertificateOrFullRefresh,
+            Some((
+                "tests/invariants/cu/inv_053_full_health_recertification_equivalence.rs",
+                "v16_bpf_trade_refreshes_stale_related_portfolio_leg_on_demand",
+            )),
+        ),
+        "TradeCpi" => inv056_evidence(
+            CurrentCertificateOrFullRefresh,
+            Some((
+                "tests/invariants/cu/inv_053_full_health_recertification_equivalence.rs",
+                "v16_bpf_tradecpi_refreshes_stale_traded_portfolio_leg_on_demand",
+            )),
+        ),
+        "BatchTradeNoCpi" | "BatchTradeCpi" => inv056_evidence(
+            CurrentCertificateOrFullRefresh,
+            Some((
+                "tests/invariants/cu/inv_056_hints_are_discovery_only_favorable_actions_fully_refresh.rs",
+                "v16_program_batch_routes_refresh_stale_related_legs_before_favorable_trade",
+            )),
+        ),
+        "ConvertReleasedPnl" => inv056_evidence(
+            CurrentCertificateOrFullRefresh,
+            Some((
+                "tests/invariants/cu/inv_054_certificate_epoch_completeness.rs",
+                "v16_attack_convert_released_pnl_requires_current_cert_and_public_refresh",
+            )),
+        ),
+        "Withdraw" => inv056_evidence(
+            FlatOnlyValueExit,
+            Some((
+                "tests/invariants/cu/inv_055_state_indexed_admission.rs",
+                "v16_attack_withdraw_requires_flat_regardless_of_size",
+            )),
+        ),
+        "CloseResolved" | "ClaimResolvedPayoutTopup" => inv056_evidence(
+            ImmutableTerminalPayout,
+            Some((
+                "tests/invariants/cu/inv_068_receipt_uniqueness_and_monotonic_topups.rs",
+                "v16_program_resolved_receipt_replays_extract_no_value_on_any_public_rail",
+            )),
+        ),
+        "CureAndCancelClose" => inv056_evidence(
+            RefreshingCure,
+            Some((
+                "tests/invariants/stateful/inv_037_exact_residual_partition.rs",
+                "inv037_public_cure_preserves_exact_partition_across_routes_and_sides",
+            )),
+        ),
+        "RebalanceReduce" => inv056_evidence(
+            StaleSafeRiskReduction,
+            Some((
+                "tests/invariants/cu/inv_057_risk_reduction_availability.rs",
+                "v16_attack_non_base_local_stale_owner_reduce_remains_live",
+            )),
+        ),
+        "ForfeitRecoveryLeg" => inv056_evidence(
+            StaleSafeRiskReduction,
+            Some((
+                "tests/invariants/stateful/inv_081_success_state_validity_over_complete_public_routes.rs",
+                "v16_program_owner_recovery_forfeit_strictly_reduces_each_position_episode",
+            )),
+        ),
+        "ForceCloseAbandonedAsset" => inv056_evidence(
+            StaleSafeRiskReduction,
+            Some((
+                "tests/invariants/cu/inv_078_permissionless_recovery_coverage.rs",
+                "v16_attack_locally_stale_permissionless_asset_can_shutdown_and_force_close",
+            )),
+        ),
+        "Deposit" | "TopUpInsurance" | "TopUpBackingBucket" | "TopUpInsuranceDomain" => {
+            inv056_evidence(InboundValueOnly, None)
+        }
+        "WithdrawBackingBucket"
+        | "WithdrawBackingBucketEarnings"
+        | "WithdrawInsuranceAsset"
+        | "SwapSecondaryForPrimary" => inv056_evidence(ScopedNonPortfolioValue, None),
+        "InitMarket"
+        | "InitPortfolio"
+        | "ClosePortfolio"
+        | "CloseSlab"
+        | "ResolveMarket"
+        | "UpdateAuthority"
+        | "ConfigureHybridOracle"
+        | "ConfigureEwmaMark"
+        | "PushEwmaMark"
+        | "UpdateLiquidationFeePolicy"
+        | "ConfigurePermissionlessResolve"
+        | "ResolveStalePermissionless"
+        | "UpdateAssetLifecycle"
+        | "FinalizeResetSide"
+        | "SyncMaintenanceFee"
+        | "UpdateMaintenanceFeePolicy"
+        | "UpdateBackingFeePolicy"
+        | "SyncBackingDomainLedger"
+        | "SyncInsuranceLedger"
+        | "UpdateTradeFeePolicy"
+        | "UpdateFeeRedirectPolicy"
+        | "UpdateMarketInitFeePolicy"
+        | "UpdateBaseUnitMints"
+        | "ConfigureAuthMark"
+        | "PushAuthMark"
+        | "UpdateAssetAuthority"
+        | "SetMatcherConfig"
+        | "RestartAssetOracle" => inv056_evidence(ControlOrBookkeeping, None),
+        _ => return None,
+    };
+    Some(evidence)
+}
+
+fn inv056_source_defines_test(source: &str, function: &str) -> bool {
+    let expected = format!("fn {function}");
+    let mut test_attribute = false;
+    for line in source.lines() {
+        let line = line.trim();
+        if line == "#[test]" {
+            test_attribute = true;
+        } else if line.starts_with("fn ") {
+            if test_attribute
+                && line
+                    .strip_prefix(&expected)
+                    .is_some_and(|tail| tail.trim_start().starts_with('('))
+            {
+                return true;
+            }
+            test_attribute = false;
+        } else if test_attribute && !line.is_empty() && !line.starts_with('#') {
+            test_attribute = false;
+        }
+    }
+    false
+}
+
+#[test]
+fn v16_program_no_hint_favorable_route_roster_is_source_complete() {
+    const REGISTRY: &str = include_str!("../public_instruction_coverage.tsv");
+    use Inv056PublicRouteDisposition::*;
+
+    let mut variants = std::collections::BTreeSet::new();
+    let mut dispositions = std::collections::BTreeMap::<_, usize>::new();
+    let mut witnessed = 0usize;
+
+    for line in REGISTRY.lines() {
+        if line.is_empty() || line.starts_with('#') || line.starts_with("tag\t") {
+            continue;
+        }
+        let columns = line.split('\t').collect::<Vec<_>>();
+        assert_eq!(columns.len(), 5, "malformed public-route row: {line}");
+        let variant = columns[1];
+        assert!(
+            variants.insert(variant),
+            "duplicate public variant {variant}"
+        );
+        let evidence = inv056_public_route_evidence(variant).unwrap_or_else(|| {
+            panic!(
+                "public instruction {variant} lacks an INV-056 stale-state/favorable-route disposition"
+            )
+        });
+        *dispositions.entry(evidence.disposition).or_default() += 1;
+
+        match (evidence.witness_path, evidence.witness_test) {
+            (Some(path), Some(test)) => {
+                assert!(
+                    path.starts_with("tests/invariants/") && path.ends_with(".rs"),
+                    "{variant} INV-056 witness must resolve to an invariant source file: {path}"
+                );
+                assert!(
+                    test.starts_with("v16_") || test.starts_with("inv037_"),
+                    "{variant} INV-056 witness must be a reviewed v16 regression: {path}#{test}"
+                );
+                let source = std::fs::read_to_string(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path),
+                )
+                .unwrap_or_else(|error| panic!("read INV-056 witness {path}: {error}"));
+                assert!(
+                    inv056_source_defines_test(&source, test),
+                    "{variant} points to missing executable witness {path}#{test}"
+                );
+                witnessed += 1;
+            }
+            (None, None) => assert!(
+                matches!(
+                    evidence.disposition,
+                    InboundValueOnly | ScopedNonPortfolioValue | ControlOrBookkeeping
+                ),
+                "{variant} has a security-relevant disposition without executable evidence"
+            ),
+            _ => panic!("{variant} has an incomplete INV-056 witness"),
+        }
+    }
+
+    assert_eq!(
+        variants.len(),
+        49,
+        "the canonical public route count changed"
+    );
+    assert_eq!(dispositions.get(&DiscoveryHint), Some(&1));
+    assert_eq!(dispositions.get(&CurrentCertificateOrFullRefresh), Some(&5));
+    assert_eq!(dispositions.get(&FlatOnlyValueExit), Some(&1));
+    assert_eq!(dispositions.get(&ImmutableTerminalPayout), Some(&2));
+    assert_eq!(dispositions.get(&RefreshingCure), Some(&1));
+    assert_eq!(dispositions.get(&StaleSafeRiskReduction), Some(&3));
+    assert_eq!(witnessed, 13);
+}
+
+const INV056_EXTERNAL_SLOT: u64 = 2;
+const INV056_EXTERNAL_TIME: i64 = 101;
+const INV056_EXTERNAL_FEEDS: [[u8; 32]; 2] = [[0x56; 32], [0x57; 32]];
+const INV056_EXTERNAL_PRICES: [u64; 2] = [1_100_000, 900_000];
+
+#[derive(Debug, PartialEq, Eq)]
+struct Inv056ExternalOrderSnapshot {
+    current_slot: u64,
+    oracle_epoch: u64,
+    funding_epoch: u64,
+    effective_prices: [u64; 2],
+    raw_targets: [u64; 2],
+    asset_slots: [u64; 2],
+    profile_prices: [u64; 2],
+    profile_publish_times: [i64; 2],
+    vault: u128,
+    c_tot: u128,
+    insurance: u128,
+}
+
+fn inv056_external_oracle_world() -> (V16CuEnv, Pubkey, [Pubkey; 2]) {
+    const INITIAL_SLOT: u64 = 1;
+    const INITIAL_TIME: i64 = 100;
+    const INITIAL_PRICE: i64 = 1_000_000;
+
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(2, 10_000, 10_000, 10_000);
+    set_test_clock(&mut env, INITIAL_SLOT, INITIAL_TIME);
+    for (asset_index, feed) in INV056_EXTERNAL_FEEDS.iter().enumerate() {
+        let initial = env.set_pyth_price_with_conf(feed, INITIAL_PRICE, -6, 0, INITIAL_TIME);
+        env.try_configure_hybrid_asset_with_conf_filter_cu(
+            asset_index as u16,
+            1,
+            0,
+            [*feed, [0; 32], [0; 32]],
+            &[initial],
+            INITIAL_SLOT,
+            INITIAL_TIME,
+            0,
+            0,
+            10,
+            0,
+        )
+        .unwrap_or_else(|error| panic!("configure external asset {asset_index}: {error}"));
+    }
+
+    let owner = Keypair::new();
+    let portfolio = env.create_portfolio(&owner);
+    set_test_clock(&mut env, INV056_EXTERNAL_SLOT, INV056_EXTERNAL_TIME);
+    let fresh = std::array::from_fn(|asset_index| {
+        env.set_pyth_price_with_conf(
+            &INV056_EXTERNAL_FEEDS[asset_index],
+            INV056_EXTERNAL_PRICES[asset_index] as i64,
+            -6,
+            0,
+            INV056_EXTERNAL_TIME,
+        )
+    });
+    (env, portfolio, fresh)
+}
+
+fn inv056_external_order_snapshot(env: &V16CuEnv) -> Inv056ExternalOrderSnapshot {
+    let market = env.svm.get_account(&env.market).unwrap();
+    let (_, group) = env.market_state();
+    let profiles = [
+        state::read_asset_oracle_profile(&market.data, 0).unwrap(),
+        state::read_asset_oracle_profile(&market.data, 1).unwrap(),
+    ];
+    Inv056ExternalOrderSnapshot {
+        current_slot: group.current_slot,
+        oracle_epoch: group.oracle_epoch,
+        funding_epoch: group.funding_epoch,
+        effective_prices: [
+            group.assets[0].effective_price,
+            group.assets[1].effective_price,
+        ],
+        raw_targets: [
+            group.assets[0].raw_oracle_target_price,
+            group.assets[1].raw_oracle_target_price,
+        ],
+        asset_slots: [group.assets[0].slot_last, group.assets[1].slot_last],
+        profile_prices: [
+            profiles[0].oracle_leg_prices_e6[0],
+            profiles[1].oracle_leg_prices_e6[0],
+        ],
+        profile_publish_times: [
+            profiles[0].oracle_leg_publish_times[0],
+            profiles[1].oracle_leg_publish_times[0],
+        ],
+        vault: group.vault,
+        c_tot: group.c_tot,
+        insurance: group.insurance,
+    }
+}
+
+fn inv056_run_external_hint_order(order: [usize; 2]) -> Inv056ExternalOrderSnapshot {
+    let (mut env, portfolio, fresh) = inv056_external_oracle_world();
+    let observations = order
+        .iter()
+        .map(|asset_index| CrankObservationHint {
+            asset_index: *asset_index as u16,
+            oracle_accounts: 1,
+        })
+        .collect();
+    let accounts = vec![
+        AccountMeta::new(env.payer.pubkey(), true),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(portfolio, false),
+        AccountMeta::new_readonly(fresh[order[0]], false),
+        AccountMeta::new_readonly(fresh[order[1]], false),
+    ];
+    env.svm.expire_blockhash();
+    let cu = env
+        .send(
+            ProgInstruction::PermissionlessCrank {
+                now_slot: 0,
+                observations,
+            },
+            accounts,
+            &[],
+        )
+        .expect("matched external-oracle hint order must progress");
+    assert_cu_within("INV-056 external-oracle hint order", cu, CRANK_CU_LIMIT);
+
+    let snapshot = inv056_external_order_snapshot(&env);
+    assert_eq!(snapshot.effective_prices, INV056_EXTERNAL_PRICES);
+    assert_eq!(snapshot.raw_targets, INV056_EXTERNAL_PRICES);
+    assert_eq!(snapshot.profile_prices, INV056_EXTERNAL_PRICES);
+    assert_eq!(snapshot.profile_publish_times, [INV056_EXTERNAL_TIME; 2]);
+    snapshot
+}
+
+#[test]
+fn v16_program_external_oracle_hint_and_account_order_is_normalized_or_atomic() {
+    let forward = inv056_run_external_hint_order([0, 1]);
+    let reverse = inv056_run_external_hint_order([1, 0]);
+    assert_eq!(
+        forward, reverse,
+        "matching hint/account permutations must produce one normalized market result"
+    );
+
+    let (mut env, portfolio, fresh) = inv056_external_oracle_world();
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let portfolio_before = env.svm.get_account(&portfolio).unwrap();
+    let vault_before = env.svm.get_account(&env.vault).unwrap();
+    env.svm.expire_blockhash();
+    let mismatched = env.send(
+        ProgInstruction::PermissionlessCrank {
+            now_slot: 0,
+            observations: vec![
+                CrankObservationHint {
+                    asset_index: 1,
+                    oracle_accounts: 1,
+                },
+                CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 1,
+                },
+            ],
+        },
+        vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(portfolio, false),
+            AccountMeta::new_readonly(fresh[0], false),
+            AccountMeta::new_readonly(fresh[1], false),
+        ],
+        &[],
+    );
+    assert!(
+        mismatched.is_err(),
+        "a feed tail that does not match hint order must reject"
+    );
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(env.svm.get_account(&portfolio).unwrap(), portfolio_before);
+    assert_eq!(env.svm.get_account(&env.vault).unwrap(), vault_before);
+
+    env.svm.expire_blockhash();
+    let retry = env.send(
+        ProgInstruction::PermissionlessCrank {
+            now_slot: 0,
+            observations: vec![
+                CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 1,
+                },
+                CrankObservationHint {
+                    asset_index: 1,
+                    oracle_accounts: 1,
+                },
+            ],
+        },
+        vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(portfolio, false),
+            AccountMeta::new_readonly(fresh[0], false),
+            AccountMeta::new_readonly(fresh[1], false),
+        ],
+        &[],
+    );
+    assert!(
+        retry.is_ok(),
+        "a canonical retry must remain live after mismatched-tail rollback: {retry:?}"
+    );
+    assert_eq!(
+        inv056_external_order_snapshot(&env),
+        forward,
+        "retry after hostile ordering must reach the canonical normalized state"
+    );
+}
+
+struct Inv056ExternalRescueWorld {
+    env: V16CuEnv,
+    victim_owner: Keypair,
+    maker_owner: Keypair,
+    victim: Pubkey,
+    maker: Pubkey,
+    adverse_oracle: Pubkey,
+    rescue_oracle: Pubkey,
+    position_before_q: i128,
+}
+
+const INV056_EXTERNAL_RESCUE_FEED: [u8; 32] = [0x58; 32];
+
+fn inv056_external_rescue_world() -> Inv056ExternalRescueWorld {
+    const INITIAL_PRICE: u64 = 1_000_000;
+    const ADVERSE_PRICE: i64 = 997_600;
+    const POSITION_Q: i128 = 50 * POS_SCALE as i128;
+    let mut env = V16CuEnv::new_with_init_params(production_risk_params());
+    set_test_clock(&mut env, 1, 100);
+    let initial = env.set_pyth_price_with_conf(
+        &INV056_EXTERNAL_RESCUE_FEED,
+        INITIAL_PRICE as i64,
+        -6,
+        0,
+        100,
+    );
+    env.try_configure_hybrid_asset_with_conf_filter_cu(
+        0,
+        1,
+        0,
+        [INV056_EXTERNAL_RESCUE_FEED, [0; 32], [0; 32]],
+        &[initial],
+        1,
+        100,
+        0,
+        0,
+        10,
+        0,
+    )
+    .expect("configure one-leg external oracle");
+    env.top_up_backing_bucket(1, 1_000_000, 1_000);
+
+    let victim_owner = Keypair::new();
+    let maker_owner = Keypair::new();
+    let victim = env.create_portfolio(&victim_owner);
+    let maker = env.create_portfolio(&maker_owner);
+    let observer = env.create_portfolio(&Keypair::new());
+    env.deposit(&victim_owner, victim, 2_600_000);
+    env.deposit(&maker_owner, maker, 100_000_000);
+    env.trade_asset_with_cu(
+        0,
+        &victim_owner,
+        victim,
+        &maker_owner,
+        maker,
+        POSITION_Q,
+        INITIAL_PRICE,
+        0,
+    );
+    let position_before_q = active_leg_for_asset(&env.portfolio_state(victim), 0).basis_pos_q;
+    assert_eq!(position_before_q, POSITION_Q);
+
+    set_test_clock(&mut env, 2, 101);
+    let adverse_oracle =
+        env.set_pyth_price_with_conf(&INV056_EXTERNAL_RESCUE_FEED, ADVERSE_PRICE, -6, 0, 101);
+    env.crank_with_oracle_tail(
+        observer,
+        ProgInstruction::PermissionlessCrank {
+            now_slot: 0,
+            observations: crank_observations(0),
+        },
+        &[adverse_oracle],
+    );
+    assert_eq!(
+        env.market_state().1.assets[0].effective_price,
+        ADVERSE_PRICE as u64
+    );
+    assert_eq!(
+        active_leg_for_asset(&env.portfolio_state(victim), 0).basis_pos_q,
+        position_before_q,
+        "observing the adverse mark through an unrelated portfolio must not mutate the victim"
+    );
+
+    set_test_clock(&mut env, 3, 102);
+    let rescue_oracle = env.set_pyth_price_with_conf(
+        &INV056_EXTERNAL_RESCUE_FEED,
+        INITIAL_PRICE as i64,
+        -6,
+        0,
+        102,
+    );
+    Inv056ExternalRescueWorld {
+        env,
+        victim_owner,
+        maker_owner,
+        victim,
+        maker,
+        adverse_oracle,
+        rescue_oracle,
+        position_before_q,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Inv056ExternalRescueRoute {
+    Omitted,
+    PriorSlotReplay,
+    FreshControl,
+}
+
+#[derive(Debug)]
+struct Inv056ExternalRescueOutcome {
+    attack_succeeded: bool,
+    attack_exact_rollback: bool,
+    position_after_attack_q: i128,
+    attack_insurance_delta: u128,
+    victim_withdrawn: u64,
+    final_insurance: u128,
+    max_cu: u64,
+}
+
+fn inv056_run_external_rescue_route(
+    route: Inv056ExternalRescueRoute,
+) -> Inv056ExternalRescueOutcome {
+    let Inv056ExternalRescueWorld {
+        mut env,
+        victim_owner,
+        maker_owner,
+        victim,
+        maker,
+        adverse_oracle,
+        rescue_oracle,
+        position_before_q,
+    } = inv056_external_rescue_world();
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let victim_before = env.svm.get_account(&victim).unwrap();
+    let vault_before = env.svm.get_account(&env.vault).unwrap();
+    let insurance_before = env.market_state().1.insurance;
+    let mut attack_results = Vec::new();
+    if !matches!(route, Inv056ExternalRescueRoute::FreshControl) {
+        for _ in 0..2 {
+            env.svm.expire_blockhash();
+            let (observations, oracle_tail) = match route {
+                Inv056ExternalRescueRoute::Omitted => (vec![], vec![]),
+                Inv056ExternalRescueRoute::PriorSlotReplay => (
+                    crank_observations_with_accounts(0, 1),
+                    vec![AccountMeta::new_readonly(adverse_oracle, false)],
+                ),
+                Inv056ExternalRescueRoute::FreshControl => unreachable!(),
+            };
+            let mut accounts = vec![
+                AccountMeta::new_readonly(env.payer.pubkey(), false),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(victim, false),
+            ];
+            accounts.extend(oracle_tail);
+            let result = env.send(
+                ProgInstruction::PermissionlessCrank {
+                    now_slot: 0,
+                    observations,
+                },
+                accounts,
+                &[],
+            );
+            let rejected = result.is_err();
+            attack_results.push(result);
+            if rejected {
+                break;
+            }
+        }
+    }
+    let position_after_attack_q = active_leg_for_asset(&env.portfolio_state(victim), 0).basis_pos_q;
+    let attack_insurance_delta = env
+        .market_state()
+        .1
+        .insurance
+        .saturating_sub(insurance_before);
+    let attack_succeeded =
+        position_after_attack_q != position_before_q || attack_insurance_delta != 0;
+    let attack_exact_rollback = attack_results.iter().all(Result::is_err)
+        && env.svm.get_account(&env.market).unwrap() == market_before
+        && env.svm.get_account(&victim).unwrap() == victim_before
+        && env.svm.get_account(&env.vault).unwrap() == vault_before;
+    let mut max_cu = attack_results
+        .iter()
+        .filter_map(|result| result.as_ref().ok().copied())
+        .max()
+        .unwrap_or(0);
+
+    let rescue_cu = env.crank_with_oracle_tail(
+        victim,
+        ProgInstruction::PermissionlessCrank {
+            now_slot: 0,
+            observations: crank_observations(0),
+        },
+        &[rescue_oracle],
+    );
+    max_cu = max_cu.max(rescue_cu);
+    for (slot, unix_timestamp) in [(4, 103), (5, 104)] {
+        set_test_clock(&mut env, slot, unix_timestamp);
+        let terminal_rescue_oracle = env.set_pyth_price_with_conf(
+            &INV056_EXTERNAL_RESCUE_FEED,
+            1_000_000,
+            -6,
+            0,
+            unix_timestamp,
+        );
+        let terminal_rescue_cu = env.crank_with_oracle_tail(
+            victim,
+            ProgInstruction::PermissionlessCrank {
+                now_slot: 0,
+                observations: crank_observations(0),
+            },
+            &[terminal_rescue_oracle],
+        );
+        max_cu = max_cu.max(terminal_rescue_cu);
+    }
+    assert!(
+        env.market_state().1.assets[0].effective_price >= 1_000_000,
+        "the authenticated rescue observation must move the effective price toward the live feed"
+    );
+    assert_eq!(
+        health_cert(&env.portfolio_state(victim)).certified_liq_deficit,
+        0,
+        "the bounded authenticated rescue move restores maintenance health"
+    );
+
+    let remaining_q = active_leg_for_asset(&env.portfolio_state(victim), 0).basis_pos_q;
+    let close_price = env.market_state().1.assets[0].effective_price;
+    let close_cu = env.trade_asset_with_cu(
+        0,
+        &victim_owner,
+        victim,
+        &maker_owner,
+        maker,
+        -remaining_q,
+        close_price,
+        0,
+    );
+    max_cu = max_cu.max(close_cu);
+    assert!(
+        !has_active_leg_for_asset(&env.portfolio_state(victim), 0),
+        "the owner-signed risk reduction must leave the victim flat"
+    );
+    set_test_clock(&mut env, 6, 105);
+    let flat_refresh_oracle =
+        env.set_pyth_price_with_conf(&INV056_EXTERNAL_RESCUE_FEED, 1_000_000, -6, 0, 105);
+    let flat_refresh_cu = env.crank_with_oracle_tail(
+        victim,
+        ProgInstruction::PermissionlessCrank {
+            now_slot: 0,
+            observations: crank_observations(0),
+        },
+        &[flat_refresh_oracle],
+    );
+    max_cu = max_cu.max(flat_refresh_cu);
+    for _ in 0..4 {
+        env.svm.expire_blockhash();
+        if env
+            .crank_if_actionable(
+                victim,
+                ProgInstruction::PermissionlessCrank {
+                    now_slot: 0,
+                    observations: vec![],
+                },
+            )
+            .is_none()
+        {
+            break;
+        }
+    }
+    let before_convert = env.portfolio_state(victim);
+    if before_convert.pnl.get() > 0 {
+        env.convert_released_pnl_with_cu(
+            &victim_owner,
+            victim,
+            u128::try_from(before_convert.pnl.get()).unwrap(),
+        );
+    }
+    let terminal = env.portfolio_state(victim);
+    assert_eq!(terminal.pnl.get(), 0);
+    let destination = env.withdraw(&victim_owner, victim, terminal.capital.get());
+    Inv056ExternalRescueOutcome {
+        attack_succeeded,
+        attack_exact_rollback,
+        position_after_attack_q,
+        attack_insurance_delta,
+        victim_withdrawn: env.token_amount(destination),
+        final_insurance: env.market_state().1.insurance,
+        max_cu,
+    }
+}
+
+#[test]
+fn v16_attack_liquidation_cannot_omit_fresh_external_rescue_observation() {
+    let control = inv056_run_external_rescue_route(Inv056ExternalRescueRoute::FreshControl);
+    let attacks = [
+        (
+            Inv056ExternalRescueRoute::PriorSlotReplay,
+            inv056_run_external_rescue_route(Inv056ExternalRescueRoute::PriorSlotReplay),
+        ),
+        (
+            Inv056ExternalRescueRoute::Omitted,
+            inv056_run_external_rescue_route(Inv056ExternalRescueRoute::Omitted),
+        ),
+    ];
+    for (attack, outcome) in attacks {
+        eprintln!("control={control:?}\nattack={outcome:?}");
+        assert!(!outcome.attack_succeeded, "{attack:?} must reject");
+        assert!(
+            outcome.attack_exact_rollback,
+            "{attack:?} must roll back market, portfolio, and vault exactly"
+        );
+        assert_eq!(outcome.position_after_attack_q, 50 * POS_SCALE as i128);
+        assert_eq!(outcome.attack_insurance_delta, 0);
+        assert_eq!(
+            outcome.victim_withdrawn, control.victim_withdrawn,
+            "{attack:?} must not reduce the victim's terminal SPL entitlement"
+        );
+        assert_eq!(outcome.final_insurance, control.final_insurance);
+        assert_cu_within(
+            "INV-056 external rescue terminal route",
+            outcome.max_cu,
+            CRANK_CU_LIMIT,
+        );
+    }
+}
+
+#[test]
+fn v16_program_pending_close_bad_hints_roll_back_then_canonical_crank_progresses() {
+    let PublicActiveCloseFixture {
+        mut env,
+        loss,
+        live_counterparty,
+        live_peer,
+        ..
+    } = public_asset1_bankrupt_close_fixture();
+    let close_before = close_progress(&env.portfolio_state(loss));
+    assert!(close_before.active && close_before.residual_remaining > 0);
+    assert!(
+        env.svm.get_sysvar::<Clock>().slot <= close_before.max_close_slot,
+        "fixture must exercise live close advancement rather than expiry recovery"
+    );
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let loss_before = env.svm.get_account(&loss).unwrap();
+    let counterparty_before = env.svm.get_account(&live_counterparty).unwrap();
+    let peer_before = env.svm.get_account(&live_peer).unwrap();
+    let vault_before = env.svm.get_account(&env.vault).unwrap();
+    env.svm.expire_blockhash();
+    let hostile = env.send(
+        ProgInstruction::PermissionlessCrank {
+            now_slot: 0,
+            observations: vec![
+                CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                },
+                CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                },
+            ],
+        },
+        vec![
+            AccountMeta::new_readonly(env.payer.pubkey(), false),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(loss, false),
+        ],
+        &[],
+    );
+    assert!(
+        hostile.is_err(),
+        "a duplicate late hint must reject before close advancement commits"
+    );
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(env.svm.get_account(&loss).unwrap(), loss_before);
+    assert_eq!(
+        env.svm.get_account(&live_counterparty).unwrap(),
+        counterparty_before
+    );
+    assert_eq!(env.svm.get_account(&live_peer).unwrap(), peer_before);
+    assert_eq!(env.svm.get_account(&env.vault).unwrap(), vault_before);
+
+    env.svm.expire_blockhash();
+    let progress_cu = env
+        .send(
+            ProgInstruction::PermissionlessCrank {
+                now_slot: 0,
+                observations: vec![],
+            },
+            vec![
+                AccountMeta::new_readonly(env.payer.pubkey(), false),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(loss, false),
+            ],
+            &[],
+        )
+        .expect("canonical empty-hint crank must advance the pending close");
+    assert_cu_within(
+        "INV-056 pending-close canonical retry",
+        progress_cu,
+        CRANK_CU_LIMIT,
+    );
+    let mode_after = env.market_state().1.mode;
+    let close_after = close_progress(&env.portfolio_state(loss));
+    assert!(
+        mode_after != MarketModeV16::Live
+            || close_after.residual_remaining < close_before.residual_remaining
+            || close_after.finalized,
+        "canonical retry must lower close rank or enter a terminal mode"
+    );
+    assert_eq!(
+        env.svm.get_account(&live_counterparty).unwrap(),
+        counterparty_before,
+        "pending-close progress must not rewrite an unrelated portfolio"
+    );
+    assert_eq!(
+        env.svm.get_account(&live_peer).unwrap(),
+        peer_before,
+        "pending-close progress must not rewrite an unrelated peer"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.vault).unwrap(),
+        vault_before,
+        "pending-close bookkeeping must not move SPL custody"
+    );
+}
+
+#[test]
+fn v16_program_public_b_stale_atom_budget_is_hint_independent_and_bounded() {
+    let (fixture, settle_b_oracle) =
+        public_asset1_bankrupt_close_fixture_with_asset0_external_oracle();
+    let PublicActiveCloseFixture {
+        mut env,
+        loss,
+        asset1_counterparty_owner,
+        asset1_counterparty,
+        live_peer,
+        ..
+    } = fixture;
+
+    // The fixture's owner forfeit books the first loss atom. A permissionless
+    // close continuation books the second, entirely through public routes.
+    let close_before = close_progress(&env.portfolio_state(loss));
+    assert!(close_before.active && close_before.residual_remaining > 0);
+    env.svm.expire_blockhash();
+    let booking_cu = env
+        .send(
+            ProgInstruction::PermissionlessCrank {
+                now_slot: 0,
+                observations: vec![],
+            },
+            vec![
+                AccountMeta::new_readonly(env.payer.pubkey(), false),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(loss, false),
+            ],
+            &[],
+        )
+        .expect("public close continuation must book the second B loss atom");
+    assert_cu_within("INV-056 public B booking", booking_cu, CRANK_CU_LIMIT);
+    let target_b = env.market_state().1.assets[1].b_long_num;
+    let before_discovery = active_leg_for_asset(&env.portfolio_state(asset1_counterparty), 1);
+    assert!(target_b > before_discovery.b_snap);
+    assert!(
+        target_b > 2,
+        "the B-index representation must make an index-tick budget observably wrong"
+    );
+    assert!(!before_discovery.b_stale);
+
+    // The owner route discovers the committed gap and may consume only one
+    // loss atom. Exactly one atom therefore remains for permissionless SettleB.
+    let discovery_cu =
+        env.forfeit_recovery_leg_with_cu(&asset1_counterparty_owner, asset1_counterparty, 1, 1);
+    assert_cu_within("INV-056 public B discovery", discovery_cu, CUSTODY_CU_LIMIT);
+    let discovered = active_leg_for_asset(&env.portfolio_state(asset1_counterparty), 1);
+    assert!(
+        discovered.b_snap > before_discovery.b_snap.saturating_add(1),
+        "one collateral-atom budget must not be interpreted as one B-index tick"
+    );
+    assert!(discovered.b_snap < target_b && discovered.b_stale);
+
+    // Compose the selected SettleB step with a real external-oracle tail for
+    // the unrelated live asset. The observation may update authenticated
+    // market state, but it must not suppress or replace higher-priority B
+    // progress on the target account.
+    for _ in 0..3 {
+        let catchup_cu = env.crank_with_oracle_tail(
+            live_peer,
+            ProgInstruction::PermissionlessCrank {
+                now_slot: 0,
+                observations: crank_observations(0),
+            },
+            &[settle_b_oracle],
+        );
+        assert_cu_within(
+            "INV-056 external-tail bounded market catch-up",
+            catchup_cu,
+            CRANK_CU_LIMIT,
+        );
+    }
+    assert_eq!(
+        env.market_state().1.assets[0].slot_last,
+        4,
+        "the external asset must be current before measuring composed account progress"
+    );
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let portfolio_before = env.svm.get_account(&asset1_counterparty).unwrap();
+    let vault_before = env.svm.get_account(&env.vault).unwrap();
+    env.svm.expire_blockhash();
+    let hostile = env.send(
+        ProgInstruction::PermissionlessCrank {
+            now_slot: 0,
+            observations: vec![
+                CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 1,
+                },
+                CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 1,
+                },
+            ],
+        },
+        vec![
+            AccountMeta::new_readonly(env.payer.pubkey(), false),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(asset1_counterparty, false),
+            AccountMeta::new_readonly(settle_b_oracle, false),
+            AccountMeta::new_readonly(settle_b_oracle, false),
+        ],
+        &[],
+    );
+    assert!(hostile.is_err(), "duplicate hints must reject atomically");
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(
+        env.svm.get_account(&asset1_counterparty).unwrap(),
+        portfolio_before
+    );
+    assert_eq!(env.svm.get_account(&env.vault).unwrap(), vault_before);
+
+    env.svm.expire_blockhash();
+    let settle_cu = env
+        .send(
+            ProgInstruction::PermissionlessCrank {
+                now_slot: 0,
+                observations: vec![CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 1,
+                }],
+            },
+            vec![
+                AccountMeta::new_readonly(env.payer.pubkey(), false),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(asset1_counterparty, false),
+                AccountMeta::new_readonly(settle_b_oracle, false),
+            ],
+            &[],
+        )
+        .expect("SettleB must compose with an authenticated unrelated oracle tail");
+    assert_cu_within(
+        "INV-056 external-tail plus public SettleB",
+        settle_cu,
+        CRANK_CU_LIMIT,
+    );
+    let settled_account = env.portfolio_state(asset1_counterparty);
+    let settled = active_leg_for_asset(&settled_account, 1);
+    assert_eq!(
+        settled.b_snap, target_b,
+        "the second atom must settle in one call"
+    );
+    assert!(!settled.b_stale);
+    assert_eq!(settled_account.b_stale_state, 0);
+}
+
+#[test]
+fn v16_program_recovery_and_resolved_dispatch_treat_hints_as_discovery_only() {
+    let PublicActiveCloseFixture {
+        mut env,
+        loss,
+        live_counterparty_owner,
+        live_counterparty,
+        live_peer_owner,
+        live_peer,
+        ..
+    } = public_asset1_bankrupt_close_fixture();
+    let close = close_progress(&env.portfolio_state(loss));
+    env.svm.warp_to_slot(close.max_close_slot + 1);
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::PermissionlessCrank {
+            now_slot: 0,
+            observations: vec![],
+        },
+        vec![
+            AccountMeta::new_readonly(env.payer.pubkey(), false),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(loss, false),
+        ],
+        &[],
+    )
+    .expect("expired close must enter permissionless Recovery");
+    assert_eq!(
+        env.market_state().1.mode,
+        MarketModeV16::Recovery,
+        "fixture must expose the distinct FinalizeRecovery selector class"
+    );
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let loss_before = env.svm.get_account(&loss).unwrap();
+    let counterparty_before = env.svm.get_account(&live_counterparty).unwrap();
+    let peer_before = env.svm.get_account(&live_peer).unwrap();
+    let vault_before = env.svm.get_account(&env.vault).unwrap();
+    env.svm.expire_blockhash();
+    let hostile = env.send(
+        ProgInstruction::PermissionlessCrank {
+            now_slot: 0,
+            observations: vec![
+                CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                },
+                CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                },
+            ],
+        },
+        vec![
+            AccountMeta::new_readonly(env.payer.pubkey(), false),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(loss, false),
+        ],
+        &[],
+    );
+    assert!(
+        hostile.is_err(),
+        "duplicate Recovery hints must reject atomically"
+    );
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(env.svm.get_account(&loss).unwrap(), loss_before);
+    assert_eq!(
+        env.svm.get_account(&live_counterparty).unwrap(),
+        counterparty_before
+    );
+    assert_eq!(env.svm.get_account(&live_peer).unwrap(), peer_before);
+    assert_eq!(env.svm.get_account(&env.vault).unwrap(), vault_before);
+
+    env.svm.expire_blockhash();
+    let finalize_cu = env
+        .send(
+            ProgInstruction::PermissionlessCrank {
+                now_slot: 0,
+                observations: vec![],
+            },
+            vec![
+                AccountMeta::new_readonly(env.payer.pubkey(), false),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(loss, false),
+            ],
+            &[],
+        )
+        .expect("empty-hint Recovery crank must finalize to Resolved");
+    assert_cu_within(
+        "INV-056 Recovery finalization retry",
+        finalize_cu,
+        CRANK_CU_LIMIT,
+    );
+    assert_eq!(env.market_state().1.mode, MarketModeV16::Resolved);
+    assert_eq!(
+        env.svm.get_account(&live_counterparty).unwrap(),
+        counterparty_before,
+        "Recovery finalization must not rewrite a claimant portfolio"
+    );
+    assert_eq!(
+        env.svm.get_account(&live_peer).unwrap(),
+        peer_before,
+        "Recovery finalization must not rewrite a claimant peer"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.vault).unwrap(),
+        vault_before,
+        "Recovery finalization snapshots accounting without moving SPL custody"
+    );
+
+    let duplicate_hint_dest = env.token_account(live_counterparty_owner.pubkey(), 0);
+    env.svm.expire_blockhash();
+    let duplicate_hint_cu = env
+        .send(
+            ProgInstruction::PermissionlessCrank {
+                now_slot: 0,
+                observations: vec![
+                    CrankObservationHint {
+                        asset_index: 0,
+                        oracle_accounts: 0,
+                    },
+                    CrankObservationHint {
+                        asset_index: 0,
+                        oracle_accounts: 0,
+                    },
+                ],
+            },
+            vec![
+                AccountMeta::new(live_counterparty_owner.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(live_counterparty, false),
+                AccountMeta::new(duplicate_hint_dest, false),
+                AccountMeta::new(env.vault, false),
+                AccountMeta::new_readonly(env.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[&live_counterparty_owner],
+        )
+        .expect("Resolved dispatch must ignore economically irrelevant duplicate hints");
+    assert_cu_within(
+        "INV-056 Resolved duplicate-hint close",
+        duplicate_hint_cu,
+        CRANK_CU_LIMIT,
+    );
+
+    let empty_hint_dest = env.token_account(live_peer_owner.pubkey(), 0);
+    env.svm.expire_blockhash();
+    let empty_hint_cu = env
+        .send(
+            ProgInstruction::PermissionlessCrank {
+                now_slot: 0,
+                observations: vec![],
+            },
+            vec![
+                AccountMeta::new(live_peer_owner.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(live_peer, false),
+                AccountMeta::new(empty_hint_dest, false),
+                AccountMeta::new(env.vault, false),
+                AccountMeta::new_readonly(env.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[&live_peer_owner],
+        )
+        .expect("Resolved empty-hint close must remain live");
+    assert_cu_within(
+        "INV-056 Resolved empty-hint close",
+        empty_hint_cu,
+        CRANK_CU_LIMIT,
+    );
+    let duplicate_hint_payout = env.token_amount(duplicate_hint_dest);
+    let empty_hint_payout = env.token_amount(empty_hint_dest);
+    assert!(duplicate_hint_payout > 0);
+    assert_eq!(
+        duplicate_hint_payout, empty_hint_payout,
+        "Resolved hints must not alter symmetric claimant economics"
+    );
+    assert_eq!(
+        env.market_state().1.vault as u64,
+        env.token_amount(env.vault),
+        "Resolved hint-insensitive closes preserve engine/SPL vault parity"
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Inv056BatchRoute {
+    NoCpi,
+    Cpi,
+}
+
+fn run_batch_route_with_stale_related_leg(route: Inv056BatchRoute) {
+    const PRICE: u64 = 100;
+    const MOVED_PRICE: u64 = 105;
+    const STALE_SIZE_Q: i128 = (10 * POS_SCALE) as i128;
+    const NEW_SIZE_Q: i128 = POS_SCALE as i128;
+
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(2, 1_000, 1_000, 500);
+    env.configure_auth_mark_for_asset_as_admin(1, 0, PRICE);
+
+    let taker_owner = Keypair::new();
+    let lp_owner = Keypair::new();
+    let taker = env.create_portfolio(&taker_owner);
+    let lp = env.create_portfolio(&lp_owner);
+    env.deposit(&taker_owner, taker, 1_000_000_000);
+    env.deposit(&lp_owner, lp, 1_000_000_000);
+    env.trade_asset_with_cu(
+        1,
+        &taker_owner,
+        taker,
+        &lp_owner,
+        lp,
+        STALE_SIZE_Q,
+        PRICE,
+        0,
+    );
+
+    let crank_long_owner = Keypair::new();
+    let crank_short_owner = Keypair::new();
+    let crank_long = env.create_portfolio(&crank_long_owner);
+    let crank_short = env.create_portfolio(&crank_short_owner);
+    env.deposit(&crank_long_owner, crank_long, 1_000_000_000);
+    env.deposit(&crank_short_owner, crank_short, 1_000_000_000);
+    env.trade_asset_with_cu(
+        1,
+        &crank_long_owner,
+        crank_long,
+        &crank_short_owner,
+        crank_short,
+        POS_SCALE as i128,
+        PRICE,
+        0,
+    );
+
+    env.svm.warp_to_slot(1);
+    env.push_auth_mark_for_asset_as_admin(1, 1, MOVED_PRICE);
+    env.crank(
+        crank_long,
+        ProgInstruction::PermissionlessCrank {
+            now_slot: 1,
+            observations: crank_observations(1),
+        },
+    );
+    let (_, stale_group) = env.market_state();
+    let taker_stale = env.portfolio_state(taker);
+    let lp_stale = env.portfolio_state(lp);
+    assert_eq!(stale_group.assets[1].effective_price, MOVED_PRICE);
+    assert!(
+        health_cert(&taker_stale).cert_oracle_epoch < stale_group.oracle_epoch,
+        "{route:?}: taker certificate must be stale before the batch route"
+    );
+    assert!(
+        health_cert(&lp_stale).cert_oracle_epoch < stale_group.oracle_epoch,
+        "{route:?}: LP certificate must be stale before the batch route"
+    );
+    assert_ne!(
+        active_leg_for_asset(&taker_stale, 1).k_snap,
+        stale_group.assets[1].k_long,
+        "{route:?}: taker stale leg snapshot must differ from current market K"
+    );
+    assert_ne!(
+        active_leg_for_asset(&lp_stale, 1).k_snap,
+        stale_group.assets[1].k_short,
+        "{route:?}: LP stale leg snapshot must differ from current market K"
+    );
+
+    let cu = match route {
+        Inv056BatchRoute::NoCpi => env
+            .send(
+                env.batch_trade_no_cpi_ix(
+                    taker,
+                    lp,
+                    vec![BatchTradeLeg {
+                        asset_index: 0,
+                        market_id: env.asset_market_id(0),
+                        size_q: NEW_SIZE_Q,
+                        exec_price: PRICE,
+                        fee_bps: 0,
+                    }],
+                ),
+                vec![
+                    AccountMeta::new(taker_owner.pubkey(), true),
+                    AccountMeta::new(lp_owner.pubkey(), true),
+                    AccountMeta::new(env.market, false),
+                    AccountMeta::new(taker, false),
+                    AccountMeta::new(lp, false),
+                ],
+                &[&taker_owner, &lp_owner],
+            )
+            .expect("BatchTradeNoCpi must refresh stale related legs before admitting asset-0"),
+        Inv056BatchRoute::Cpi => {
+            let matcher_program = Pubkey::new_unique();
+            let matcher_bytes =
+                std::fs::read(auth_matcher_program_path()).expect("read auth matcher SBF");
+            env.svm.add_program(matcher_program, &matcher_bytes);
+            let (ctx, delegate, _) = env.init_auth_matcher_context(matcher_program, &lp_owner, lp);
+            env.send(
+                env.batch_trade_cpi_ix(
+                    taker,
+                    lp,
+                    vec![BatchTradeCpiLeg {
+                        asset_index: 0,
+                        market_id: env.asset_market_id(0),
+                        size_q: NEW_SIZE_Q,
+                        fee_bps: 0,
+                        limit_price: 0,
+                    }],
+                ),
+                vec![
+                    AccountMeta::new(taker_owner.pubkey(), true),
+                    AccountMeta::new(env.market, false),
+                    AccountMeta::new(taker, false),
+                    AccountMeta::new(lp, false),
+                    AccountMeta::new_readonly(matcher_program, false),
+                    AccountMeta::new(ctx, false),
+                    AccountMeta::new_readonly(delegate, false),
+                ],
+                &[&taker_owner],
+            )
+            .expect("BatchTradeCpi must refresh stale related legs before admitting asset-0")
+        }
+    };
+    assert_cu_within(
+        &format!("INV-056 {route:?} stale related-leg batch refresh"),
+        cu,
+        MULTI_ASSET_OPEN_TRADE_CU_LIMIT,
+    );
+
+    let (_, group_after) = env.market_state();
+    let taker_after = env.portfolio_state(taker);
+    let lp_after = env.portfolio_state(lp);
+    assert_eq!(
+        health_cert(&taker_after).cert_oracle_epoch,
+        group_after.oracle_epoch,
+        "{route:?}: taker is recertified against the full market epoch"
+    );
+    assert_eq!(
+        health_cert(&lp_after).cert_oracle_epoch,
+        group_after.oracle_epoch,
+        "{route:?}: LP is recertified against the full market epoch"
+    );
+    assert_eq!(
+        active_leg_for_asset(&taker_after, 1).k_snap,
+        group_after.assets[1].k_long,
+        "{route:?}: taker stale asset-1 leg was refreshed in-place"
+    );
+    assert_eq!(
+        active_leg_for_asset(&lp_after, 1).k_snap,
+        group_after.assets[1].k_short,
+        "{route:?}: LP stale asset-1 leg was refreshed in-place"
+    );
+    assert!(has_active_leg_for_asset(&taker_after, 0));
+    assert!(has_active_leg_for_asset(&lp_after, 0));
+    assert!(has_active_leg_for_asset(&taker_after, 1));
+    assert!(has_active_leg_for_asset(&lp_after, 1));
+}
+
+#[test]
+fn v16_program_batch_routes_refresh_stale_related_legs_before_favorable_trade() {
+    run_batch_route_with_stale_related_leg(Inv056BatchRoute::NoCpi);
+    run_batch_route_with_stale_related_leg(Inv056BatchRoute::Cpi);
+}
+
+fn inv056_boundary_frame(env: &V16CuEnv, keys: &[Pubkey]) -> Vec<(Pubkey, Account)> {
+    keys.iter()
+        .map(|key| (*key, env.svm.get_account(key).unwrap()))
+        .collect()
+}
+
+fn inv056_assert_boundary_frame(env: &V16CuEnv, expected: &[(Pubkey, Account)], label: &str) {
+    for (key, account) in expected {
+        let actual = env.svm.get_account(key).unwrap();
+        assert!(
+            actual == *account,
+            "{label}: account frame changed: {key}, first data difference: {:?}",
+            actual
+                .data
+                .iter()
+                .zip(&account.data)
+                .position(|(a, b)| a != b),
+        );
+    }
+}
+
+fn inv056_assert_boundary_reject(
+    env: &mut V16CuEnv,
+    keys: &[Pubkey],
+    signatures: u64,
+    expected: PercolatorError,
+    action: impl FnOnce(&mut V16CuEnv) -> Result<u64, String>,
+) {
+    let before = inv056_boundary_frame(env, keys);
+    let mut payer = env.svm.get_account(&env.payer.pubkey()).unwrap();
+    env.svm.expire_blockhash();
+    let err = action(env).expect_err("incomplete observations must not improve admission");
+    assert!(
+        err.contains(&format!("Custom({})", expected as u32)),
+        "{err}"
+    );
+    inv056_assert_boundary_frame(env, &before, "rejection rollback");
+    payer.lamports -= signatures * solana_sdk::fee::FeeStructure::default().lamports_per_signature;
+    assert_eq!(env.svm.get_account(&env.payer.pubkey()).unwrap(), payer);
+}
+
+fn inv056_boundary_crank(
+    env: &mut V16CuEnv,
+    portfolio: Pubkey,
+    observations: Vec<CrankObservationHint>,
+    oracles: &[Pubkey],
+) -> Result<u64, String> {
+    let mut accounts = vec![
+        AccountMeta::new(env.payer.pubkey(), true),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(portfolio, false),
+    ];
+    accounts.extend(
+        oracles
+            .iter()
+            .map(|key| AccountMeta::new_readonly(*key, false)),
+    );
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::PermissionlessCrank {
+            now_slot: u64::MAX,
+            observations,
+        },
+        accounts,
+        &[],
+    )
+}
+
+fn inv056_boundary_full_observations() -> Vec<CrankObservationHint> {
+    vec![
+        CrankObservationHint {
+            asset_index: 0,
+            oracle_accounts: 0,
+        },
+        CrankObservationHint {
+            asset_index: 1,
+            oracle_accounts: 1,
+        },
+        CrankObservationHint {
+            asset_index: 2,
+            oracle_accounts: 0,
+        },
+    ]
+}
+
+#[test]
+fn v16_bpf_inv056_mixed_observations_preserve_full_refresh_trade_boundary() {
+    // INV-056 / INV-020 / INV-053 / INV-054: compare wrapper histories, not an
+    // engine refresh implementation. All economic state comes from public SBF routes.
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(3, 1_000, 1_000, 500);
+    set_test_clock(&mut env, 1, 100);
+    env.configure_auth_mark_for_asset_as_admin(0, 1, 100);
+    env.configure_auth_mark_for_asset_as_admin(2, 1, 100);
+    let feed = [0x56; 32];
+    let old_oracle = env.set_pyth_price(&feed, 100, -6, 100);
+    env.try_configure_hybrid_asset_with_cu(
+        1,
+        1,
+        0,
+        [feed, [0; 32], [0; 32]],
+        &[old_oracle],
+        1,
+        100,
+        0,
+        0,
+        3,
+    )
+    .unwrap();
+
+    let trader = Keypair::new();
+    let counterparty = Keypair::new();
+    let keeper = Keypair::new();
+    let trader_account = env.create_portfolio(&trader);
+    let counterparty_account = env.create_portfolio(&counterparty);
+    let keeper_account = env.create_portfolio(&keeper);
+    let trader_tokens = env.deposit(&trader, trader_account, 310);
+    let counterparty_tokens = env.deposit(&counterparty, counterparty_account, 10_000);
+    for (asset, sign) in [(0, 1), (1, -1)] {
+        env.trade_asset_with_cu(
+            asset,
+            &trader,
+            trader_account,
+            &counterparty,
+            counterparty_account,
+            sign * (10 * POS_SCALE) as i128,
+            100,
+            0,
+        );
+    }
+    let original_cert = health_cert(&env.portfolio_state(trader_account));
+    assert_eq!(original_cert.certified_equity, 310);
+    assert_eq!(original_cert.certified_initial_req, 200);
+
+    let trade = |env: &mut V16CuEnv, batch: bool, size_q: i128| {
+        let ix = if batch {
+            env.batch_trade_no_cpi_ix(
+                trader_account,
+                counterparty_account,
+                vec![BatchTradeLeg {
+                    asset_index: 2,
+                    market_id: env.asset_market_id(2),
+                    size_q,
+                    exec_price: 100,
+                    fee_bps: 0,
+                }],
+            )
+        } else {
+            env.trade_no_cpi_ix(trader_account, counterparty_account, 2, size_q, 100, 0)
+        };
+        env.svm.expire_blockhash();
+        env.send(
+            ix,
+            vec![
+                AccountMeta::new(trader.pubkey(), true),
+                AccountMeta::new(counterparty.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(trader_account, false),
+                AccountMeta::new(counterparty_account, false),
+            ],
+            &[&trader, &counterparty],
+        )
+    };
+    let mut keys = vec![
+        env.market,
+        trader_account,
+        counterparty_account,
+        keeper_account,
+        env.vault,
+        env.mint,
+        trader_tokens,
+        counterparty_tokens,
+        trader.pubkey(),
+        counterparty.pubkey(),
+        keeper.pubkey(),
+        env.admin.pubkey(),
+        old_oracle,
+    ];
+    let before_losses = inv056_boundary_frame(&env, &keys);
+    for batch in [false, true] {
+        trade(&mut env, batch, (POS_SCALE + POS_SCALE / 10) as i128)
+            .expect("same over-boundary request is admissible before the losses");
+        let cert = health_cert(&env.portfolio_state(trader_account));
+        assert_eq!(cert.certified_equity, 310);
+        assert_eq!(cert.certified_initial_req, 211);
+        for (key, account) in &before_losses {
+            env.svm.set_account(*key, account.clone()).unwrap();
+        }
+    }
+
+    set_test_clock(&mut env, 2, 101);
+    env.push_auth_mark_for_asset_as_admin(0, 2, 95);
+    let fresh_oracle = env.set_pyth_price(&feed, 105, -6, 101);
+    keys.push(fresh_oracle);
+    inv056_boundary_crank(
+        &mut env,
+        keeper_account,
+        crank_observations_with_accounts(1, 1),
+        &[fresh_oracle],
+    )
+    .unwrap();
+    let (_, partial_market) = env.market_state();
+    assert_eq!(partial_market.assets[0].effective_price, 100);
+    assert_eq!(partial_market.assets[1].effective_price, 105);
+    assert!(original_cert.cert_oracle_epoch < partial_market.oracle_epoch);
+    assert_eq!(env.portfolio_state(trader_account).capital.get(), 310);
+
+    // Repeat omissions against the same live history. The valid first observation
+    // in the replay case would advance AuthMark before the regressed Pyth tail fails.
+    for _ in 0..2 {
+        inv056_assert_boundary_reject(
+            &mut env,
+            &keys,
+            1,
+            PercolatorError::EngineNonProgress,
+            |env| inv056_boundary_crank(env, trader_account, vec![], &[]),
+        );
+        inv056_assert_boundary_reject(
+            &mut env,
+            &keys,
+            1,
+            PercolatorError::EngineNonProgress,
+            |env| {
+                inv056_boundary_crank(
+                    env,
+                    trader_account,
+                    crank_observations_with_accounts(1, 1),
+                    &[fresh_oracle],
+                )
+            },
+        );
+    }
+    inv056_assert_boundary_reject(&mut env, &keys, 1, PercolatorError::OracleStale, |env| {
+        inv056_boundary_crank(
+            env,
+            trader_account,
+            inv056_boundary_full_observations(),
+            &[old_oracle],
+        )
+    });
+    inv056_boundary_crank(
+        &mut env,
+        keeper_account,
+        inv056_boundary_full_observations(),
+        &[fresh_oracle],
+    )
+    .unwrap();
+    let (_, observed_market) = env.market_state();
+    assert_eq!(observed_market.current_slot, 2);
+    assert_eq!(observed_market.assets[0].effective_price, 95);
+    assert_eq!(observed_market.assets[1].effective_price, 105);
+    assert_eq!(observed_market.assets[2].effective_price, 100);
+    assert_eq!(
+        health_cert(&env.portfolio_state(trader_account)),
+        original_cert
+    );
+    let stale_checkpoint = inv056_boundary_frame(&env, &keys);
+
+    // Two losses of 50 leave equity 210. Gross initial margin is 95 + 105 = 200;
+    // opening one unit on asset 2 costs 10, and another tenth costs one more atom.
+    // The old certificate would admit both, making the negative control material.
+    let expected_equity = 310 + 10 * (95 - 100) - 10 * (105 - 100);
+    let expected_req = (10 * 95 + 10 * 105) / 10;
+    assert_eq!(expected_equity, 210);
+    assert_eq!(expected_req, 200);
+    assert!(original_cert.certified_equity > expected_req + 11);
+    let mut route_reference: Option<Vec<(Pubkey, Account)>> = None;
+    for batch in [false, true] {
+        let mut full_reference: Option<Vec<(Pubkey, Account)>> = None;
+        for refresh in ["full", "empty-hints", "on-demand"] {
+            // Restore only captured public account bytes to replay an identical
+            // prefix. No synthetic engine fields or direct engine transitions.
+            for (key, account) in &stale_checkpoint {
+                env.svm.set_account(*key, account.clone()).unwrap();
+            }
+            if refresh != "on-demand" {
+                for account in [trader_account, counterparty_account] {
+                    let (observations, oracles) = if refresh == "full" {
+                        (inv056_boundary_full_observations(), vec![fresh_oracle])
+                    } else {
+                        (vec![], vec![])
+                    };
+                    inv056_boundary_crank(&mut env, account, observations, &oracles).unwrap();
+                }
+                let current = health_cert(&env.portfolio_state(trader_account));
+                assert!(current.valid);
+                assert_eq!(current.cert_oracle_epoch, env.market_state().1.oracle_epoch);
+                assert_eq!(current.certified_equity, expected_equity);
+                assert_eq!(current.certified_initial_req, expected_req as u128);
+            }
+            inv056_assert_boundary_reject(
+                &mut env,
+                &keys,
+                3,
+                PercolatorError::EngineInvalidConfig,
+                |env| trade(env, batch, (POS_SCALE + POS_SCALE / 10) as i128),
+            );
+            trade(&mut env, batch, POS_SCALE as i128).unwrap();
+
+            let a = env.portfolio_state(trader_account);
+            let b = env.portfolio_state(counterparty_account);
+            let (_, group) = env.market_state();
+            let cert = health_cert(&a);
+            assert!(cert.valid);
+            assert_eq!(cert.cert_oracle_epoch, group.oracle_epoch);
+            assert_eq!(cert.certified_equity, expected_equity);
+            assert_eq!(cert.certified_initial_req, (expected_req + 10) as u128);
+            assert_eq!(a.capital.get() as i128 + a.pnl.get(), expected_equity);
+            assert_eq!(b.capital.get() as i128 + b.pnl.get(), 10_100);
+            assert_eq!(group.vault, 10_310);
+            assert_eq!(
+                TokenAccount::unpack(&env.svm.get_account(&env.vault).unwrap().data)
+                    .unwrap()
+                    .amount,
+                10_310
+            );
+            assert_eq!(group.insurance, 0);
+            for asset in 0..3 {
+                let size = if asset == 2 {
+                    POS_SCALE
+                } else {
+                    10 * POS_SCALE
+                };
+                assert_eq!(group.assets[asset].oi_eff_long_q, size);
+                assert_eq!(group.assets[asset].oi_eff_short_q, size);
+            }
+            let outcome = inv056_boundary_frame(&env, &keys);
+            if let Some(reference) = &full_reference {
+                inv056_assert_boundary_frame(
+                    &env,
+                    reference,
+                    &format!("batch={batch}, refresh={refresh}"),
+                );
+            } else {
+                full_reference = Some(outcome);
+            }
+            println!("INV-056 mixed observations: batch={batch}, refresh={refresh}, equity=210, margin=210; +1 margin rejected");
+        }
+        if let Some(reference) = &route_reference {
+            inv056_assert_boundary_frame(&env, reference, "single/batch route equivalence");
+        } else {
+            route_reference = full_reference;
+        }
+    }
+}
