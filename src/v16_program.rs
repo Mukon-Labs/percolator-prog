@@ -33,6 +33,21 @@ use solana_program::{
 
 declare_id!("Perco1ator111111111111111111111111111111111");
 
+pub mod martingaler_program;
+pub mod martingaler_state;
+
+pub fn dispatch_instruction<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    if martingaler_program::has_namespace(instruction_data) {
+        martingaler_program::process_instruction(program_id, accounts, instruction_data)
+    } else {
+        processor::process_instruction(program_id, accounts, instruction_data)
+    }
+}
+
 pub mod constants {
     use core::mem::size_of;
     use percolator::{
@@ -16825,7 +16840,7 @@ pub mod processor {
 
 #[cfg(all(not(feature = "no-entrypoint"), not(feature = "anchor-v2")))]
 pub mod entrypoint {
-    use super::processor;
+    use super::dispatch_instruction;
     #[allow(unused_imports)]
     use alloc::format;
     #[cfg(target_os = "solana")]
@@ -16865,7 +16880,7 @@ pub mod entrypoint {
         accounts: &'a [AccountInfo<'a>],
         instruction_data: &[u8],
     ) -> ProgramResult {
-        processor::process_instruction(program_id, accounts, instruction_data)
+        dispatch_instruction(program_id, accounts, instruction_data)
     }
 }
 
@@ -16874,7 +16889,7 @@ pub mod entrypoint {
 pub mod entrypoint {
     extern crate alloc;
 
-    use super::processor;
+    use super::dispatch_instruction;
     use alloc::{rc::Rc, vec::Vec};
     use anchor_lang_v2::pinocchio::{
         account::{AccountView, RuntimeAccount},
@@ -16950,7 +16965,7 @@ pub mod entrypoint {
             });
         }
 
-        processor::process_instruction(program_id, &legacy_accounts, instruction_data)
+        dispatch_instruction(program_id, &legacy_accounts, instruction_data)
     }
 
     fn first_duplicate(accounts: &[AccountView], index: usize) -> Option<usize> {

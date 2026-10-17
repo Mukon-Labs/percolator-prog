@@ -2644,6 +2644,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "percolator"
+version = "0.1.1"
+source = "git+https://github.com/Mukon-Labs/percolator.git?rev=72613184c4d4e82dbb643f7663b6e1328d541516#72613184c4d4e82dbb643f7663b6e1328d541516"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "percolator-prog"
 version = "0.1.0"
 dependencies = [
@@ -2656,7 +2664,8 @@ dependencies = [
  "num-bigint 0.4.6",
  "num-derive 0.4.2",
  "num-traits",
- "percolator",
+ "percolator 0.1.1 (git+https://github.com/aeyakovenko/percolator?rev=4db11a8cb0053815e23a35d3a7d3edc265d8d866)",
+ "percolator 0.1.1 (git+https://github.com/Mukon-Labs/percolator.git?rev=72613184c4d4e82dbb643f7663b6e1328d541516)",
  "pinocchio 0.6.0",
  "proptest",
  "pyth-sdk-solana",
