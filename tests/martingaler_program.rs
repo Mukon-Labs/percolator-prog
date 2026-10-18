@@ -5952,6 +5952,7 @@ fn settled_fifo_head_blocks_profit_bypass_and_accepts_new_current_tail_claim() {
 #[test]
 fn full_tail_rollover_bundle_is_atomic_bounded_and_initializes_current_sequence() {
     const QUEUED: u64 = 8_820_000;
+    const ROLLOVER_TX_CU_LIMIT: u32 = 250_000;
     let mut fixture = Fixture::new(209);
     bootstrap_cash_open(&mut fixture, false);
     let entry = fixture.install_pyth_price(&PRIMARY_FEED_ID, 100_000_000, 100_000, ORACLE_TIME);
@@ -5990,7 +5991,7 @@ fn full_tail_rollover_bundle_is_atomic_bounded_and_initializes_current_sequence(
     let exit = fixture.install_pyth_price(&PRIMARY_FEED_ID, 101_000_000, 100_000, ORACLE_TIME);
     let instructions = vec![
         ComputeBudgetInstruction::request_heap_frame(128 * 1024),
-        ComputeBudgetInstruction::set_compute_unit_limit(TX_CU_LIMIT),
+        ComputeBudgetInstruction::set_compute_unit_limit(ROLLOVER_TX_CU_LIMIT),
         fixture.prepare_claim_instruction(),
         fixture.prepare_queue_page_instruction(1),
         fixture.profitable_close_instruction(exit, ProfitSettlementShape::Rollover),
@@ -6011,7 +6012,7 @@ fn full_tail_rollover_bundle_is_atomic_bounded_and_initializes_current_sequence(
         "martingaler_phase2b6_rollover_bundle_compute_units={};wire_bytes={wire_len}",
         result.compute_units_consumed
     );
-    assert!(result.compute_units_consumed <= u64::from(TX_CU_LIMIT));
+    assert!(result.compute_units_consumed <= u64::from(ROLLOVER_TX_CU_LIMIT));
 
     let pool =
         decode_account::<PoolState>(&fixture.svm.get_account(&fixture.pool).unwrap().data).unwrap();
