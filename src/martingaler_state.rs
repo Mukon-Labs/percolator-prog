@@ -8,7 +8,7 @@ use alloc::boxed::Box;
 use bytemuck::{Pod, Zeroable};
 use core::mem::size_of;
 use percolator_martingaler_engine::martingaler::{
-    V1_MAX_LEVERAGE_X, V1_MAX_NET_PROFIT_PER_POSITION_QUOTE, V1_MAX_POSITION_NOTIONAL_QUOTE,
+    V1_MAX_NET_PROFIT_PER_POSITION_QUOTE, V1_MAX_POSITION_NOTIONAL_QUOTE,
     V1_MAX_RESERVED_PROFIT_PER_CONTROLLER_QUOTE, V1_TOTAL_POTENTIAL_LIABILITY_QUOTE,
 };
 use solana_program::program_error::ProgramError;
@@ -23,6 +23,12 @@ pub const MARTINGALER_ERROR_BASE: u32 = 30_000;
 pub const QUEUE_FLAG_HEAD_SETTLED: u8 = 1;
 pub const MAX_ORACLE_STALENESS_SECS: u64 = 300;
 pub const MAX_ORACLE_CONFIDENCE_BPS: u16 = 1_000;
+pub const MAX_PHOENIX_SOURCE_STALENESS_SLOTS: u64 = 10_000;
+pub const V1_MAX_LEVERAGE_X: u16 = 500;
+pub const V1_MIN_COLLATERAL_QUOTE: u128 = 10 * 1_000_000;
+pub const V1_PAYOUT_FACTOR_SCALE_BPS: u16 = 10_000;
+pub const V1_MIN_PAYOUT_FACTOR_BPS: u16 = 3_000;
+const LEGACY_FULL_RESERVE_ADMISSION: u16 = u16::MAX;
 
 pub const KIND_POOL: u8 = 1;
 pub const KIND_MARKET_RISK: u8 = 2;
@@ -31,6 +37,11 @@ pub const KIND_POSITION: u8 = 4;
 pub const KIND_CLAIM: u8 = 5;
 pub const KIND_QUEUE_PAGE: u8 = 6;
 pub const KIND_ORACLE_POLICY: u8 = 7;
+pub const KIND_ORACLE_RELAY: u8 = 8;
+pub const KIND_TRADING_SESSION: u8 = 9;
+pub const TRADING_SESSION_DURATION_SECS: i64 = 3_600;
+pub const TRADING_SESSION_MAX_ACTIONS: u64 = 100;
+pub const TRADING_SESSION_TOTAL_NOTIONAL_CAP: u128 = 10_000_000 * 1_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -330,6 +341,27 @@ impl TryFrom<u8> for PositionSide {
 pub enum FundingKind {
     Cash = 0,
     Claim = 1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum OracleRelaySource {
+    MagicBlockDemo = 1,
+    PhoenixHawkeye = 2,
+    PhoenixMainnetRelay = 3,
+}
+
+impl TryFrom<u8> for OracleRelaySource {
+    type Error = StateError;
+
+    fn try_from(value: u8) -> StateResult<Self> {
+        match value {
+            1 => Ok(Self::MagicBlockDemo),
+            2 => Ok(Self::PhoenixHawkeye),
+            3 => Ok(Self::PhoenixMainnetRelay),
+            _ => Err(StateError::InvalidTag),
+        }
+    }
 }
 
 impl TryFrom<u8> for FundingKind {
@@ -729,6 +761,162 @@ impl MartingalerAccount for OraclePolicyState {
     }
 }
 
+/// Program-owned L1 observation with an immutable source-specific trust path.
+///
+/// MagicBlock and devnet Phoenix-mainnet-mirror observations are written by
+/// the configured singleton keeper; native Phoenix observations are refreshed
+/// permissionlessly through a pinned Hawkeye CPI. The source tag and immutable
+/// configuration keep those trust paths distinct from each other and from
+/// direct Pyth/Switchboard accounts.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
+pub struct OracleRelayState {
+    pub pool: Key32,
+    pub market: Key32,
+    pub feed_id: Key32,
+    pub authority: Key32,
+    pub price_e6: U64Le,
+    pub confidence_e6: U64Le,
+    pub publish_time: I64Le,
+    pub source_posted_slot: U64Le,
+    pub update_slot: U64Le,
+    pub sequence: U64Le,
+    /// Exact E6 quote-price value represented by one Phoenix market tick.
+    /// Zero for relay sources that already submit an E6 price.
+    pub price_e6_per_tick: U64Le,
+    /// Maximum age of both Phoenix mark and index updates at refresh time.
+    /// Zero for non-Phoenix relay sources.
+    pub max_source_staleness_slots: U64Le,
+    /// Maximum Phoenix best-bid/best-ask spread, measured around the midpoint.
+    /// Zero for non-Phoenix relay sources.
+    pub max_spread_bps: U16Le,
+    /// Maximum divergence between Phoenix's finalized mark and index price.
+    /// Zero for non-Phoenix relay sources.
+    pub max_mark_index_divergence_bps: U16Le,
+    pub source: u8,
+    pub reserved_control: [u8; 3],
+}
+
+impl OracleRelayState {
+    pub fn new(
+        pool: Key32,
+        market: Key32,
+        feed_id: Key32,
+        authority: Key32,
+        source: OracleRelaySource,
+        price_e6_per_tick: u64,
+        max_source_staleness_slots: u64,
+        max_spread_bps: u16,
+        max_mark_index_divergence_bps: u16,
+    ) -> StateResult<Self> {
+        let state = Self {
+            pool,
+            market,
+            feed_id,
+            authority,
+            price_e6: U64Le::new(0),
+            confidence_e6: U64Le::new(0),
+            publish_time: I64Le::new(0),
+            source_posted_slot: U64Le::new(0),
+            update_slot: U64Le::new(0),
+            sequence: U64Le::new(0),
+            price_e6_per_tick: U64Le::new(price_e6_per_tick),
+            max_source_staleness_slots: U64Le::new(max_source_staleness_slots),
+            max_spread_bps: U16Le::new(max_spread_bps),
+            max_mark_index_divergence_bps: U16Le::new(max_mark_index_divergence_bps),
+            source: source as u8,
+            reserved_control: [0; 3],
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub fn record_observation(
+        &mut self,
+        price_e6: u64,
+        confidence_e6: u64,
+        publish_time: i64,
+        source_posted_slot: u64,
+        update_slot: u64,
+    ) -> StateResult<()> {
+        if price_e6 == 0
+            || confidence_e6 > price_e6
+            || publish_time <= 0
+            || source_posted_slot == 0
+            || update_slot == 0
+        {
+            return Err(StateError::InvalidState);
+        }
+        let sequence = self.sequence.get();
+        if sequence != 0
+            && (publish_time < self.publish_time.get()
+                || source_posted_slot <= self.source_posted_slot.get())
+        {
+            return Err(StateError::InvalidState);
+        }
+        self.price_e6 = U64Le::new(price_e6);
+        self.confidence_e6 = U64Le::new(confidence_e6);
+        self.publish_time = I64Le::new(publish_time);
+        self.source_posted_slot = U64Le::new(source_posted_slot);
+        self.update_slot = U64Le::new(update_slot);
+        self.sequence = U64Le::new(
+            sequence
+                .checked_add(1)
+                .ok_or(StateError::ArithmeticOverflow)?,
+        );
+        self.validate()
+    }
+}
+
+impl MartingalerAccount for OracleRelayState {
+    const KIND: u8 = KIND_ORACLE_RELAY;
+
+    fn validate(&self) -> StateResult<()> {
+        let source = OracleRelaySource::try_from(self.source)?;
+        let source_config_valid = match source {
+            OracleRelaySource::MagicBlockDemo | OracleRelaySource::PhoenixMainnetRelay => {
+                self.price_e6_per_tick.get() == 0
+                    && self.max_source_staleness_slots.get() == 0
+                    && self.max_spread_bps.get() == 0
+                    && self.max_mark_index_divergence_bps.get() == 0
+            }
+            OracleRelaySource::PhoenixHawkeye => {
+                self.price_e6_per_tick.get() > 0
+                    && self.max_source_staleness_slots.get() > 0
+                    && self.max_source_staleness_slots.get() <= MAX_PHOENIX_SOURCE_STALENESS_SLOTS
+                    && self.max_spread_bps.get() > 0
+                    && self.max_spread_bps.get() <= 10_000
+                    && self.max_mark_index_divergence_bps.get() > 0
+                    && self.max_mark_index_divergence_bps.get() <= 10_000
+            }
+        };
+        let empty_observation = self.sequence.get() == 0;
+        let observation_is_zero = self.price_e6.get() == 0
+            && self.confidence_e6.get() == 0
+            && self.publish_time.get() == 0
+            && self.source_posted_slot.get() == 0
+            && self.update_slot.get() == 0;
+        if self.pool.is_zero()
+            || self.market.is_zero()
+            || self.feed_id.is_zero()
+            || self.authority.is_zero()
+            || self.pool == self.market
+            || !source_config_valid
+            || !all_zero(&self.reserved_control)
+            || (empty_observation != observation_is_zero)
+            || (!empty_observation
+                && (self.price_e6.get() == 0
+                    || self.confidence_e6.get() > self.price_e6.get()
+                    || self.publish_time.get() <= 0
+                    || self.source_posted_slot.get() == 0
+                    || self.update_slot.get() == 0))
+        {
+            return Err(StateError::InvalidState);
+        }
+        Ok(())
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
 pub struct ControllerRiskState {
@@ -769,6 +957,151 @@ impl MartingalerAccount for ControllerRiskState {
             || self.controller.is_zero()
             || self.available_cash_collateral.get() > u128::from(u64::MAX)
             || self.reserved_profit.get() > V1_MAX_RESERVED_PROFIT_PER_CONTROLLER_QUOTE
+            || !all_zero(&self.reserved)
+        {
+            return Err(StateError::InvalidState);
+        }
+        Ok(())
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
+pub struct TradingSessionState {
+    pub pool: Key32,
+    pub owner: Key32,
+    pub session_key: Key32,
+    pub epoch: U64Le,
+    pub created_at: I64Le,
+    pub expires_at: I64Le,
+    pub next_nonce: U64Le,
+    pub spent_notional: U128Le,
+    pub revoked: u8,
+    pub reserved: [u8; 15],
+}
+
+impl TradingSessionState {
+    pub fn new(pool: Key32, owner: Key32, session_key: Key32, now: i64) -> StateResult<Self> {
+        Self::new_epoch(pool, owner, session_key, 1, now)
+    }
+
+    fn new_epoch(
+        pool: Key32,
+        owner: Key32,
+        session_key: Key32,
+        epoch: u64,
+        now: i64,
+    ) -> StateResult<Self> {
+        let state = Self {
+            pool,
+            owner,
+            session_key,
+            epoch: U64Le::new(epoch),
+            created_at: I64Le::new(now),
+            expires_at: I64Le::new(
+                now.checked_add(TRADING_SESSION_DURATION_SECS)
+                    .ok_or(StateError::ArithmeticOverflow)?,
+            ),
+            next_nonce: U64Le::new(0),
+            spent_notional: U128Le::new(0),
+            revoked: 0,
+            reserved: [0; 15],
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub fn renew(
+        &self,
+        owner: Key32,
+        session_key: Key32,
+        expected_epoch: u64,
+        now: i64,
+    ) -> StateResult<Self> {
+        self.validate()?;
+        if owner != self.owner || expected_epoch != self.epoch.get() {
+            return Err(StateError::InvalidState);
+        }
+        Self::new_epoch(
+            self.pool,
+            self.owner,
+            session_key,
+            expected_epoch
+                .checked_add(1)
+                .ok_or(StateError::ArithmeticOverflow)?,
+            now,
+        )
+    }
+
+    pub fn revoke(&self, owner: Key32, expected_epoch: u64) -> StateResult<Self> {
+        self.validate()?;
+        if owner != self.owner || expected_epoch != self.epoch.get() {
+            return Err(StateError::InvalidState);
+        }
+        let mut next = *self;
+        next.revoked = 1;
+        next.validate()?;
+        Ok(next)
+    }
+
+    pub fn authorize_action(
+        &self,
+        pool: Key32,
+        owner: Key32,
+        signer: Key32,
+        epoch: u64,
+        nonce: u64,
+        now: i64,
+        opened_notional: u128,
+    ) -> StateResult<Self> {
+        self.validate()?;
+        if pool != self.pool
+            || owner != self.owner
+            || signer != self.session_key
+            || epoch != self.epoch.get()
+            || nonce != self.next_nonce.get()
+            || self.revoked != 0
+            || now < self.created_at.get()
+            || now >= self.expires_at.get()
+            || opened_notional > V1_MAX_POSITION_NOTIONAL_QUOTE
+        {
+            return Err(StateError::InvalidState);
+        }
+        let next_spent = self
+            .spent_notional
+            .get()
+            .checked_add(opened_notional)
+            .ok_or(StateError::ArithmeticOverflow)?;
+        if next_spent > TRADING_SESSION_TOTAL_NOTIONAL_CAP {
+            return Err(StateError::RiskLimitExceeded);
+        }
+        let mut next = *self;
+        next.next_nonce = U64Le::new(nonce.checked_add(1).ok_or(StateError::ArithmeticOverflow)?);
+        next.spent_notional = U128Le::new(next_spent);
+        next.validate()?;
+        Ok(next)
+    }
+}
+
+impl MartingalerAccount for TradingSessionState {
+    const KIND: u8 = KIND_TRADING_SESSION;
+
+    fn validate(&self) -> StateResult<()> {
+        let expected_expiry = self
+            .created_at
+            .get()
+            .checked_add(TRADING_SESSION_DURATION_SECS)
+            .ok_or(StateError::ArithmeticOverflow)?;
+        if self.pool.is_zero()
+            || self.owner.is_zero()
+            || self.session_key.is_zero()
+            || self.owner == self.session_key
+            || self.epoch.get() == 0
+            || self.created_at.get() < 0
+            || self.expires_at.get() != expected_expiry
+            || self.next_nonce.get() > TRADING_SESSION_MAX_ACTIONS
+            || self.spent_notional.get() > TRADING_SESSION_TOTAL_NOTIONAL_CAP
+            || self.revoked > 1
             || !all_zero(&self.reserved)
         {
             return Err(StateError::InvalidState);
@@ -915,10 +1248,12 @@ impl MartingalerAccount for PositionState {
         {
             return Err(StateError::InvalidState);
         }
-        let minimum_leverage = (self.notional.get() / self.collateral.get())
-            .checked_add(u128::from(self.notional.get() % self.collateral.get() != 0))
+        let exact_notional = self
+            .collateral
+            .get()
+            .checked_mul(u128::from(self.leverage_x.get()))
             .ok_or(StateError::ArithmeticOverflow)?;
-        if minimum_leverage > u128::from(self.leverage_x.get()) {
+        if self.notional.get() != exact_notional {
             return Err(StateError::InvalidState);
         }
         match funding {
@@ -1328,6 +1663,12 @@ pub struct IdleCashWithdrawalOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PayoutQuote {
+    pub max_payable_profit: u128,
+    pub payout_factor_bps: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CashOpenOutcome {
     pub position: PositionState,
     pub reserved_profit: u128,
@@ -1734,6 +2075,90 @@ pub fn withdraw_idle_cash(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn quote_payout_factor(
+    pool: &PoolState,
+    market: &MarketRiskState,
+    controller: &ControllerRiskState,
+    notional: u128,
+    min_payout_factor_bps: u16,
+) -> StateResult<PayoutQuote> {
+    pool.validate()?;
+    market.validate()?;
+    controller.validate()?;
+    if min_payout_factor_bps == LEGACY_FULL_RESERVE_ADMISSION {
+        let reserved_profit = core::cmp::min(notional, market.max_net_profit_per_position.get());
+        let controller_reserve = controller
+            .reserved_profit
+            .get()
+            .checked_add(reserved_profit)
+            .ok_or(StateError::ArithmeticOverflow)?;
+        let total_liability = pool
+            .total_queued
+            .get()
+            .checked_add(pool.open_claim_collateral.get())
+            .and_then(|value| value.checked_add(pool.residual_bad_debt.get()))
+            .and_then(|value| value.checked_add(pool.reserved_open_profit.get()))
+            .and_then(|value| value.checked_add(reserved_profit))
+            .ok_or(StateError::ArithmeticOverflow)?;
+        if controller_reserve > pool.max_reserved_profit_per_controller.get()
+            || total_liability > pool.total_liability_open_gate.get()
+        {
+            return Err(StateError::LiabilityLimitExceeded);
+        }
+        return Ok(PayoutQuote {
+            max_payable_profit: reserved_profit,
+            payout_factor_bps: V1_PAYOUT_FACTOR_SCALE_BPS,
+        });
+    }
+    if notional == 0
+        || (min_payout_factor_bps != 0
+            && !(V1_MIN_PAYOUT_FACTOR_BPS..=V1_PAYOUT_FACTOR_SCALE_BPS)
+                .contains(&min_payout_factor_bps))
+    {
+        return Err(StateError::RiskLimitExceeded);
+    }
+    let nominal_profit = core::cmp::min(notional, market.max_net_profit_per_position.get());
+    let controller_depth = pool
+        .max_reserved_profit_per_controller
+        .get()
+        .saturating_sub(controller.reserved_profit.get());
+    let current_liability = pool
+        .total_queued
+        .get()
+        .checked_add(pool.open_claim_collateral.get())
+        .and_then(|value| value.checked_add(pool.residual_bad_debt.get()))
+        .and_then(|value| value.checked_add(pool.reserved_open_profit.get()))
+        .ok_or(StateError::ArithmeticOverflow)?;
+    let total_depth = pool
+        .total_liability_open_gate
+        .get()
+        .saturating_sub(current_liability);
+    let available = core::cmp::min(
+        nominal_profit,
+        core::cmp::min(controller_depth, total_depth),
+    );
+    let payout_factor_bps = available
+        .checked_mul(u128::from(V1_PAYOUT_FACTOR_SCALE_BPS))
+        .ok_or(StateError::ArithmeticOverflow)?
+        / nominal_profit;
+    let payout_factor_bps =
+        u16::try_from(payout_factor_bps).map_err(|_| StateError::ArithmeticOverflow)?;
+    if payout_factor_bps < V1_MIN_PAYOUT_FACTOR_BPS
+        || (min_payout_factor_bps != 0 && payout_factor_bps < min_payout_factor_bps)
+    {
+        return Err(StateError::LiabilityLimitExceeded);
+    }
+    let max_payable_profit = nominal_profit
+        .checked_mul(u128::from(payout_factor_bps))
+        .ok_or(StateError::ArithmeticOverflow)?
+        / u128::from(V1_PAYOUT_FACTOR_SCALE_BPS);
+    Ok(PayoutQuote {
+        max_payable_profit,
+        payout_factor_bps,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn open_cash_position_from_idle(
     pool_key: Key32,
     market_key: Key32,
@@ -1752,6 +2177,47 @@ pub fn open_cash_position_from_idle(
     secondary_entry_price_e6: u64,
     secondary_publish_time: i64,
 ) -> StateResult<CashOpenOutcome> {
+    open_cash_position_from_idle_guarded(
+        pool_key,
+        market_key,
+        controller_key,
+        pool,
+        market,
+        controller,
+        observed_vault_balance,
+        position_id,
+        side,
+        collateral,
+        notional,
+        leverage_x,
+        entry_price_e6,
+        entry_publish_time,
+        secondary_entry_price_e6,
+        secondary_publish_time,
+        LEGACY_FULL_RESERVE_ADMISSION,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn open_cash_position_from_idle_guarded(
+    pool_key: Key32,
+    market_key: Key32,
+    controller_key: Key32,
+    pool: &mut PoolState,
+    market: &mut MarketRiskState,
+    controller: &mut ControllerRiskState,
+    observed_vault_balance: u64,
+    position_id: u64,
+    side: PositionSide,
+    collateral: u128,
+    notional: u128,
+    leverage_x: u16,
+    entry_price_e6: u64,
+    entry_publish_time: i64,
+    secondary_entry_price_e6: u64,
+    secondary_publish_time: i64,
+    min_payout_factor_bps: u16,
+) -> StateResult<CashOpenOutcome> {
     pool.validate()?;
     market.validate()?;
     controller.validate()?;
@@ -1763,7 +2229,8 @@ pub fn open_cash_position_from_idle(
         || market_key.is_zero()
         || market.market_id.get() == 0
         || position_id == 0
-        || collateral == 0
+        || (min_payout_factor_bps != LEGACY_FULL_RESERVE_ADMISSION
+            && collateral < V1_MIN_COLLATERAL_QUOTE)
         || notional == 0
         || leverage_x == 0
         || leverage_x > market.max_leverage_x.get()
@@ -1775,11 +2242,10 @@ pub fn open_cash_position_from_idle(
         return Err(StateError::RiskLimitExceeded);
     }
 
-    let minimum_leverage = notional
-        .checked_add(collateral - 1)
-        .ok_or(StateError::ArithmeticOverflow)?
-        / collateral;
-    if minimum_leverage > u128::from(leverage_x) {
+    let exact_notional = collateral
+        .checked_mul(u128::from(leverage_x))
+        .ok_or(StateError::ArithmeticOverflow)?;
+    if notional != exact_notional {
         return Err(StateError::RiskLimitExceeded);
     }
 
@@ -1795,7 +2261,8 @@ pub fn open_cash_position_from_idle(
         return Err(StateError::InsufficientCashCollateral);
     }
 
-    let reserved_profit = core::cmp::min(notional, market.max_net_profit_per_position.get());
+    let payout = quote_payout_factor(pool, market, controller, notional, min_payout_factor_bps)?;
+    let reserved_profit = payout.max_payable_profit;
     let next_controller_reserve = controller
         .reserved_profit
         .get()
@@ -1944,6 +2411,53 @@ pub fn open_claim_position_from_queue(
     secondary_entry_price_e6: u64,
     secondary_publish_time: i64,
 ) -> StateResult<ClaimOpenOutcome> {
+    open_claim_position_from_queue_guarded(
+        pool_key,
+        market_key,
+        controller_key,
+        source_claim_key,
+        pool,
+        market,
+        controller,
+        source_page,
+        source_claim,
+        observed_vault_balance,
+        position_id,
+        side,
+        claim_amount,
+        notional,
+        leverage_x,
+        entry_price_e6,
+        entry_publish_time,
+        secondary_entry_price_e6,
+        secondary_publish_time,
+        LEGACY_FULL_RESERVE_ADMISSION,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn open_claim_position_from_queue_guarded(
+    pool_key: Key32,
+    market_key: Key32,
+    controller_key: Key32,
+    source_claim_key: Key32,
+    pool: &mut PoolState,
+    market: &mut MarketRiskState,
+    controller: &mut ControllerRiskState,
+    source_page: &mut QueuePageState,
+    source_claim: &mut ClaimState,
+    observed_vault_balance: u64,
+    position_id: u64,
+    side: PositionSide,
+    claim_amount: u128,
+    notional: u128,
+    leverage_x: u16,
+    entry_price_e6: u64,
+    entry_publish_time: i64,
+    secondary_entry_price_e6: u64,
+    secondary_publish_time: i64,
+    min_payout_factor_bps: u16,
+) -> StateResult<ClaimOpenOutcome> {
     pool.validate()?;
     market.validate()?;
     controller.validate()?;
@@ -1961,7 +2475,8 @@ pub fn open_claim_position_from_queue(
         || market_key.is_zero()
         || market.market_id.get() == 0
         || position_id == 0
-        || claim_amount == 0
+        || (min_payout_factor_bps != LEGACY_FULL_RESERVE_ADMISSION
+            && claim_amount < V1_MIN_COLLATERAL_QUOTE)
         || notional == 0
         || leverage_x == 0
         || leverage_x > market.max_leverage_x.get()
@@ -1973,11 +2488,10 @@ pub fn open_claim_position_from_queue(
         return Err(StateError::RiskLimitExceeded);
     }
 
-    let minimum_leverage = notional
-        .checked_add(claim_amount - 1)
-        .ok_or(StateError::ArithmeticOverflow)?
-        / claim_amount;
-    if minimum_leverage > u128::from(leverage_x) {
+    let exact_notional = claim_amount
+        .checked_mul(u128::from(leverage_x))
+        .ok_or(StateError::ArithmeticOverflow)?;
+    if notional != exact_notional {
         return Err(StateError::RiskLimitExceeded);
     }
 
@@ -1987,7 +2501,8 @@ pub fn open_claim_position_from_queue(
         return Err(StateError::CustodyShortfall);
     }
     let surplus_recorded = observed_vault_balance - represented_before;
-    let reserved_profit = core::cmp::min(notional, market.max_net_profit_per_position.get());
+    let payout = quote_payout_factor(pool, market, controller, notional, min_payout_factor_bps)?;
+    let reserved_profit = payout.max_payable_profit;
     let next_controller_reserve = controller
         .reserved_profit
         .get()
@@ -2221,6 +2736,13 @@ pub fn close_cash_position(
             .checked_sub(collateral)
             .ok_or(StateError::ArithmeticOverflow)?,
     );
+    next_pool.idle_cash_collateral = U128Le::new(
+        next_pool
+            .idle_cash_collateral
+            .get()
+            .checked_add(refund)
+            .ok_or(StateError::ArithmeticOverflow)?,
+    );
     next_pool.reserved_open_profit = U128Le::new(
         next_pool
             .reserved_open_profit
@@ -2259,6 +2781,13 @@ pub fn close_cash_position(
             .checked_sub(1)
             .ok_or(StateError::ArithmeticOverflow)?,
     );
+    next_controller.available_cash_collateral = U128Le::new(
+        next_controller
+            .available_cash_collateral
+            .get()
+            .checked_add(refund)
+            .ok_or(StateError::ArithmeticOverflow)?,
+    );
     if collected != 0 {
         if next_pool.total_queued.get() != 0 || next_pool.queue_flags & QUEUE_FLAG_HEAD_SETTLED != 0
         {
@@ -2294,10 +2823,7 @@ pub fn close_cash_position(
     next_controller.validate()?;
     next_position.validate()?;
     let represented_after = next_pool.represented_quote_custody()?;
-    let expected_after = observed_vault_balance
-        .checked_sub(refund)
-        .ok_or(StateError::ArithmeticOverflow)?;
-    if represented_after != expected_after {
+    if represented_after != observed_vault_balance {
         return Err(StateError::InvalidState);
     }
 
@@ -2442,6 +2968,18 @@ pub fn close_profitable_cash_position(
             .checked_sub(position.collateral.get())
             .ok_or(StateError::ArithmeticOverflow)?,
     );
+    let internal_credit = position
+        .collateral
+        .get()
+        .checked_add(immediate_profit)
+        .ok_or(StateError::ArithmeticOverflow)?;
+    next_pool.idle_cash_collateral = U128Le::new(
+        next_pool
+            .idle_cash_collateral
+            .get()
+            .checked_add(internal_credit)
+            .ok_or(StateError::ArithmeticOverflow)?,
+    );
     next_pool.free_cash = U128Le::new(
         next_pool
             .free_cash
@@ -2491,6 +3029,13 @@ pub fn close_profitable_cash_position(
             .open_positions
             .get()
             .checked_sub(1)
+            .ok_or(StateError::ArithmeticOverflow)?,
+    );
+    next_controller.available_cash_collateral = U128Le::new(
+        next_controller
+            .available_cash_collateral
+            .get()
+            .checked_add(internal_credit)
             .ok_or(StateError::ArithmeticOverflow)?,
     );
     next_position.status = PositionStatus::Closed as u8;
@@ -2562,15 +3107,7 @@ pub fn close_profitable_cash_position(
         claim.validate()?;
     }
     let represented_after = next_pool.represented_quote_custody()?;
-    let token_outflow = position
-        .collateral
-        .get()
-        .checked_add(immediate_profit)
-        .ok_or(StateError::ArithmeticOverflow)?;
-    let expected_after = observed
-        .checked_sub(token_outflow)
-        .ok_or(StateError::ArithmeticOverflow)?;
-    if represented_after != expected_after {
+    if represented_after != observed {
         return Err(StateError::InvalidState);
     }
 
@@ -2898,6 +3435,13 @@ fn close_claim_position_inner(
             .checked_sub(immediate_payout)
             .ok_or(StateError::ArithmeticOverflow)?,
     );
+    next_pool.idle_cash_collateral = U128Le::new(
+        next_pool
+            .idle_cash_collateral
+            .get()
+            .checked_add(immediate_payout)
+            .ok_or(StateError::ArithmeticOverflow)?,
+    );
     next_pool.residual_bad_debt = U128Le::new(
         next_pool
             .residual_bad_debt
@@ -2950,6 +3494,13 @@ fn close_claim_position_inner(
             .open_positions
             .get()
             .checked_sub(1)
+            .ok_or(StateError::ArithmeticOverflow)?,
+    );
+    next_controller.available_cash_collateral = U128Le::new(
+        next_controller
+            .available_cash_collateral
+            .get()
+            .checked_add(immediate_payout)
             .ok_or(StateError::ArithmeticOverflow)?,
     );
     next_source_claim.collateral_in_use = U128Le::new(
@@ -3061,10 +3612,7 @@ fn close_claim_position_inner(
         claim.validate()?;
     }
     let represented_after = next_pool.represented_quote_custody()?;
-    let expected_after = observed
-        .checked_sub(immediate_payout)
-        .ok_or(StateError::ArithmeticOverflow)?;
-    if represented_after != expected_after {
+    if represented_after != observed {
         return Err(StateError::InvalidState);
     }
 
@@ -3347,6 +3895,20 @@ pub fn service_fifo_claim(
             .queued_claim_face
             .get()
             .checked_sub(outcome.paid)
+            .ok_or(StateError::ArithmeticOverflow)?,
+    );
+    next_pool.idle_cash_collateral = U128Le::new(
+        next_pool
+            .idle_cash_collateral
+            .get()
+            .checked_add(outcome.paid)
+            .ok_or(StateError::ArithmeticOverflow)?,
+    );
+    next_controller.available_cash_collateral = U128Le::new(
+        next_controller
+            .available_cash_collateral
+            .get()
+            .checked_add(outcome.paid)
             .ok_or(StateError::ArithmeticOverflow)?,
     );
     next_claim.remaining_face = U128Le::new(outcome.remaining_face);
@@ -3657,7 +4219,9 @@ fn all_zero(bytes: &[u8]) -> bool {
 pub const POOL_ACCOUNT_LEN: usize = account_len::<PoolState>();
 pub const MARKET_RISK_ACCOUNT_LEN: usize = account_len::<MarketRiskState>();
 pub const ORACLE_POLICY_ACCOUNT_LEN: usize = account_len::<OraclePolicyState>();
+pub const ORACLE_RELAY_ACCOUNT_LEN: usize = account_len::<OracleRelayState>();
 pub const CONTROLLER_RISK_ACCOUNT_LEN: usize = account_len::<ControllerRiskState>();
+pub const TRADING_SESSION_ACCOUNT_LEN: usize = account_len::<TradingSessionState>();
 pub const POSITION_ACCOUNT_LEN: usize = account_len::<PositionState>();
 pub const CLAIM_ACCOUNT_LEN: usize = account_len::<ClaimState>();
 pub const QUEUE_PAGE_ACCOUNT_LEN: usize = account_len::<QueuePageState>();

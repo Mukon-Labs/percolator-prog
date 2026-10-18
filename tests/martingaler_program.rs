@@ -8,26 +8,33 @@ use percolator_prog::{
     dispatch_instruction, id,
     ix::Instruction as V16Instruction,
     martingaler_program::{
-        derive_canonical_vault, derive_claim, derive_controller, derive_market,
-        derive_oracle_policy, derive_pool, derive_position, derive_queue_page,
-        derive_queue_page_zero, derive_vault_authority, has_namespace,
-        Instruction as MartingalerInstruction, PopFifoShape, ProfitSettlementShape,
+        decode_phoenix_bbo_return, derive_canonical_vault, derive_claim, derive_controller,
+        derive_market, derive_oracle_policy, derive_oracle_relay, derive_pool, derive_position,
+        derive_queue_page, derive_queue_page_zero, derive_trading_session, derive_vault_authority,
+        has_namespace, Instruction as MartingalerInstruction, PopFifoShape, ProfitSettlementShape,
         CLOSE_CASH_POSITION_IX_LEN, CLOSE_CLAIM_POSITION_IX_LEN,
         CLOSE_PROFITABLE_CASH_POSITION_IX_LEN, CONTROLLER_IX_LEN, DEPOSIT_CASH_IX_LEN,
-        INITIALIZE_MARKET_IX_LEN, INITIALIZE_ORACLE_POLICY_IX_LEN, INITIALIZE_VAULT_IX_LEN,
+        HAWKEYE_PROGRAM_ID, INITIALIZE_MARKET_IX_LEN, INITIALIZE_ORACLE_POLICY_IX_LEN,
+        INITIALIZE_ORACLE_RELAY_IX_LEN, INITIALIZE_TRADING_SESSION_IX_LEN, INITIALIZE_VAULT_IX_LEN,
         MARTINGALER_IX_LEN, MARTINGALER_IX_MAGIC, MARTINGALER_IX_VERSION,
-        OPEN_CASH_POSITION_IX_LEN, OPEN_CLAIM_POSITION_IX_LEN, POP_FIFO_HEAD_IX_LEN,
-        PREPARE_CLAIM_IX_LEN, PREPARE_MARKET_IX_LEN, PREPARE_ORACLE_POLICY_IX_LEN,
-        PREPARE_POSITION_IX_LEN, PREPARE_QUEUE_PAGE_IX_LEN, RESOLVE_BANKRUPT_CLAIM_POSITION_IX_LEN,
-        SERVICE_FIFO_HEAD_IX_LEN, SET_STATUS_IX_LEN, WITHDRAW_IDLE_CASH_IX_LEN,
+        OPEN_CASH_POSITION_IX_LEN, OPEN_CLAIM_POSITION_IX_LEN, PHOENIX_BETA_GLOBAL_CONFIG,
+        PHOENIX_BETA_PROGRAM_ID, PHOENIX_HAWKEYE_RETURN_VERSION, PHOENIX_MAINNET_GLOBAL_CONFIG,
+        PHOENIX_VIEW_BBO_RETURN_MAGIC, POP_FIFO_HEAD_IX_LEN, PREPARE_CLAIM_IX_LEN,
+        PREPARE_MARKET_IX_LEN, PREPARE_ORACLE_POLICY_IX_LEN, PREPARE_ORACLE_RELAY_IX_LEN,
+        PREPARE_POSITION_IX_LEN, PREPARE_QUEUE_PAGE_IX_LEN, PREPARE_TRADING_SESSION_IX_LEN,
+        REFRESH_PHOENIX_ORACLE_IX_LEN, RESOLVE_BANKRUPT_CLAIM_POSITION_IX_LEN,
+        REVOKE_TRADING_SESSION_IX_LEN, SERVICE_FIFO_HEAD_IX_LEN, SESSION_CLOSE_POSITION_IX_LEN,
+        SESSION_CLOSE_PROFITABLE_POSITION_IX_LEN, SESSION_OPEN_POSITION_IX_LEN,
+        SESSION_PREPARE_POSITION_IX_LEN, SET_STATUS_IX_LEN, UPDATE_ORACLE_RELAY_IX_LEN,
+        WITHDRAW_IDLE_CASH_IX_LEN,
     },
     martingaler_state::{
         account_len, decode_account, decode_account_header, initialize_account, overwrite_account,
         validate_queue_page_zero_account, ClaimState, ClaimStatus, ControllerRiskState,
-        FundingKind, HaircutConfig, Key32, MarketRiskState, OraclePolicyState, PoolState,
-        PoolStatus, PositionSide, PositionState, PositionStatus, QueueEntry, QueuePageState,
-        U128Le, U16Le, ACCOUNT_HEADER_LEN, NO_CLAIM_SEQUENCE, QUEUE_FLAG_HEAD_SETTLED,
-        QUEUE_PAGE_CAPACITY,
+        FundingKind, HaircutConfig, Key32, MarketRiskState, OraclePolicyState, OracleRelaySource,
+        OracleRelayState, PoolState, PoolStatus, PositionSide, PositionState, PositionStatus,
+        QueueEntry, QueuePageState, TradingSessionState, U128Le, U16Le, ACCOUNT_HEADER_LEN,
+        NO_CLAIM_SEQUENCE, QUEUE_FLAG_HEAD_SETTLED, QUEUE_PAGE_CAPACITY,
     },
     oracle_v16, processor,
 };
@@ -56,7 +63,7 @@ const DEPOSIT_AMOUNT: u64 = 250_000_000;
 const POSITION_ID: u64 = 42;
 const OPEN_COLLATERAL: u64 = 10_000_000;
 const OPEN_NOTIONAL: u64 = 1_000_000_000;
-const PROFIT_CLAIM_FACE: u64 = 8_820_000;
+const PROFIT_CLAIM_FACE: u64 = 17_640_000;
 const PRIMARY_FEED_ID: [u8; 32] = [0x11; 32];
 const SECONDARY_FEED_ID: [u8; 32] = [0x22; 32];
 const ORACLE_TIME: i64 = 1_000;
@@ -355,6 +362,20 @@ impl Fixture {
         )
     }
 
+    fn update_leverage_limit_instruction(&self, max_leverage_x: u16) -> SolInstruction {
+        self.instruction(
+            MartingalerInstruction::UpdateLeverageLimit {
+                market_id: MARKET_ID,
+                max_leverage_x,
+            },
+            vec![
+                AccountMeta::new_readonly(self.admin.pubkey(), true),
+                AccountMeta::new(self.pool, false),
+                AccountMeta::new(self.market, false),
+            ],
+        )
+    }
+
     fn withdraw_idle_cash_instruction(&self, amount: u64) -> SolInstruction {
         self.instruction(
             MartingalerInstruction::WithdrawIdleCash { amount },
@@ -484,6 +505,28 @@ impl Fixture {
                 leverage_x,
             },
             accounts,
+        )
+    }
+
+    fn guarded_open_cash_instruction(
+        &self,
+        primary_oracle: Pubkey,
+        collateral: u64,
+        notional: u64,
+        leverage_x: u16,
+        min_payout_factor_bps: u16,
+    ) -> SolInstruction {
+        self.instruction(
+            MartingalerInstruction::GuardedOpenCashPosition {
+                position_id: POSITION_ID,
+                market_id: MARKET_ID,
+                side: PositionSide::Long,
+                collateral,
+                notional,
+                leverage_x,
+                min_payout_factor_bps,
+            },
+            self.open_cash_metas(primary_oracle, None),
         )
     }
 
@@ -669,6 +712,18 @@ impl Fixture {
 
     fn service_fifo_instruction(&self) -> SolInstruction {
         self.service_fifo_instruction_for(self.claim(), self.page_zero)
+    }
+
+    fn service_fifo_internal_instruction(&self) -> SolInstruction {
+        self.instruction(
+            MartingalerInstruction::ServiceFifoHeadInternal,
+            vec![
+                AccountMeta::new(self.pool, false),
+                AccountMeta::new(self.controller_risk, false),
+                AccountMeta::new(self.claim(), false),
+                AccountMeta::new(self.page_zero, false),
+            ],
+        )
     }
 
     fn service_fifo_instruction_for(&self, claim: Pubkey, head_page: Pubkey) -> SolInstruction {
@@ -1017,6 +1072,16 @@ fn program_path() -> PathBuf {
     path
 }
 
+fn hawkeye_mock_program_path() -> PathBuf {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/hawkeye_mock/target/deploy/hawkeye_mock.so");
+    assert!(
+        path.exists(),
+        "build exact Hawkeye CPI fixture before this test"
+    );
+    path
+}
+
 fn spl_token_program_path() -> PathBuf {
     bundled_litesvm_program("spl_token-3.5.0.so")
 }
@@ -1086,6 +1151,58 @@ fn make_switchboard_data(
     data[2368..2376].copy_from_slice(&result_slot.to_le_bytes());
     data[2952..2960].copy_from_slice(&publish_time.to_le_bytes());
     data
+}
+
+fn make_phoenix_bbo_return(
+    best_bid_ticks: u64,
+    best_ask_ticks: u64,
+    mark_price_ticks: u64,
+    index_price_ticks: u64,
+    mark_slot: u64,
+    index_slot: u64,
+) -> Vec<u8> {
+    let mut data = vec![0u8; 64];
+    data[0..8].copy_from_slice(&PHOENIX_VIEW_BBO_RETURN_MAGIC.to_le_bytes());
+    data[8..10].copy_from_slice(&PHOENIX_HAWKEYE_RETURN_VERSION.to_le_bytes());
+    data[10] = 3;
+    data[16..24].copy_from_slice(&best_bid_ticks.to_le_bytes());
+    data[24..32].copy_from_slice(&best_ask_ticks.to_le_bytes());
+    data[32..40].copy_from_slice(&mark_price_ticks.to_le_bytes());
+    data[40..48].copy_from_slice(&index_price_ticks.to_le_bytes());
+    data[48..56].copy_from_slice(&mark_slot.to_le_bytes());
+    data[56..64].copy_from_slice(&index_slot.to_le_bytes());
+    data
+}
+
+#[test]
+fn phoenix_bbo_return_decoder_binds_exact_hawkeye_shape() {
+    let valid = make_phoenix_bbo_return(9_995, 10_005, 10_000, 10_002, 995, 996);
+    let decoded = decode_phoenix_bbo_return(&valid).unwrap();
+    assert_eq!(decoded.best_bid_ticks, 9_995);
+    assert_eq!(decoded.best_ask_ticks, 10_005);
+    assert_eq!(decoded.mark_price_ticks, 10_000);
+    assert_eq!(decoded.index_price_ticks, 10_002);
+    assert_eq!(decoded.mark_price_last_updated_slot, 995);
+    assert_eq!(decoded.index_price_last_updated_slot, 996);
+
+    for mutation in 0..6 {
+        let mut hostile = valid.clone();
+        match mutation {
+            0 => {
+                hostile.pop();
+            }
+            1 => hostile[0] ^= 1,
+            2 => hostile[8] = 2,
+            3 => hostile[10] = 1,
+            4 => hostile[11] = 1,
+            5 => {
+                hostile[16..24].copy_from_slice(&10_006u64.to_le_bytes());
+                hostile[24..32].copy_from_slice(&10_005u64.to_le_bytes());
+            }
+            _ => unreachable!(),
+        }
+        assert!(decode_phoenix_bbo_return(&hostile).is_err());
+    }
 }
 
 fn make_chainlink_data(decimals: u8, result_slot: u64, publish_time: u32, answer: i128) -> Vec<u8> {
@@ -1181,7 +1298,7 @@ fn install_controller_ata(fixture: &mut Fixture) {
 
 fn queued_claim_fixture(seed: u8, service_cash: u64, status: PoolStatus) -> Fixture {
     let mut fixture = opened_profitable_fixture(seed, 100_000_000);
-    let exit = fixture.install_pyth_price(&PRIMARY_FEED_ID, 101_000_000, 100_000, ORACLE_TIME);
+    let exit = fixture.install_pyth_price(&PRIMARY_FEED_ID, 102_000_000, 100_000, ORACLE_TIME);
     fixture
         .send_controller(vec![
             fixture.prepare_claim_instruction(),
@@ -1222,7 +1339,7 @@ fn opened_claim_position_fixture(seed: u8) -> Fixture {
                 entry,
                 None,
                 PROFIT_CLAIM_FACE,
-                882_000_000,
+                1_764_000_000,
                 100,
             ),
         ])
@@ -1249,9 +1366,9 @@ fn opened_claim_position_dual_fixture(seed: u8) -> Fixture {
             ),
         ])
         .expect("open dual-oracle cash position for claim funding");
-    let cash_exit = fixture.install_pyth_price(&PRIMARY_FEED_ID, 101_000_000, 100_000, ORACLE_TIME);
+    let cash_exit = fixture.install_pyth_price(&PRIMARY_FEED_ID, 102_000_000, 100_000, ORACLE_TIME);
     let cash_exit_secondary =
-        fixture.install_switchboard_price(&SECONDARY_FEED_ID, 101_200_000, 100_000, ORACLE_TIME);
+        fixture.install_switchboard_price(&SECONDARY_FEED_ID, 102_200_000, 100_000, ORACLE_TIME);
     fixture
         .send_controller(vec![
             fixture.prepare_claim_instruction(),
@@ -1278,7 +1395,7 @@ fn opened_claim_position_dual_fixture(seed: u8) -> Fixture {
                 claim_entry,
                 Some(claim_entry_secondary),
                 PROFIT_CLAIM_FACE,
-                882_000_000,
+                1_764_000_000,
                 100,
             ),
         ])
@@ -1491,6 +1608,40 @@ fn bootstrap_cash_open(fixture: &mut Fixture, dual_oracle: bool) {
     fixture.set_clock(ORACLE_TIME);
 }
 
+fn send_relay_update(
+    fixture: &mut Fixture,
+    authority: &Keypair,
+    relay: Pubkey,
+    price_e6: u64,
+    confidence_e6: u64,
+    publish_time: i64,
+    source_posted_slot: u64,
+) -> Result<litesvm::types::TransactionMetadata, Box<litesvm::types::FailedTransactionMetadata>> {
+    let instruction = fixture.instruction(
+        MartingalerInstruction::UpdateOracleRelay {
+            price_e6,
+            confidence_e6,
+            publish_time,
+            source_posted_slot,
+        },
+        vec![
+            AccountMeta::new_readonly(authority.pubkey(), true),
+            AccountMeta::new(relay, false),
+        ],
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::request_heap_frame(128 * 1024),
+            ComputeBudgetInstruction::set_compute_unit_limit(TX_CU_LIMIT),
+            instruction,
+        ],
+        Some(&fixture.payer.pubkey()),
+        &[&fixture.payer, authority],
+        fixture.svm.latest_blockhash(),
+    );
+    fixture.svm.send_transaction(tx).map_err(Box::new)
+}
+
 #[test]
 fn instruction_codec_is_strict_and_legacy_namespace_is_unchanged() {
     for (instruction, expected_len) in [
@@ -1554,6 +1705,42 @@ fn instruction_codec_is_strict_and_legacy_namespace_is_unchanged() {
             INITIALIZE_ORACLE_POLICY_IX_LEN,
         ),
         (
+            MartingalerInstruction::PrepareOracleRelay {
+                market_id: MARKET_ID,
+                feed_id: PRIMARY_FEED_ID,
+            },
+            PREPARE_ORACLE_RELAY_IX_LEN,
+        ),
+        (
+            MartingalerInstruction::InitializeOracleRelay {
+                market_id: MARKET_ID,
+                feed_id: PRIMARY_FEED_ID,
+                authority: [0x33; 32],
+                source: OracleRelaySource::MagicBlockDemo,
+                price_e6_per_tick: 0,
+                max_source_staleness_slots: 0,
+                max_spread_bps: 0,
+                max_mark_index_divergence_bps: 0,
+            },
+            INITIALIZE_ORACLE_RELAY_IX_LEN,
+        ),
+        (
+            MartingalerInstruction::UpdateOracleRelay {
+                price_e6: 100_000_000,
+                confidence_e6: 100_000,
+                publish_time: ORACLE_TIME,
+                source_posted_slot: 500,
+            },
+            UPDATE_ORACLE_RELAY_IX_LEN,
+        ),
+        (
+            MartingalerInstruction::RefreshPhoenixOracle {
+                global_trader_index_count: 1,
+                active_trader_buffer_count: 1,
+            },
+            REFRESH_PHOENIX_ORACLE_IX_LEN,
+        ),
+        (
             MartingalerInstruction::PrepareClaim {
                 position_id: POSITION_ID,
             },
@@ -1572,6 +1759,10 @@ fn instruction_codec_is_strict_and_legacy_namespace_is_unchanged() {
         ),
         (
             MartingalerInstruction::ServiceFifoHead,
+            SERVICE_FIFO_HEAD_IX_LEN,
+        ),
+        (
+            MartingalerInstruction::ServiceFifoHeadInternal,
             SERVICE_FIFO_HEAD_IX_LEN,
         ),
         (
@@ -1655,6 +1846,98 @@ fn instruction_codec_is_strict_and_legacy_namespace_is_unchanged() {
         (
             MartingalerInstruction::WithdrawIdleCash { amount: 1 },
             WITHDRAW_IDLE_CASH_IX_LEN,
+        ),
+        (
+            MartingalerInstruction::PrepareTradingSession,
+            PREPARE_TRADING_SESSION_IX_LEN,
+        ),
+        (
+            MartingalerInstruction::InitializeTradingSession {
+                session_key: [0x44; 32],
+                expected_epoch: 0,
+            },
+            INITIALIZE_TRADING_SESSION_IX_LEN,
+        ),
+        (
+            MartingalerInstruction::RevokeTradingSession { expected_epoch: 1 },
+            REVOKE_TRADING_SESSION_IX_LEN,
+        ),
+        (
+            MartingalerInstruction::SessionPreparePosition {
+                position_id: POSITION_ID,
+                epoch: 1,
+                nonce: 0,
+            },
+            SESSION_PREPARE_POSITION_IX_LEN,
+        ),
+        (
+            MartingalerInstruction::SessionOpenCashPosition {
+                position_id: POSITION_ID,
+                market_id: MARKET_ID,
+                side: PositionSide::Long,
+                collateral: OPEN_COLLATERAL,
+                notional: OPEN_NOTIONAL,
+                leverage_x: 100,
+                epoch: 1,
+                nonce: 1,
+            },
+            SESSION_OPEN_POSITION_IX_LEN,
+        ),
+        (
+            MartingalerInstruction::SessionCloseNonPositiveCashPosition {
+                position_id: POSITION_ID,
+                epoch: 1,
+                nonce: 2,
+            },
+            SESSION_CLOSE_POSITION_IX_LEN,
+        ),
+        (
+            MartingalerInstruction::SessionPrepareClaim {
+                position_id: POSITION_ID,
+                epoch: 1,
+                nonce: 3,
+            },
+            SESSION_PREPARE_POSITION_IX_LEN,
+        ),
+        (
+            MartingalerInstruction::SessionCloseProfitableCashPosition {
+                position_id: POSITION_ID,
+                settlement_shape: ProfitSettlementShape::CurrentTail,
+                epoch: 1,
+                nonce: 4,
+            },
+            SESSION_CLOSE_PROFITABLE_POSITION_IX_LEN,
+        ),
+        (
+            MartingalerInstruction::SessionOpenClaimPosition {
+                position_id: POSITION_ID,
+                market_id: MARKET_ID,
+                side: PositionSide::Short,
+                claim_amount: PROFIT_CLAIM_FACE,
+                notional: OPEN_NOTIONAL,
+                leverage_x: 100,
+                epoch: 1,
+                nonce: 5,
+            },
+            SESSION_OPEN_POSITION_IX_LEN,
+        ),
+        (
+            MartingalerInstruction::SessionCloseNonPositiveClaimPosition {
+                position_id: POSITION_ID,
+                settlement_shape: ProfitSettlementShape::CurrentTail,
+                epoch: 1,
+                nonce: 6,
+            },
+            SESSION_CLOSE_PROFITABLE_POSITION_IX_LEN,
+        ),
+        (
+            MartingalerInstruction::SessionCloseProfitableClaimPosition {
+                position_id: POSITION_ID,
+                settlement_shape: ProfitSettlementShape::Rollover,
+                epoch: 1,
+                nonce: 7,
+            },
+            SESSION_CLOSE_PROFITABLE_POSITION_IX_LEN,
         ),
     ] {
         let encoded = instruction.encode();
@@ -1823,6 +2106,181 @@ fn instruction_codec_is_strict_and_legacy_namespace_is_unchanged() {
         dispatch_instruction(&id(), &[], &formerly_unknown_tag),
         processor::process_instruction(&id(), &[], &formerly_unknown_tag)
     );
+}
+
+#[test]
+fn restricted_trading_session_opens_closes_and_rejects_nonce_replay() {
+    let mut fixture = Fixture::new(212);
+    bootstrap_cash_open(&mut fixture, false);
+    let primary = fixture.install_pyth_price(&PRIMARY_FEED_ID, 100_000_000, 100_000, ORACLE_TIME);
+    let session_key = deterministic_keypair(212, 9);
+    fixture
+        .svm
+        .airdrop(&session_key.pubkey(), 1_000_000_000)
+        .expect("fund bounded trading session");
+    let (session, _) = derive_trading_session(&id(), &fixture.pool, &fixture.controller.pubkey());
+
+    let prepare_session = fixture.instruction(
+        MartingalerInstruction::PrepareTradingSession,
+        vec![
+            AccountMeta::new(fixture.controller.pubkey(), true),
+            AccountMeta::new_readonly(fixture.pool, false),
+            AccountMeta::new(session, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+    );
+    let initialize_session = fixture.instruction(
+        MartingalerInstruction::InitializeTradingSession {
+            session_key: session_key.pubkey().to_bytes(),
+            expected_epoch: 0,
+        },
+        vec![
+            AccountMeta::new(fixture.controller.pubkey(), true),
+            AccountMeta::new_readonly(fixture.pool, false),
+            AccountMeta::new_readonly(fixture.controller_risk, false),
+            AccountMeta::new(session, false),
+            AccountMeta::new_readonly(session_key.pubkey(), true),
+        ],
+    );
+    let create_tx = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::request_heap_frame(128 * 1024),
+            ComputeBudgetInstruction::set_compute_unit_limit(400_000),
+            prepare_session,
+            initialize_session,
+        ],
+        Some(&fixture.payer.pubkey()),
+        &[&fixture.payer, &fixture.controller, &session_key],
+        fixture.svm.latest_blockhash(),
+    );
+    fixture
+        .svm
+        .send_transaction(create_tx)
+        .expect("create owner-authorized bounded trading session");
+
+    let mut prepare_accounts = fixture.prepare_position_instruction().accounts;
+    prepare_accounts[0] = AccountMeta::new(session_key.pubkey(), true);
+    prepare_accounts.push(AccountMeta::new(session, false));
+    prepare_accounts.push(AccountMeta::new_readonly(
+        fixture.controller.pubkey(),
+        false,
+    ));
+    let prepare_position = fixture.instruction(
+        MartingalerInstruction::SessionPreparePosition {
+            position_id: POSITION_ID,
+            epoch: 1,
+            nonce: 0,
+        },
+        prepare_accounts,
+    );
+
+    let mut open_accounts = fixture.open_cash_metas(primary, None);
+    open_accounts[0] = AccountMeta::new(session_key.pubkey(), true);
+    open_accounts.push(AccountMeta::new(session, false));
+    open_accounts.push(AccountMeta::new_readonly(
+        fixture.controller.pubkey(),
+        false,
+    ));
+    let open = fixture.instruction(
+        MartingalerInstruction::SessionOpenCashPosition {
+            position_id: POSITION_ID,
+            market_id: MARKET_ID,
+            side: PositionSide::Long,
+            collateral: OPEN_COLLATERAL,
+            notional: OPEN_NOTIONAL,
+            leverage_x: 100,
+            epoch: 1,
+            nonce: 1,
+        },
+        open_accounts,
+    );
+    let open_tx = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::request_heap_frame(128 * 1024),
+            ComputeBudgetInstruction::set_compute_unit_limit(400_000),
+            prepare_position,
+            open,
+        ],
+        Some(&fixture.payer.pubkey()),
+        &[&fixture.payer, &session_key],
+        fixture.svm.latest_blockhash(),
+    );
+    fixture
+        .svm
+        .send_transaction(open_tx)
+        .expect("session-only signer prepares and opens owner's position");
+
+    let active =
+        decode_account::<TradingSessionState>(&fixture.svm.get_account(&session).unwrap().data)
+            .unwrap();
+    assert_eq!(active.owner.0, fixture.controller.pubkey().to_bytes());
+    assert_eq!(active.session_key.0, session_key.pubkey().to_bytes());
+    assert_eq!(active.epoch.get(), 1);
+    assert_eq!(active.next_nonce.get(), 2);
+    assert_eq!(active.spent_notional.get(), u128::from(OPEN_NOTIONAL));
+
+    let mut close_accounts = fixture.close_cash_metas_with_oracles(primary, None);
+    close_accounts[0] = AccountMeta::new(session_key.pubkey(), true);
+    close_accounts.push(AccountMeta::new(session, false));
+    close_accounts.push(AccountMeta::new_readonly(
+        fixture.controller.pubkey(),
+        false,
+    ));
+    let close = fixture.instruction(
+        MartingalerInstruction::SessionCloseNonPositiveCashPosition {
+            position_id: POSITION_ID,
+            epoch: 1,
+            nonce: 2,
+        },
+        close_accounts.clone(),
+    );
+    let close_tx = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::request_heap_frame(128 * 1024),
+            ComputeBudgetInstruction::set_compute_unit_limit(400_000),
+            close,
+        ],
+        Some(&fixture.payer.pubkey()),
+        &[&fixture.payer, &session_key],
+        fixture.svm.latest_blockhash(),
+    );
+    fixture
+        .svm
+        .send_transaction(close_tx)
+        .expect("session-only signer closes owner's position");
+    let controller = decode_account::<ControllerRiskState>(
+        &fixture
+            .svm
+            .get_account(&fixture.controller_risk)
+            .unwrap()
+            .data,
+    )
+    .unwrap();
+    assert_eq!(
+        controller.available_cash_collateral.get(),
+        u128::from(DEPOSIT_AMOUNT)
+    );
+    assert_eq!(controller.open_positions.get(), 0);
+
+    let replay = fixture.instruction(
+        MartingalerInstruction::SessionCloseNonPositiveCashPosition {
+            position_id: POSITION_ID,
+            epoch: 1,
+            nonce: 2,
+        },
+        close_accounts,
+    );
+    let replay_tx = Transaction::new_signed_with_payer(
+        &[replay],
+        Some(&fixture.payer.pubkey()),
+        &[&fixture.payer, &session_key],
+        fixture.svm.latest_blockhash(),
+    );
+    assert!(fixture.svm.send_transaction(replay_tx).is_err());
+    let final_session =
+        decode_account::<TradingSessionState>(&fixture.svm.get_account(&session).unwrap().data)
+            .unwrap();
+    assert_eq!(final_session.next_nonce.get(), 3);
 }
 
 #[test]
@@ -2239,7 +2697,7 @@ fn market_and_controller_bundles_create_exact_empty_roots_and_reject_replay() {
     assert_eq!(market.pool, Key32::new(fixture.pool.to_bytes()));
     assert_eq!(market.market_id.get(), MARKET_ID);
     assert_eq!(market.status, PoolStatus::Active as u8);
-    assert_eq!(market.max_leverage_x.get(), 100);
+    assert_eq!(market.max_leverage_x.get(), 500);
     assert_eq!(
         market.max_position_notional.get(),
         V1_MAX_POSITION_NOTIONAL_QUOTE
@@ -2348,6 +2806,214 @@ fn registration_prepare_is_inert_and_dust_prefunding_is_tolerated() {
             .data
     )
     .is_ok());
+}
+
+#[test]
+fn leverage_limit_update_is_state_compatible_and_rejects_live_risk() {
+    let mut fixture = Fixture::new(211);
+    fixture
+        .send(vec![fixture.prepare(), fixture.initialize()], true)
+        .unwrap();
+    fixture
+        .send(
+            vec![
+                fixture.market_instruction(true),
+                fixture.market_instruction(false),
+            ],
+            true,
+        )
+        .unwrap();
+
+    let mut pool_account = fixture.svm.get_account(&fixture.pool).unwrap();
+    let mut pool = decode_account::<PoolState>(&pool_account.data).unwrap();
+    pool.max_leverage_x = U16Le::new(100);
+    overwrite_account(&mut pool_account.data, &pool).unwrap();
+    fixture.svm.set_account(fixture.pool, pool_account).unwrap();
+    let mut market_account = fixture.svm.get_account(&fixture.market).unwrap();
+    let mut market = decode_account::<MarketRiskState>(&market_account.data).unwrap();
+    market.max_leverage_x = U16Le::new(100);
+    overwrite_account(&mut market_account.data, &market).unwrap();
+    fixture
+        .svm
+        .set_account(fixture.market, market_account)
+        .unwrap();
+
+    fixture
+        .send(vec![fixture.update_leverage_limit_instruction(500)], true)
+        .unwrap();
+    assert_eq!(
+        decode_account::<PoolState>(&fixture.svm.get_account(&fixture.pool).unwrap().data)
+            .unwrap()
+            .max_leverage_x
+            .get(),
+        500
+    );
+    assert_eq!(
+        decode_account::<MarketRiskState>(&fixture.svm.get_account(&fixture.market).unwrap().data,)
+            .unwrap()
+            .max_leverage_x
+            .get(),
+        500
+    );
+
+    let mut pool_account = fixture.svm.get_account(&fixture.pool).unwrap();
+    let mut pool = decode_account::<PoolState>(&pool_account.data).unwrap();
+    pool.reserved_open_profit = U128Le::new(1);
+    overwrite_account(&mut pool_account.data, &pool).unwrap();
+    fixture.svm.set_account(fixture.pool, pool_account).unwrap();
+    let before = account_snapshot(&fixture, &[fixture.pool, fixture.market]);
+    assert!(fixture
+        .send(vec![fixture.update_leverage_limit_instruction(500)], true)
+        .is_err());
+    assert_eq!(
+        account_snapshot(&fixture, &[fixture.pool, fixture.market]),
+        before
+    );
+}
+
+#[test]
+fn guarded_open_and_session_guarded_open_codecs_are_exact() {
+    let guarded = MartingalerInstruction::GuardedOpenCashPosition {
+        position_id: 7,
+        market_id: MARKET_ID,
+        side: PositionSide::Short,
+        collateral: OPEN_COLLATERAL,
+        notional: OPEN_NOTIONAL,
+        leverage_x: 100,
+        min_payout_factor_bps: 5_000,
+    };
+    let encoded = guarded.encode();
+    assert_eq!(MartingalerInstruction::decode(&encoded).unwrap(), guarded);
+    assert_eq!(encoded.len(), 42);
+    let session = MartingalerInstruction::SessionGuardedOpenClaimPosition {
+        position_id: 8,
+        market_id: MARKET_ID,
+        side: PositionSide::Long,
+        claim_amount: OPEN_COLLATERAL,
+        notional: OPEN_NOTIONAL,
+        leverage_x: 100,
+        min_payout_factor_bps: 3_000,
+        epoch: 2,
+        nonce: 4,
+    };
+    let encoded = session.encode();
+    assert_eq!(MartingalerInstruction::decode(&encoded).unwrap(), session);
+    assert_eq!(encoded.len(), 58);
+}
+
+#[test]
+fn guarded_open_enforces_signed_factor_at_the_real_instruction_boundary() {
+    let mut fixture = Fixture::new(213);
+    bootstrap_cash_open(&mut fixture, false);
+    let primary = fixture.install_pyth_price(&PRIMARY_FEED_ID, 100_000_000, 100_000, ORACLE_TIME);
+
+    // The legacy open tag remains decodable but cannot bypass the V1 minimum.
+    let before_minimum = account_snapshot(
+        &fixture,
+        &[
+            fixture.pool,
+            fixture.market,
+            fixture.controller_risk,
+            fixture.position,
+        ],
+    );
+    assert!(fixture
+        .send_controller(vec![
+            fixture.prepare_position_instruction(),
+            fixture.open_cash_instruction(primary, None, 9_999_999, 999_999_900, 100),
+        ])
+        .is_err());
+    assert_eq!(
+        account_snapshot(
+            &fixture,
+            &[
+                fixture.pool,
+                fixture.market,
+                fixture.controller_risk,
+                fixture.position
+            ],
+        ),
+        before_minimum,
+    );
+
+    // Leave exactly $500 of controller profit depth. For this position's
+    // $1,000 nominal-profit cap the immutable payout factor is therefore 50%.
+    let prior_reserved = 249_500_000_000u128;
+    let mut pool_account = fixture.svm.get_account(&fixture.pool).unwrap();
+    let mut pool = decode_account::<PoolState>(&pool_account.data).unwrap();
+    pool.reserved_open_profit = U128Le::new(prior_reserved);
+    overwrite_account(&mut pool_account.data, &pool).unwrap();
+    fixture.svm.set_account(fixture.pool, pool_account).unwrap();
+
+    let mut market_account = fixture.svm.get_account(&fixture.market).unwrap();
+    let mut market = decode_account::<MarketRiskState>(&market_account.data).unwrap();
+    market.reserved_profit = U128Le::new(prior_reserved);
+    overwrite_account(&mut market_account.data, &market).unwrap();
+    fixture
+        .svm
+        .set_account(fixture.market, market_account)
+        .unwrap();
+
+    let mut controller_account = fixture.svm.get_account(&fixture.controller_risk).unwrap();
+    let mut controller = decode_account::<ControllerRiskState>(&controller_account.data).unwrap();
+    controller.reserved_profit = U128Le::new(prior_reserved);
+    overwrite_account(&mut controller_account.data, &controller).unwrap();
+    fixture
+        .svm
+        .set_account(fixture.controller_risk, controller_account)
+        .unwrap();
+
+    let before = account_snapshot(
+        &fixture,
+        &[
+            fixture.pool,
+            fixture.market,
+            fixture.controller_risk,
+            fixture.position,
+        ],
+    );
+    assert!(fixture
+        .send_controller(vec![
+            fixture.prepare_position_instruction(),
+            fixture.guarded_open_cash_instruction(
+                primary,
+                OPEN_COLLATERAL,
+                OPEN_NOTIONAL,
+                100,
+                6_000,
+            ),
+        ])
+        .is_err());
+    assert_eq!(
+        account_snapshot(
+            &fixture,
+            &[
+                fixture.pool,
+                fixture.market,
+                fixture.controller_risk,
+                fixture.position
+            ],
+        ),
+        before,
+    );
+
+    fixture
+        .send_controller(vec![
+            fixture.prepare_position_instruction(),
+            fixture.guarded_open_cash_instruction(
+                primary,
+                OPEN_COLLATERAL,
+                OPEN_NOTIONAL,
+                100,
+                5_000,
+            ),
+        ])
+        .expect("the signed factor succeeds at its exact frozen boundary");
+    let position =
+        decode_account::<PositionState>(&fixture.svm.get_account(&fixture.position).unwrap().data)
+            .unwrap();
+    assert_eq!(position.max_payable_profit.get(), 500_000_000);
+    assert_eq!(position.reserved_profit.get(), 500_000_000);
 }
 
 #[test]
@@ -3145,6 +3811,484 @@ fn oracle_policy_registration_is_canonical_immutable_and_bounded() {
 }
 
 #[test]
+fn magicblock_relay_is_canonical_authority_bound_monotonic_and_trade_readable() {
+    let mut fixture = Fixture::new(131);
+    bootstrap_cash_open(&mut fixture, false);
+    let relay_authority = deterministic_keypair(131, 9);
+    let (relay, relay_bump) = derive_oracle_relay(&id(), &fixture.market, &PRIMARY_FEED_ID);
+    let relay_metas = vec![
+        AccountMeta::new(fixture.admin.pubkey(), true),
+        AccountMeta::new_readonly(fixture.pool, false),
+        AccountMeta::new_readonly(fixture.market, false),
+        AccountMeta::new(relay, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+    ];
+    assert!(fixture
+        .send(
+            vec![
+                fixture.instruction(
+                    MartingalerInstruction::PrepareOracleRelay {
+                        market_id: MARKET_ID,
+                        feed_id: PRIMARY_FEED_ID,
+                    },
+                    relay_metas.clone(),
+                ),
+                fixture.instruction(
+                    MartingalerInstruction::InitializeOracleRelay {
+                        market_id: MARKET_ID,
+                        feed_id: PRIMARY_FEED_ID,
+                        authority: Pubkey::new_unique().to_bytes(),
+                        source: OracleRelaySource::PhoenixHawkeye,
+                        price_e6_per_tick: 10_000,
+                        max_source_staleness_slots: 10,
+                        max_spread_bps: 100,
+                        max_mark_index_divergence_bps: 100,
+                    },
+                    relay_metas.clone(),
+                ),
+            ],
+            true,
+        )
+        .is_err());
+    assert!(fixture.svm.get_account(&relay).is_none());
+    fixture.svm.expire_blockhash();
+    fixture
+        .send(
+            vec![
+                fixture.instruction(
+                    MartingalerInstruction::PrepareOracleRelay {
+                        market_id: MARKET_ID,
+                        feed_id: PRIMARY_FEED_ID,
+                    },
+                    relay_metas.clone(),
+                ),
+                fixture.instruction(
+                    MartingalerInstruction::InitializeOracleRelay {
+                        market_id: MARKET_ID,
+                        feed_id: PRIMARY_FEED_ID,
+                        authority: relay_authority.pubkey().to_bytes(),
+                        source: OracleRelaySource::MagicBlockDemo,
+                        price_e6_per_tick: 0,
+                        max_source_staleness_slots: 0,
+                        max_spread_bps: 0,
+                        max_mark_index_divergence_bps: 0,
+                    },
+                    relay_metas,
+                ),
+            ],
+            true,
+        )
+        .expect("register canonical MagicBlock relay");
+
+    let relay_account = fixture.svm.get_account(&relay).unwrap();
+    assert_eq!(relay_account.owner, id());
+    assert_eq!(relay_account.data.len(), account_len::<OracleRelayState>());
+    assert_eq!(
+        decode_account_header::<OracleRelayState>(&relay_account.data)
+            .unwrap()
+            .bump,
+        relay_bump
+    );
+    let empty = decode_account::<OracleRelayState>(&relay_account.data).unwrap();
+    assert_eq!(empty.sequence.get(), 0);
+    assert_eq!(
+        empty.authority,
+        Key32::new(relay_authority.pubkey().to_bytes())
+    );
+
+    let mut clock = fixture.svm.get_sysvar::<Clock>();
+    clock.slot = 100;
+    clock.unix_timestamp = ORACLE_TIME;
+    fixture.svm.set_sysvar(&clock);
+
+    let before = fixture.svm.get_account(&relay).unwrap();
+    let wrong_authority_update = fixture.instruction(
+        MartingalerInstruction::UpdateOracleRelay {
+            price_e6: 100_000_000,
+            confidence_e6: 100_000,
+            publish_time: ORACLE_TIME,
+            source_posted_slot: 500,
+        },
+        vec![
+            AccountMeta::new_readonly(fixture.controller.pubkey(), true),
+            AccountMeta::new(relay, false),
+        ],
+    );
+    assert!(fixture
+        .send_controller(vec![wrong_authority_update])
+        .is_err());
+    assert_eq!(fixture.svm.get_account(&relay).unwrap(), before);
+    assert!(send_relay_update(
+        &mut fixture,
+        &relay_authority,
+        relay,
+        100_000_000,
+        100_000,
+        ORACLE_TIME + 6,
+        500,
+    )
+    .is_err());
+    assert_eq!(fixture.svm.get_account(&relay).unwrap(), before);
+    assert!(send_relay_update(
+        &mut fixture,
+        &relay_authority,
+        relay,
+        100_000_000,
+        100_000,
+        ORACLE_TIME - 121,
+        500,
+    )
+    .is_err());
+    assert_eq!(fixture.svm.get_account(&relay).unwrap(), before);
+
+    send_relay_update(
+        &mut fixture,
+        &relay_authority,
+        relay,
+        100_000_000,
+        100_000,
+        ORACLE_TIME,
+        500,
+    )
+    .expect("relay valid MagicBlock observation");
+    let live =
+        decode_account::<OracleRelayState>(&fixture.svm.get_account(&relay).unwrap().data).unwrap();
+    assert_eq!(live.sequence.get(), 1);
+    assert_eq!(live.update_slot.get(), 100);
+    let after = fixture.svm.get_account(&relay).unwrap();
+    assert!(send_relay_update(
+        &mut fixture,
+        &relay_authority,
+        relay,
+        100_000_001,
+        100_000,
+        ORACLE_TIME,
+        500,
+    )
+    .is_err());
+    assert_eq!(fixture.svm.get_account(&relay).unwrap(), after);
+
+    fixture
+        .send_controller(vec![
+            fixture.prepare_position_instruction(),
+            fixture.open_cash_instruction(relay, None, OPEN_COLLATERAL, OPEN_NOTIONAL, 100),
+        ])
+        .expect("open cash position from fresh MagicBlock relay");
+    let position =
+        decode_account::<PositionState>(&fixture.svm.get_account(&fixture.position).unwrap().data)
+            .unwrap();
+    assert_eq!(position.entry_price_e6.get(), 100_000_000);
+    assert_eq!(position.entry_publish_time.get(), ORACLE_TIME);
+}
+
+#[test]
+fn phoenix_mainnet_mirror_is_signed_e6_while_native_phoenix_remains_cpi_only() {
+    let mut fixture = Fixture::new(171);
+    bootstrap_cash_open(&mut fixture, false);
+    let relay_authority = deterministic_keypair(171, 9);
+    let (relay, _) = derive_oracle_relay(&id(), &fixture.market, &PRIMARY_FEED_ID);
+    let relay_metas = vec![
+        AccountMeta::new(fixture.admin.pubkey(), true),
+        AccountMeta::new_readonly(fixture.pool, false),
+        AccountMeta::new_readonly(fixture.market, false),
+        AccountMeta::new(relay, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+    ];
+    fixture
+        .send(
+            vec![
+                fixture.instruction(
+                    MartingalerInstruction::PrepareOracleRelay {
+                        market_id: MARKET_ID,
+                        feed_id: PRIMARY_FEED_ID,
+                    },
+                    relay_metas.clone(),
+                ),
+                fixture.instruction(
+                    MartingalerInstruction::InitializeOracleRelay {
+                        market_id: MARKET_ID,
+                        feed_id: PRIMARY_FEED_ID,
+                        authority: relay_authority.pubkey().to_bytes(),
+                        source: OracleRelaySource::PhoenixMainnetRelay,
+                        price_e6_per_tick: 0,
+                        max_source_staleness_slots: 0,
+                        max_spread_bps: 0,
+                        max_mark_index_divergence_bps: 0,
+                    },
+                    relay_metas,
+                ),
+            ],
+            true,
+        )
+        .expect("register Phoenix mainnet mirror relay");
+    let mut clock = fixture.svm.get_sysvar::<Clock>();
+    clock.slot = 100;
+    clock.unix_timestamp = ORACLE_TIME;
+    fixture.svm.set_sysvar(&clock);
+    send_relay_update(
+        &mut fixture,
+        &relay_authority,
+        relay,
+        100_000_000,
+        100_000,
+        ORACLE_TIME,
+        500,
+    )
+    .expect("write Phoenix mainnet mirror observation");
+    let state =
+        decode_account::<OracleRelayState>(&fixture.svm.get_account(&relay).unwrap().data).unwrap();
+    assert_eq!(state.source, OracleRelaySource::PhoenixMainnetRelay as u8);
+    assert_eq!(state.price_e6.get(), 100_000_000);
+    assert_eq!(state.sequence.get(), 1);
+}
+
+#[test]
+fn phoenix_hawkeye_refresh_is_permissionless_guarded_and_trade_readable() {
+    let mut fixture = Fixture::new(132);
+    bootstrap_cash_open(&mut fixture, true);
+
+    let hawkeye_mock = std::fs::read(hawkeye_mock_program_path()).expect("read Hawkeye mock SBF");
+    fixture.svm.add_program(HAWKEYE_PROGRAM_ID, &hawkeye_mock);
+    fixture
+        .svm
+        .add_program(PHOENIX_BETA_PROGRAM_ID, &hawkeye_mock);
+
+    let global_trader_index = Pubkey::new_unique();
+    let active_trader_buffer = Pubkey::new_unique();
+    let perp_asset_map = Pubkey::new_unique();
+    let orderbook = Pubkey::new_from_array(PRIMARY_FEED_ID);
+    let spline_collection = Pubkey::new_unique();
+    let install_phoenix_data = |fixture: &mut Fixture, key: Pubkey, data: Vec<u8>| {
+        fixture
+            .svm
+            .set_account(
+                key,
+                Account {
+                    lamports: 1_000_000_000,
+                    data,
+                    owner: PHOENIX_BETA_PROGRAM_ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+    };
+    install_phoenix_data(
+        &mut fixture,
+        PHOENIX_BETA_GLOBAL_CONFIG,
+        make_phoenix_bbo_return(9_995, 10_005, 10_000, 10_002, 995, 995),
+    );
+    for key in [
+        global_trader_index,
+        active_trader_buffer,
+        perp_asset_map,
+        orderbook,
+        spline_collection,
+    ] {
+        install_phoenix_data(&mut fixture, key, vec![1]);
+    }
+
+    let (relay, relay_bump) = derive_oracle_relay(&id(), &fixture.market, &PRIMARY_FEED_ID);
+    let relay_metas = vec![
+        AccountMeta::new(fixture.admin.pubkey(), true),
+        AccountMeta::new_readonly(fixture.pool, false),
+        AccountMeta::new_readonly(fixture.market, false),
+        AccountMeta::new(relay, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+    ];
+    fixture
+        .send(
+            vec![
+                fixture.instruction(
+                    MartingalerInstruction::PrepareOracleRelay {
+                        market_id: MARKET_ID,
+                        feed_id: PRIMARY_FEED_ID,
+                    },
+                    relay_metas.clone(),
+                ),
+                fixture.instruction(
+                    MartingalerInstruction::InitializeOracleRelay {
+                        market_id: MARKET_ID,
+                        feed_id: PRIMARY_FEED_ID,
+                        authority: PHOENIX_BETA_PROGRAM_ID.to_bytes(),
+                        source: OracleRelaySource::PhoenixHawkeye,
+                        price_e6_per_tick: 10_000,
+                        max_source_staleness_slots: 10,
+                        max_spread_bps: 100,
+                        max_mark_index_divergence_bps: 100,
+                    },
+                    relay_metas,
+                ),
+            ],
+            true,
+        )
+        .expect("register canonical Phoenix relay");
+    assert_eq!(
+        decode_account_header::<OracleRelayState>(&fixture.svm.get_account(&relay).unwrap().data)
+            .unwrap()
+            .bump,
+        relay_bump
+    );
+
+    let mut clock = fixture.svm.get_sysvar::<Clock>();
+    clock.slot = 1_000;
+    clock.unix_timestamp = ORACLE_TIME;
+    fixture.svm.set_sysvar(&clock);
+
+    let attacker = deterministic_keypair(132, 10);
+    fixture
+        .svm
+        .airdrop(&attacker.pubkey(), 1_000_000)
+        .expect("fund relay attack signer");
+    let before = fixture.svm.get_account(&relay).unwrap();
+    assert!(send_relay_update(
+        &mut fixture,
+        &attacker,
+        relay,
+        100_000_000,
+        50_000,
+        ORACLE_TIME,
+        995,
+    )
+    .is_err());
+    assert_eq!(fixture.svm.get_account(&relay).unwrap(), before);
+
+    let refresh_accounts = vec![
+        AccountMeta::new(relay, false),
+        AccountMeta::new_readonly(HAWKEYE_PROGRAM_ID, false),
+        AccountMeta::new_readonly(PHOENIX_BETA_PROGRAM_ID, false),
+        AccountMeta::new_readonly(PHOENIX_BETA_GLOBAL_CONFIG, false),
+        AccountMeta::new_readonly(global_trader_index, false),
+        AccountMeta::new_readonly(active_trader_buffer, false),
+        AccountMeta::new_readonly(perp_asset_map, false),
+        AccountMeta::new_readonly(orderbook, false),
+        AccountMeta::new_readonly(spline_collection, false),
+    ];
+    let reject_refresh = |fixture: &mut Fixture, accounts: Vec<AccountMeta>| {
+        let before = fixture.svm.get_account(&relay).unwrap();
+        fixture.svm.expire_blockhash();
+        let refresh = fixture.instruction(
+            MartingalerInstruction::RefreshPhoenixOracle {
+                global_trader_index_count: 1,
+                active_trader_buffer_count: 1,
+            },
+            accounts,
+        );
+        assert!(fixture.send(vec![refresh], false).is_err());
+        assert_eq!(fixture.svm.get_account(&relay).unwrap(), before);
+    };
+    let refresh = fixture.instruction(
+        MartingalerInstruction::RefreshPhoenixOracle {
+            global_trader_index_count: 1,
+            active_trader_buffer_count: 1,
+        },
+        refresh_accounts.clone(),
+    );
+    fixture
+        .send(vec![refresh], false)
+        .expect("refresh from exact Hawkeye return data");
+    let live =
+        decode_account::<OracleRelayState>(&fixture.svm.get_account(&relay).unwrap().data).unwrap();
+    assert_eq!(live.sequence.get(), 1);
+    assert_eq!(live.price_e6.get(), 100_000_000);
+    assert_eq!(live.confidence_e6.get(), 50_000);
+    assert_eq!(live.publish_time.get(), ORACLE_TIME);
+    assert_eq!(live.source_posted_slot.get(), 995);
+    assert_eq!(live.update_slot.get(), 1_000);
+
+    let mut wrong_global = refresh_accounts.clone();
+    wrong_global[3] = AccountMeta::new_readonly(PHOENIX_MAINNET_GLOBAL_CONFIG, false);
+    reject_refresh(&mut fixture, wrong_global);
+
+    let wrong_program = Pubkey::new_unique();
+    fixture.svm.add_program(wrong_program, &hawkeye_mock);
+    let mut unsupported_program = refresh_accounts.clone();
+    unsupported_program[2] = AccountMeta::new_readonly(wrong_program, false);
+    reject_refresh(&mut fixture, unsupported_program);
+
+    let wrong_orderbook = Pubkey::new_unique();
+    install_phoenix_data(&mut fixture, wrong_orderbook, vec![1]);
+    let mut unbound_orderbook = refresh_accounts.clone();
+    unbound_orderbook[7] = AccountMeta::new_readonly(wrong_orderbook, false);
+    reject_refresh(&mut fixture, unbound_orderbook);
+
+    let canonical_orderbook = fixture.svm.get_account(&orderbook).unwrap();
+    let mut wrong_owner = canonical_orderbook.clone();
+    wrong_owner.owner = system_program::ID;
+    fixture.svm.set_account(orderbook, wrong_owner).unwrap();
+    reject_refresh(&mut fixture, refresh_accounts.clone());
+    fixture
+        .svm
+        .set_account(orderbook, canonical_orderbook)
+        .unwrap();
+
+    let mut spoofed_return_program =
+        make_phoenix_bbo_return(9_995, 10_005, 10_000, 10_002, 996, 996);
+    spoofed_return_program.push(1);
+    install_phoenix_data(
+        &mut fixture,
+        PHOENIX_BETA_GLOBAL_CONFIG,
+        spoofed_return_program,
+    );
+    reject_refresh(&mut fixture, refresh_accounts.clone());
+
+    for hostile_return in [
+        make_phoenix_bbo_return(9_995, 10_005, 10_000, 10_002, 989, 989),
+        make_phoenix_bbo_return(9_995, 10_005, 10_000, 10_002, 1_001, 1_001),
+        make_phoenix_bbo_return(9_995, 10_005, 10_000, 10_002, 994, 994),
+        make_phoenix_bbo_return(9_995, 10_005, 10_000, 10_102, 996, 996),
+        make_phoenix_bbo_return(u64::MAX, u64::MAX, u64::MAX, u64::MAX, 996, 996),
+    ] {
+        install_phoenix_data(&mut fixture, PHOENIX_BETA_GLOBAL_CONFIG, hostile_return);
+        reject_refresh(&mut fixture, refresh_accounts.clone());
+    }
+
+    install_phoenix_data(
+        &mut fixture,
+        PHOENIX_BETA_GLOBAL_CONFIG,
+        make_phoenix_bbo_return(9_000, 11_000, 10_000, 10_002, 996, 996),
+    );
+    reject_refresh(&mut fixture, refresh_accounts.clone());
+
+    install_phoenix_data(
+        &mut fixture,
+        PHOENIX_BETA_GLOBAL_CONFIG,
+        make_phoenix_bbo_return(9_996, 10_006, 10_001, 10_003, 996, 996),
+    );
+    fixture.svm.expire_blockhash();
+    let refreshed = fixture.instruction(
+        MartingalerInstruction::RefreshPhoenixOracle {
+            global_trader_index_count: 1,
+            active_trader_buffer_count: 1,
+        },
+        refresh_accounts,
+    );
+    fixture
+        .send(vec![refreshed], false)
+        .expect("refresh next monotonic Phoenix observation");
+
+    let independent =
+        fixture.install_pyth_price(&SECONDARY_FEED_ID, 100_030_000, 50_000, ORACLE_TIME);
+    fixture
+        .send_controller(vec![
+            fixture.prepare_position_instruction(),
+            fixture.open_cash_instruction(
+                relay,
+                Some(independent),
+                OPEN_COLLATERAL,
+                OPEN_NOTIONAL,
+                100,
+            ),
+        ])
+        .expect("Phoenix plus direct Pyth satisfy dual-provider policy");
+    let position =
+        decode_account::<PositionState>(&fixture.svm.get_account(&fixture.position).unwrap().data)
+            .unwrap();
+    assert_eq!(position.entry_price_e6.get(), 100_010_000);
+    assert_eq!(position.secondary_entry_price_e6.get(), 100_030_000);
+}
+
+#[test]
 fn single_oracle_policy_opens_with_zero_secondary_provenance() {
     let mut fixture = Fixture::new(129);
     bootstrap_cash_open(&mut fixture, false);
@@ -3350,6 +4494,99 @@ fn unsupported_or_same_family_oracle_providers_fail_atomically() {
         before
     );
     assert!(same_family.svm.get_account(&same_family.position).is_none());
+
+    // MagicBlock's pinned demo PriceUpdateV3 transports a Pyth-family
+    // observation. It must not appear independent from direct Pyth merely
+    // because the keeper relayed it through a program-owned account.
+    let mut relayed_pyth = Fixture::new(152);
+    bootstrap_cash_open(&mut relayed_pyth, true);
+    let relay_authority = deterministic_keypair(152, 9);
+    let (relay, _) = derive_oracle_relay(&id(), &relayed_pyth.market, &PRIMARY_FEED_ID);
+    let relay_metas = vec![
+        AccountMeta::new(relayed_pyth.admin.pubkey(), true),
+        AccountMeta::new_readonly(relayed_pyth.pool, false),
+        AccountMeta::new_readonly(relayed_pyth.market, false),
+        AccountMeta::new(relay, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+    ];
+    relayed_pyth
+        .send(
+            vec![
+                relayed_pyth.instruction(
+                    MartingalerInstruction::PrepareOracleRelay {
+                        market_id: MARKET_ID,
+                        feed_id: PRIMARY_FEED_ID,
+                    },
+                    relay_metas.clone(),
+                ),
+                relayed_pyth.instruction(
+                    MartingalerInstruction::InitializeOracleRelay {
+                        market_id: MARKET_ID,
+                        feed_id: PRIMARY_FEED_ID,
+                        authority: relay_authority.pubkey().to_bytes(),
+                        source: OracleRelaySource::MagicBlockDemo,
+                        price_e6_per_tick: 0,
+                        max_source_staleness_slots: 0,
+                        max_spread_bps: 0,
+                        max_mark_index_divergence_bps: 0,
+                    },
+                    relay_metas,
+                ),
+            ],
+            true,
+        )
+        .expect("register relayed Pyth-family observation");
+    relayed_pyth.set_clock(ORACLE_TIME);
+    let mut relay_clock = relayed_pyth.svm.get_sysvar::<Clock>();
+    relay_clock.slot = 100;
+    relayed_pyth.svm.set_sysvar(&relay_clock);
+    send_relay_update(
+        &mut relayed_pyth,
+        &relay_authority,
+        relay,
+        100_000_000,
+        100_000,
+        ORACLE_TIME,
+        500,
+    )
+    .expect("write relayed Pyth-family observation");
+    let direct_pyth =
+        relayed_pyth.install_pyth_price(&SECONDARY_FEED_ID, 101_000_000, 100_000, ORACLE_TIME);
+    let before = cash_open_snapshot(&relayed_pyth, &[relay, direct_pyth]);
+    assert!(relayed_pyth
+        .send_controller(vec![
+            relayed_pyth.prepare_position_instruction(),
+            relayed_pyth.open_cash_instruction(
+                relay,
+                Some(direct_pyth),
+                OPEN_COLLATERAL,
+                OPEN_NOTIONAL,
+                100,
+            ),
+        ])
+        .is_err());
+    assert_eq!(
+        cash_open_snapshot(&relayed_pyth, &[relay, direct_pyth]),
+        before
+    );
+    let independent_switchboard = relayed_pyth.install_switchboard_price(
+        &SECONDARY_FEED_ID,
+        101_000_000,
+        100_000,
+        ORACLE_TIME,
+    );
+    relayed_pyth
+        .send_controller(vec![
+            relayed_pyth.prepare_position_instruction(),
+            relayed_pyth.open_cash_instruction(
+                relay,
+                Some(independent_switchboard),
+                OPEN_COLLATERAL,
+                OPEN_NOTIONAL,
+                100,
+            ),
+        ])
+        .expect("relay plus independent Switchboard observation");
 }
 
 #[test]
@@ -3618,6 +4855,63 @@ fn deposits_capture_unsolicited_surplus_and_reject_custody_shortfalls_atomically
 }
 
 #[test]
+fn controller_can_deposit_when_it_is_the_transaction_fee_payer() {
+    let mut fixture = Fixture::new(202);
+    fixture.send_bundle().expect("initialize canonical pool");
+    fixture
+        .send_controller(vec![
+            fixture.controller_instruction(true),
+            fixture.controller_instruction(false),
+        ])
+        .expect("register controller");
+    fixture
+        .send(vec![fixture.vault_instruction()], true)
+        .expect("initialize canonical vault");
+
+    let transaction_instructions = vec![
+        ComputeBudgetInstruction::request_heap_frame(128 * 1024),
+        ComputeBudgetInstruction::set_compute_unit_limit(TX_CU_LIMIT),
+        fixture.deposit_instruction(DEPOSIT_AMOUNT),
+    ];
+    let transaction = Transaction::new_signed_with_payer(
+        &transaction_instructions,
+        Some(&fixture.controller.pubkey()),
+        &[&fixture.controller],
+        fixture.svm.latest_blockhash(),
+    );
+    fixture
+        .svm
+        .send_transaction(transaction)
+        .expect("self-paid controller deposit");
+
+    let pool =
+        decode_account::<PoolState>(&fixture.svm.get_account(&fixture.pool).unwrap().data).unwrap();
+    let controller = decode_account::<ControllerRiskState>(
+        &fixture
+            .svm
+            .get_account(&fixture.controller_risk)
+            .unwrap()
+            .data,
+    )
+    .unwrap();
+    let source =
+        TokenAccount::unpack(&fixture.svm.get_account(&fixture.source).unwrap().data).unwrap();
+    let vault =
+        TokenAccount::unpack(&fixture.svm.get_account(&fixture.vault).unwrap().data).unwrap();
+    assert_eq!(pool.idle_cash_collateral.get(), u128::from(DEPOSIT_AMOUNT));
+    assert_eq!(
+        controller.available_cash_collateral.get(),
+        u128::from(DEPOSIT_AMOUNT)
+    );
+    assert_eq!(source.amount, SOURCE_BALANCE - DEPOSIT_AMOUNT);
+    assert_eq!(vault.amount, DEPOSIT_AMOUNT);
+    assert_eq!(
+        pool.represented_quote_custody().unwrap(),
+        u128::from(vault.amount)
+    );
+}
+
+#[test]
 fn hostile_deposit_shapes_and_failed_token_cpi_leave_custody_unchanged() {
     let mut fixture = Fixture::new(124);
     fixture.send_bundle().expect("initialize canonical pool");
@@ -3641,13 +4935,13 @@ fn hostile_deposit_shapes_and_failed_token_cpi_leave_custody_unchanged() {
     assert!(fixture.send(vec![instruction], false).is_err());
     assert_eq!(custody_snapshot(&fixture), before);
 
-    let mut writable_authority = fixture.deposit_metas();
-    writable_authority[0] = AccountMeta::new(fixture.controller.pubkey(), true);
+    let mut writable_nonsigner = fixture.deposit_metas();
+    writable_nonsigner[0] = AccountMeta::new(fixture.controller.pubkey(), false);
     let instruction = fixture.instruction(
         MartingalerInstruction::DepositCash { amount: 1 },
-        writable_authority,
+        writable_nonsigner,
     );
-    assert!(fixture.send_controller(vec![instruction]).is_err());
+    assert!(fixture.send(vec![instruction], false).is_err());
     assert_eq!(custody_snapshot(&fixture), before);
 
     let mut wrong_token_program = fixture.deposit_metas();
@@ -4029,12 +5323,9 @@ fn controller_close_refunds_exact_principal_in_close_only_and_rejects_replay() {
         TokenAccount::unpack(&fixture.svm.get_account(&fixture.vault).unwrap().data).unwrap();
     let destination =
         TokenAccount::unpack(&fixture.svm.get_account(&fixture.source).unwrap().data).unwrap();
-    assert_eq!(vault.amount, DEPOSIT_AMOUNT - 5_000_000);
-    assert_eq!(
-        destination.amount,
-        SOURCE_BALANCE - DEPOSIT_AMOUNT + 5_000_000
-    );
-    assert_eq!(pool.idle_cash_collateral.get(), 240_000_000);
+    assert_eq!(vault.amount, DEPOSIT_AMOUNT);
+    assert_eq!(destination.amount, SOURCE_BALANCE - DEPOSIT_AMOUNT);
+    assert_eq!(pool.idle_cash_collateral.get(), 245_000_000);
     assert_eq!(pool.protected_principal.get(), 0);
     assert_eq!(pool.free_cash.get(), 5_000_000);
     assert_eq!(pool.reserved_open_profit.get(), 0);
@@ -4044,7 +5335,7 @@ fn controller_close_refunds_exact_principal_in_close_only_and_rejects_replay() {
     );
     assert_eq!(market.long_open_interest.get(), 0);
     assert_eq!(market.reserved_profit.get(), 0);
-    assert_eq!(controller.available_cash_collateral.get(), 240_000_000);
+    assert_eq!(controller.available_cash_collateral.get(), 245_000_000);
     assert_eq!(controller.reserved_profit.get(), 0);
     assert_eq!(controller.open_positions.get(), 0);
     assert_eq!(position.status, PositionStatus::Closed as u8);
@@ -4105,18 +5396,15 @@ fn flat_controller_close_refunds_full_principal_and_rejects_replay() {
     let source_after = fixture.svm.get_account(&fixture.source).unwrap();
     let vault_amount_after = TokenAccount::unpack(&vault_after.data).unwrap().amount;
     let source_amount_after = TokenAccount::unpack(&source_after.data).unwrap().amount;
-    assert_eq!(vault_amount_before - vault_amount_after, OPEN_COLLATERAL);
-    assert_eq!(source_amount_after - source_amount_before, OPEN_COLLATERAL);
-    assert_eq!(vault_amount_after, DEPOSIT_AMOUNT - OPEN_COLLATERAL);
-    assert_eq!(
-        source_amount_after,
-        SOURCE_BALANCE - DEPOSIT_AMOUNT + OPEN_COLLATERAL
-    );
+    assert_eq!(vault_amount_after, vault_amount_before);
+    assert_eq!(source_amount_after, source_amount_before);
+    assert_eq!(vault_amount_after, DEPOSIT_AMOUNT);
+    assert_eq!(source_amount_after, SOURCE_BALANCE - DEPOSIT_AMOUNT);
     assert_eq!(
         fixture.svm.get_account(&fixture.quote_mint).unwrap(),
         mint_before
     );
-    assert_eq!(pool.idle_cash_collateral.get(), 240_000_000);
+    assert_eq!(pool.idle_cash_collateral.get(), 250_000_000);
     assert_eq!(pool.protected_principal.get(), 0);
     assert_eq!(pool.free_cash.get(), 0);
     assert_eq!(pool.claim_service_cash.get(), 0);
@@ -4128,7 +5416,7 @@ fn flat_controller_close_refunds_full_principal_and_rejects_replay() {
     );
     assert_eq!(market.long_open_interest.get(), 0);
     assert_eq!(market.reserved_profit.get(), 0);
-    assert_eq!(controller.available_cash_collateral.get(), 240_000_000);
+    assert_eq!(controller.available_cash_collateral.get(), 250_000_000);
     assert_eq!(controller.reserved_profit.get(), 0);
     assert_eq!(controller.open_positions.get(), 0);
     assert_eq!(position.status, PositionStatus::Closed as u8);
@@ -4416,6 +5704,16 @@ fn profitable_cash_close_fully_pays_principal_and_profit_without_claim() {
     pool_state.free_cash = U128Le::new(u128::from(PAYABLE_PROFIT));
     overwrite_account(&mut pool_account.data, &pool_state).unwrap();
     fixture.svm.set_account(fixture.pool, pool_account).unwrap();
+    let mut controller_account = fixture.svm.get_account(&fixture.controller_risk).unwrap();
+    let mut controller_state =
+        decode_account::<ControllerRiskState>(&controller_account.data).unwrap();
+    controller_state.available_cash_collateral =
+        U128Le::new(controller_state.available_cash_collateral.get() - u128::from(PAYABLE_PROFIT));
+    overwrite_account(&mut controller_account.data, &controller_state).unwrap();
+    fixture
+        .svm
+        .set_account(fixture.controller_risk, controller_account)
+        .unwrap();
     let mut market_account = fixture.svm.get_account(&fixture.market).unwrap();
     let mut market_state = decode_account::<MarketRiskState>(&market_account.data).unwrap();
     market_state.status = PoolStatus::CloseOnly as u8;
@@ -4462,14 +5760,8 @@ fn profitable_cash_close_fully_pays_principal_and_profit_without_claim() {
         TokenAccount::unpack(&fixture.svm.get_account(&fixture.vault).unwrap().data).unwrap();
     let destination =
         TokenAccount::unpack(&fixture.svm.get_account(&fixture.source).unwrap().data).unwrap();
-    assert_eq!(
-        destination.amount - source_before,
-        OPEN_COLLATERAL + PAYABLE_PROFIT
-    );
-    assert_eq!(
-        vault.amount,
-        DEPOSIT_AMOUNT - OPEN_COLLATERAL - PAYABLE_PROFIT
-    );
+    assert_eq!(destination.amount, source_before);
+    assert_eq!(vault.amount, DEPOSIT_AMOUNT);
     assert_eq!(pool.free_cash.get(), 0);
     assert_eq!(pool.protected_principal.get(), 0);
     assert_eq!(pool.total_queued.get(), 0);
@@ -4521,6 +5813,16 @@ fn profitable_cash_close_partially_pays_and_atomically_appends_current_tail() {
     pool_state.free_cash = U128Le::new(u128::from(FREE_CASH));
     overwrite_account(&mut pool_account.data, &pool_state).unwrap();
     fixture.svm.set_account(fixture.pool, pool_account).unwrap();
+    let mut controller_account = fixture.svm.get_account(&fixture.controller_risk).unwrap();
+    let mut controller_state =
+        decode_account::<ControllerRiskState>(&controller_account.data).unwrap();
+    controller_state.available_cash_collateral =
+        U128Le::new(controller_state.available_cash_collateral.get() - u128::from(FREE_CASH));
+    overwrite_account(&mut controller_account.data, &controller_state).unwrap();
+    fixture
+        .svm
+        .set_account(fixture.controller_risk, controller_account)
+        .unwrap();
 
     let exit = fixture.install_pyth_price(&PRIMARY_FEED_ID, 101_000_000, 100_000, ORACLE_TIME);
     let result = fixture
@@ -4554,7 +5856,7 @@ fn profitable_cash_close_partially_pays_and_atomically_appends_current_tail() {
     .unwrap();
     let vault =
         TokenAccount::unpack(&fixture.svm.get_account(&fixture.vault).unwrap().data).unwrap();
-    assert_eq!(vault.amount, DEPOSIT_AMOUNT - OPEN_COLLATERAL - FREE_CASH);
+    assert_eq!(vault.amount, DEPOSIT_AMOUNT);
     assert_eq!(pool.total_queued.get(), u128::from(QUEUED));
     assert_eq!(pool.free_cash.get(), 0);
     assert_eq!(pool.fee_accrual.get(), 180_000);
@@ -4637,7 +5939,7 @@ fn settled_fifo_head_blocks_profit_bypass_and_accepts_new_current_tail_claim() {
             .unwrap();
     let vault =
         TokenAccount::unpack(&fixture.svm.get_account(&fixture.vault).unwrap().data).unwrap();
-    assert_eq!(vault.amount, DEPOSIT_AMOUNT - OPEN_COLLATERAL);
+    assert_eq!(vault.amount, DEPOSIT_AMOUNT);
     assert_eq!(pool.free_cash.get(), 0);
     assert_eq!(pool.total_queued.get(), u128::from(QUEUED));
     assert_eq!(pool.head_claim_sequence.get(), 1);
@@ -4824,7 +6126,7 @@ fn real_sbf_favorable_zero_atom_close_returns_only_principal_without_claim() {
             .unwrap();
     let destination =
         TokenAccount::unpack(&fixture.svm.get_account(&fixture.source).unwrap().data).unwrap();
-    assert_eq!(destination.amount - source_before, OPEN_COLLATERAL);
+    assert_eq!(destination.amount, source_before);
     assert_eq!(pool.protected_principal.get(), 0);
     assert_eq!(pool.reserved_open_profit.get(), 0);
     assert_eq!(pool.total_queued.get(), 0);
@@ -5486,8 +6788,8 @@ fn fifo_service_partially_pays_exact_available_cash_and_preserves_head() {
             .data,
     )
     .unwrap();
-    assert_eq!(vault_before - vault.amount, SERVICE_CASH);
-    assert_eq!(destination.amount, SERVICE_CASH);
+    assert_eq!(vault.amount, vault_before);
+    assert_eq!(destination.amount, 0);
     assert_eq!(pool.claim_service_cash.get(), 0);
     assert_eq!(
         pool.total_queued.get(),
@@ -5523,6 +6825,59 @@ fn fifo_service_partially_pays_exact_available_cash_and_preserves_head() {
         .send(vec![fixture.service_fifo_instruction()], false)
         .is_err());
     assert_eq!(claim_service_snapshot(&fixture), before_pop);
+}
+
+#[test]
+fn internal_fifo_service_credits_account_usdc_without_wallet_token_dependency() {
+    const SERVICE_CASH: u64 = 4_000_000;
+    let mut fixture = queued_claim_fixture(111, SERVICE_CASH, PoolStatus::CloseOnly);
+    let vault_before = fixture.svm.get_account(&fixture.vault).unwrap();
+    let controller_before = decode_account::<ControllerRiskState>(
+        &fixture
+            .svm
+            .get_account(&fixture.controller_risk)
+            .unwrap()
+            .data,
+    )
+    .unwrap();
+    let controller_ata = fixture.controller_ata();
+    replace_account(&mut fixture, controller_ata, system_program::ID, 0, false);
+
+    fixture
+        .send(vec![fixture.service_fifo_internal_instruction()], false)
+        .expect("service FIFO into the controller's internal Account USDC balance");
+
+    let pool =
+        decode_account::<PoolState>(&fixture.svm.get_account(&fixture.pool).unwrap().data).unwrap();
+    let controller = decode_account::<ControllerRiskState>(
+        &fixture
+            .svm
+            .get_account(&fixture.controller_risk)
+            .unwrap()
+            .data,
+    )
+    .unwrap();
+    let claim =
+        decode_account::<ClaimState>(&fixture.svm.get_account(&fixture.claim()).unwrap().data)
+            .unwrap();
+    assert_eq!(
+        fixture.svm.get_account(&fixture.vault).unwrap(),
+        vault_before
+    );
+    assert_eq!(pool.claim_service_cash.get(), 0);
+    assert_eq!(pool.idle_cash_collateral.get(), 250_000_000);
+    assert_eq!(
+        controller.available_cash_collateral.get(),
+        controller_before.available_cash_collateral.get() + u128::from(SERVICE_CASH)
+    );
+    assert_eq!(
+        claim.remaining_face.get(),
+        u128::from(PROFIT_CLAIM_FACE - SERVICE_CASH)
+    );
+    assert_eq!(
+        pool.represented_quote_custody().unwrap(),
+        u128::from(DEPOSIT_AMOUNT)
+    );
 }
 
 #[test]
@@ -5583,8 +6938,8 @@ fn full_service_and_final_pop_bundle_is_permissionless_bounded_and_releases_exce
             .data,
     )
     .unwrap();
-    assert_eq!(vault_before - vault.amount, PROFIT_CLAIM_FACE);
-    assert_eq!(destination.amount, PROFIT_CLAIM_FACE);
+    assert_eq!(vault.amount, vault_before);
+    assert_eq!(destination.amount, 0);
     assert_eq!(pool.total_queued.get(), 0);
     assert_eq!(pool.claim_service_cash.get(), 0);
     assert_eq!(pool.free_cash.get(), u128::from(EXCESS));
@@ -5960,8 +7315,8 @@ fn fifo_pop_crosses_exactly_one_canonical_page_and_preserves_next_page() {
             .data,
     )
     .unwrap();
-    assert_eq!(vault_before - vault.amount, PROFIT_CLAIM_FACE);
-    assert_eq!(destination.amount, PROFIT_CLAIM_FACE);
+    assert_eq!(vault.amount, vault_before);
+    assert_eq!(destination.amount, 0);
     assert_eq!(pool.claim_service_cash.get(), 0);
     assert_eq!(pool.head_page_index.get(), 1);
     assert_eq!(pool.head_claim_sequence.get(), 33);
@@ -6365,8 +7720,8 @@ fn claim_funded_close_pays_immediately_only_after_priority_clears_and_free_cash_
         pool.free_cash.get(),
         FREE_CASH - u128::from(PROFIT_CLAIM_FACE)
     );
-    assert_eq!(vault_before - vault_after, PROFIT_CLAIM_FACE);
-    assert_eq!(destination_after - destination_before, PROFIT_CLAIM_FACE);
+    assert_eq!(vault_after, vault_before);
+    assert_eq!(destination_after, destination_before);
     assert!(fixture
         .svm
         .get_account(&fixture.claim_for(CLAIM_POSITION_ID))
@@ -6419,7 +7774,7 @@ fn claim_funded_bankruptcy_is_permissionless_extinguishes_claim_and_never_transf
     assert_eq!(position.status, PositionStatus::Closed as u8);
     assert_eq!(pool.total_queued.get(), 0);
     assert_eq!(pool.open_claim_collateral.get(), 0);
-    assert_eq!(pool.residual_bad_debt.get(), 8_820_000);
+    assert_eq!(pool.residual_bad_debt.get(), u128::from(PROFIT_CLAIM_FACE));
     assert_eq!(controller.active_claims.get(), 0);
     assert_eq!(controller.open_positions.get(), 0);
     assert_eq!(
@@ -6480,7 +7835,7 @@ fn devnet_release_rehearsal_runs_cash_claim_fifo_reuse_and_wind_down_on_fresh_sb
     max_compute_units = max_compute_units.max(result.compute_units_consumed);
 
     let cash_profit =
-        fixture.install_pyth_price(&PRIMARY_FEED_ID, 101_000_000, 100_000, ORACLE_TIME);
+        fixture.install_pyth_price(&PRIMARY_FEED_ID, 102_000_000, 100_000, ORACLE_TIME);
     let result = fixture
         .send_controller(vec![
             fixture.prepare_claim_instruction(),
@@ -6507,7 +7862,7 @@ fn devnet_release_rehearsal_runs_cash_claim_fifo_reuse_and_wind_down_on_fresh_sb
                 claim_entry,
                 None,
                 PROFIT_CLAIM_FACE,
-                882_000_000,
+                1_764_000_000,
                 100,
             ),
         ])
@@ -6555,13 +7910,13 @@ fn devnet_release_rehearsal_runs_cash_claim_fifo_reuse_and_wind_down_on_fresh_sb
                 LOSS_POSITION_ID,
                 loss_entry,
                 None,
-                OPEN_COLLATERAL,
-                OPEN_NOTIONAL,
+                OPEN_COLLATERAL * 2,
+                OPEN_NOTIONAL * 2,
                 100,
             ),
         ])
         .expect("release rehearsal opens the loss-funding cash position");
-    let loss_exit = fixture.install_pyth_price(&PRIMARY_FEED_ID, 99_100_000, 100_000, ORACLE_TIME);
+    let loss_exit = fixture.install_pyth_price(&PRIMARY_FEED_ID, 98_000_000, 100_000, ORACLE_TIME);
     let result = fixture
         .send_controller(vec![fixture.close_cash_instruction_for(
             LOSS_POSITION_ID,

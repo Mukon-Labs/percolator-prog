@@ -3,18 +3,20 @@ use percolator_prog::martingaler_state::{
     account_len, append_claim, close_cash_position, close_nonpositive_claim_position,
     close_profitable_cash_position, close_profitable_claim_position, consume_claim_for_position,
     decode_account, decode_account_header, initialize_account, initialize_queue_page_zero_account,
-    link_next_queue_page, open_cash_position_from_idle, open_claim_position_from_queue,
-    oracle_cash_pnl, overwrite_account, pay_fifo_head, pop_fifo_head_with_claim,
-    pop_settled_fifo_head, record_cash_deposit, resolve_bankrupt_claim_position,
-    service_fifo_claim, transition_market_status, transition_pool_status,
-    validate_queue_page_zero_account, withdraw_idle_cash, ClaimState, ClaimStatus,
-    ControllerRiskState, FundingKind, HaircutConfig, I64Le, Key32, MarketRiskState,
-    MartingalerAccount, OracleCashPnl, OraclePolicyState, PoolState, PoolStatus, PositionSide,
-    PositionState, PositionStatus, QueueEntry, QueuePageState, StateError, U128Le, U16Le, U32Le,
-    U64Le, ACCOUNT_HEADER_LEN, CLAIM_ACCOUNT_LEN, CONTROLLER_RISK_ACCOUNT_LEN, KIND_POOL,
-    MARKET_RISK_ACCOUNT_LEN, MARTINGALER_MAGIC, MARTINGALER_VERSION, NO_CLAIM_SEQUENCE,
-    NO_PAGE_INDEX, ORACLE_POLICY_ACCOUNT_LEN, POOL_ACCOUNT_LEN, POSITION_ACCOUNT_LEN,
+    link_next_queue_page, open_cash_position_from_idle, open_cash_position_from_idle_guarded,
+    open_claim_position_from_queue, oracle_cash_pnl, overwrite_account, pay_fifo_head,
+    pop_fifo_head_with_claim, pop_settled_fifo_head, quote_payout_factor, record_cash_deposit,
+    resolve_bankrupt_claim_position, service_fifo_claim, transition_market_status,
+    transition_pool_status, validate_queue_page_zero_account, withdraw_idle_cash, ClaimState,
+    ClaimStatus, ControllerRiskState, FundingKind, HaircutConfig, I64Le, Key32, MarketRiskState,
+    MartingalerAccount, OracleCashPnl, OraclePolicyState, OracleRelaySource, OracleRelayState,
+    PoolState, PoolStatus, PositionSide, PositionState, PositionStatus, QueueEntry, QueuePageState,
+    StateError, TradingSessionState, U128Le, U16Le, U32Le, U64Le, ACCOUNT_HEADER_LEN,
+    CLAIM_ACCOUNT_LEN, CONTROLLER_RISK_ACCOUNT_LEN, KIND_POOL, MARKET_RISK_ACCOUNT_LEN,
+    MARTINGALER_MAGIC, MARTINGALER_VERSION, NO_CLAIM_SEQUENCE, NO_PAGE_INDEX,
+    ORACLE_POLICY_ACCOUNT_LEN, ORACLE_RELAY_ACCOUNT_LEN, POOL_ACCOUNT_LEN, POSITION_ACCOUNT_LEN,
     QUEUE_FLAG_HEAD_SETTLED, QUEUE_PAGE_ACCOUNT_LEN, QUEUE_PAGE_CAPACITY,
+    TRADING_SESSION_ACCOUNT_LEN, V1_MIN_COLLATERAL_QUOTE,
 };
 
 fn key(byte: u8) -> Key32 {
@@ -136,7 +138,20 @@ fn every_account_kind_has_an_exact_round_trip_layout() {
     let pool = pool();
     let market = market(pool_key);
     let oracle_policy = oracle_policy(pool_key);
+    let oracle_relay = OracleRelayState::new(
+        pool_key,
+        key(8),
+        key(10),
+        key(12),
+        OracleRelaySource::MagicBlockDemo,
+        0,
+        0,
+        0,
+        0,
+    )
+    .unwrap();
     let controller = controller(pool_key);
+    let session = TradingSessionState::new(pool_key, key(4), key(5), 1_000).unwrap();
     let position = cash_position(pool_key);
     let claim = cash_claim(pool_key);
     let page = QueuePageState::new(pool_key, 0, NO_PAGE_INDEX, 1).unwrap();
@@ -146,7 +161,9 @@ fn every_account_kind_has_an_exact_round_trip_layout() {
     assert_eq!(POOL_ACCOUNT_LEN, 424);
     assert_eq!(MARKET_RISK_ACCOUNT_LEN, 200);
     assert_eq!(ORACLE_POLICY_ACCOUNT_LEN, 160);
+    assert_eq!(ORACLE_RELAY_ACCOUNT_LEN, 216);
     assert_eq!(CONTROLLER_RISK_ACCOUNT_LEN, 168);
+    assert_eq!(TRADING_SESSION_ACCOUNT_LEN, 176);
     assert_eq!(POSITION_ACCOUNT_LEN, 208);
     assert_eq!(CLAIM_ACCOUNT_LEN, 216);
     assert_eq!(QUEUE_PAGE_ACCOUNT_LEN, 2_160);
@@ -156,21 +173,59 @@ fn every_account_kind_has_an_exact_round_trip_layout() {
         ORACLE_POLICY_ACCOUNT_LEN,
         account_len::<OraclePolicyState>()
     );
+    assert_eq!(ORACLE_RELAY_ACCOUNT_LEN, account_len::<OracleRelayState>());
     assert_eq!(
         CONTROLLER_RISK_ACCOUNT_LEN,
         account_len::<ControllerRiskState>()
     );
     assert_eq!(POSITION_ACCOUNT_LEN, account_len::<PositionState>());
+    assert_eq!(
+        TRADING_SESSION_ACCOUNT_LEN,
+        account_len::<TradingSessionState>()
+    );
     assert_eq!(CLAIM_ACCOUNT_LEN, account_len::<ClaimState>());
     assert_eq!(QUEUE_PAGE_ACCOUNT_LEN, account_len::<QueuePageState>());
 
     round_trip(pool);
     round_trip(market);
     round_trip(oracle_policy);
+    round_trip(oracle_relay);
     round_trip(controller);
+    round_trip(session);
     round_trip(position);
     round_trip(claim);
     round_trip(page);
+}
+
+#[test]
+fn trading_session_is_owner_bound_expiring_replay_safe_and_notional_bounded() {
+    let pool_key = key(9);
+    let owner = key(4);
+    let signer = key(5);
+    let session = TradingSessionState::new(pool_key, owner, signer, 1_000).unwrap();
+    let next = session
+        .authorize_action(pool_key, owner, signer, 1, 0, 1_001, 500_000_000)
+        .unwrap();
+    assert_eq!(next.next_nonce.get(), 1);
+    assert_eq!(next.spent_notional.get(), 500_000_000);
+    assert!(session
+        .authorize_action(pool_key, owner, signer, 1, 1, 1_001, 0)
+        .is_err());
+    assert!(next
+        .authorize_action(pool_key, owner, key(6), 1, 1, 1_001, 0)
+        .is_err());
+    assert!(next
+        .authorize_action(pool_key, owner, signer, 1, 1, 4_600, 0)
+        .is_err());
+    let revoked = next.revoke(owner, 1).unwrap();
+    assert!(revoked
+        .authorize_action(pool_key, owner, signer, 1, 1, 1_002, 0)
+        .is_err());
+    let renewed = revoked.renew(owner, key(6), 1, 2_000).unwrap();
+    assert_eq!(renewed.epoch.get(), 2);
+    assert_eq!(renewed.next_nonce.get(), 0);
+    assert_eq!(renewed.spent_notional.get(), 0);
+    assert_eq!(renewed.revoked, 0);
 }
 
 #[test]
@@ -463,6 +518,130 @@ fn oracle_policy_and_cash_open_use_fixed_layout_and_exact_reclassification() {
 }
 
 #[test]
+fn oracle_relay_is_immutable_in_identity_and_monotonic_in_observation() {
+    let mut relay = OracleRelayState::new(
+        key(9),
+        key(8),
+        key(10),
+        key(12),
+        OracleRelaySource::MagicBlockDemo,
+        0,
+        0,
+        0,
+        0,
+    )
+    .unwrap();
+    assert_eq!(relay.sequence.get(), 0);
+    relay
+        .record_observation(100_000_000, 100_000, 1_000, 50, 75)
+        .unwrap();
+    assert_eq!(relay.sequence.get(), 1);
+    assert_eq!(relay.price_e6.get(), 100_000_000);
+    assert_eq!(relay.publish_time.get(), 1_000);
+
+    let snapshot = relay;
+    assert_eq!(
+        relay.record_observation(100_100_000, 100_000, 1_000, 50, 76),
+        Err(StateError::InvalidState)
+    );
+    assert_eq!(relay, snapshot);
+    assert_eq!(
+        relay.record_observation(100_100_000, 100_000, 1_001, 50, 76),
+        Err(StateError::InvalidState)
+    );
+    assert_eq!(relay, snapshot);
+    assert_eq!(
+        relay.record_observation(100_100_000, 100_000, 999, 51, 76),
+        Err(StateError::InvalidState)
+    );
+    assert_eq!(relay, snapshot);
+    assert_eq!(
+        relay.record_observation(100_100_000, 100_000, 1_001, 49, 76),
+        Err(StateError::InvalidState)
+    );
+    assert_eq!(relay, snapshot);
+
+    relay
+        .record_observation(100_100_000, 100_000, 1_001, 51, 76)
+        .unwrap();
+    assert_eq!(relay.sequence.get(), 2);
+    assert_eq!(relay.source, OracleRelaySource::MagicBlockDemo as u8);
+    assert_eq!(relay.authority, key(12));
+}
+
+#[test]
+fn oracle_relay_source_configuration_is_explicit_and_fail_closed() {
+    assert!(OracleRelayState::new(
+        key(9),
+        key(8),
+        key(10),
+        key(12),
+        OracleRelaySource::MagicBlockDemo,
+        1,
+        0,
+        0,
+        0,
+    )
+    .is_err());
+    assert!(OracleRelayState::new(
+        key(9),
+        key(8),
+        key(10),
+        key(12),
+        OracleRelaySource::PhoenixHawkeye,
+        0,
+        64,
+        100,
+        100,
+    )
+    .is_err());
+    let phoenix = OracleRelayState::new(
+        key(9),
+        key(8),
+        key(10),
+        key(12),
+        OracleRelaySource::PhoenixHawkeye,
+        10_000,
+        64,
+        100,
+        100,
+    )
+    .unwrap();
+    assert_eq!(phoenix.price_e6_per_tick.get(), 10_000);
+    assert_eq!(phoenix.max_source_staleness_slots.get(), 64);
+    assert_eq!(phoenix.max_spread_bps.get(), 100);
+    assert_eq!(phoenix.max_mark_index_divergence_bps.get(), 100);
+    let mirrored = OracleRelayState::new(
+        key(9),
+        key(8),
+        key(10),
+        key(12),
+        OracleRelaySource::PhoenixMainnetRelay,
+        0,
+        0,
+        0,
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        mirrored.source,
+        OracleRelaySource::PhoenixMainnetRelay as u8
+    );
+    assert!(OracleRelayState::new(
+        key(9),
+        key(8),
+        key(10),
+        key(12),
+        OracleRelaySource::PhoenixMainnetRelay,
+        10_000,
+        0,
+        0,
+        0,
+    )
+    .is_err());
+}
+
+#[test]
 fn cash_open_risk_cash_and_custody_failures_are_atomic() {
     let pool_key = key(9);
     let market_key = key(8);
@@ -473,7 +652,7 @@ fn cash_open_risk_cash_and_custody_failures_are_atomic() {
     record_cash_deposit(pool_key, &mut pool, &mut controller, 0, 100).unwrap();
 
     for (observed, collateral, notional, leverage, expected) in [
-        (100, 101, 100, 1, StateError::InsufficientCashCollateral),
+        (100, 101, 101, 1, StateError::InsufficientCashCollateral),
         (99, 1, 1, 1, StateError::CustodyShortfall),
         (100, 1, 101, 100, StateError::RiskLimitExceeded),
         (100, 1, 2_000_001, 100, StateError::RiskLimitExceeded),
@@ -510,6 +689,102 @@ fn cash_open_risk_cash_and_custody_failures_are_atomic() {
     assert!(OraclePolicyState::new(pool_key, market_key, key(10), key(10), 30, 100).is_err());
     assert!(OraclePolicyState::new(pool_key, market_key, key(10), Key32::ZERO, 0, 100).is_err());
     assert!(OraclePolicyState::new(pool_key, market_key, key(10), Key32::ZERO, 30, 0).is_err());
+}
+
+#[test]
+fn guarded_open_enforces_ten_dollar_floor_and_freezes_dynamic_payout_cap() {
+    let pool_key = key(9);
+    let market_key = key(8);
+    let controller_key = key(4);
+    let mut pool = pool();
+    let mut market = MarketRiskState::new(
+        pool_key,
+        &pool,
+        1,
+        500,
+        1_000_000 * 1_000_000,
+        1_000_000 * 1_000_000,
+        haircut(),
+    )
+    .unwrap();
+    let mut controller = ControllerRiskState::new(pool_key, controller_key).unwrap();
+    record_cash_deposit(pool_key, &mut pool, &mut controller, 0, 2_000 * 1_000_000).unwrap();
+    pool.reserved_open_profit = U128Le::new(200_000 * 1_000_000);
+    controller.reserved_profit = U128Le::new(200_000 * 1_000_000);
+    controller.open_positions = U32Le::new(2);
+    market.reserved_profit = U128Le::new(200_000 * 1_000_000);
+
+    let quote = quote_payout_factor(&pool, &market, &controller, 100_000 * 1_000_000, 0).unwrap();
+    assert_eq!(quote.payout_factor_bps, 5_000);
+    assert_eq!(quote.max_payable_profit, 50_000 * 1_000_000);
+
+    let before = (pool, market, controller);
+    assert_eq!(
+        open_cash_position_from_idle_guarded(
+            pool_key,
+            market_key,
+            controller_key,
+            &mut pool,
+            &mut market,
+            &mut controller,
+            2_000 * 1_000_000,
+            7,
+            PositionSide::Long,
+            V1_MIN_COLLATERAL_QUOTE - 1,
+            (V1_MIN_COLLATERAL_QUOTE - 1) * 100,
+            100,
+            100_000_000,
+            1_000,
+            0,
+            0,
+            0,
+        ),
+        Err(StateError::RiskLimitExceeded)
+    );
+    assert_eq!((pool, market, controller), before);
+    assert_eq!(
+        open_cash_position_from_idle_guarded(
+            pool_key,
+            market_key,
+            controller_key,
+            &mut pool,
+            &mut market,
+            &mut controller,
+            2_000 * 1_000_000,
+            7,
+            PositionSide::Long,
+            1_000 * 1_000_000,
+            100_000 * 1_000_000,
+            100,
+            100_000_000,
+            1_000,
+            0,
+            0,
+            6_000,
+        ),
+        Err(StateError::LiabilityLimitExceeded)
+    );
+    let opened = open_cash_position_from_idle_guarded(
+        pool_key,
+        market_key,
+        controller_key,
+        &mut pool,
+        &mut market,
+        &mut controller,
+        2_000 * 1_000_000,
+        7,
+        PositionSide::Long,
+        1_000 * 1_000_000,
+        100_000 * 1_000_000,
+        100,
+        100_000_000,
+        1_000,
+        0,
+        0,
+        5_000,
+    )
+    .unwrap();
+    assert_eq!(opened.position.max_payable_profit.get(), 50_000 * 1_000_000);
 }
 
 #[test]
@@ -645,15 +920,15 @@ fn cash_close_releases_exact_accounting_refunds_principal_and_tombstones() {
     assert_eq!(outcome.cash_loss_collected, 50);
     assert_eq!(outcome.residual_bad_debt_added, 0);
     assert_eq!(outcome.surplus_recorded, 5);
-    assert_eq!(outcome.represented_custody_after, 455);
-    assert_eq!(pool.idle_cash_collateral.get(), 400);
+    assert_eq!(outcome.represented_custody_after, 505);
+    assert_eq!(pool.idle_cash_collateral.get(), 450);
     assert_eq!(pool.protected_principal.get(), 0);
     assert_eq!(pool.free_cash.get(), 50);
     assert_eq!(pool.unallocated_vault_surplus.get(), 5);
     assert_eq!(pool.reserved_open_profit.get(), 0);
     assert_eq!(market.long_open_interest.get(), 0);
     assert_eq!(market.reserved_profit.get(), 0);
-    assert_eq!(controller.available_cash_collateral.get(), 400);
+    assert_eq!(controller.available_cash_collateral.get(), 450);
     assert_eq!(controller.reserved_profit.get(), 0);
     assert_eq!(controller.open_positions.get(), 0);
     assert_eq!(position.status, PositionStatus::Closed as u8);
@@ -670,7 +945,7 @@ fn cash_close_releases_exact_accounting_refunds_principal_and_tombstones() {
         &mut market,
         &mut controller,
         &mut position,
-        455,
+        505,
         99_500_000,
         None,
         false,
@@ -702,17 +977,17 @@ fn flat_cash_close_refunds_all_principal_and_releases_every_live_cap() {
     assert_eq!(outcome.cash_loss_collected, 0);
     assert_eq!(outcome.residual_bad_debt_added, 0);
     assert_eq!(outcome.surplus_recorded, 0);
-    assert_eq!(outcome.represented_custody_after, 400);
-    assert_eq!(pool.idle_cash_collateral.get(), 400);
+    assert_eq!(outcome.represented_custody_after, 500);
+    assert_eq!(pool.idle_cash_collateral.get(), 500);
     assert_eq!(pool.protected_principal.get(), 0);
     assert_eq!(pool.free_cash.get(), 0);
     assert_eq!(pool.claim_service_cash.get(), 0);
     assert_eq!(pool.residual_bad_debt.get(), 0);
     assert_eq!(pool.reserved_open_profit.get(), 0);
-    assert_eq!(pool.represented_quote_custody().unwrap(), 400);
+    assert_eq!(pool.represented_quote_custody().unwrap(), 500);
     assert_eq!(market.long_open_interest.get(), 0);
     assert_eq!(market.reserved_profit.get(), 0);
-    assert_eq!(controller.available_cash_collateral.get(), 400);
+    assert_eq!(controller.available_cash_collateral.get(), 500);
     assert_eq!(controller.reserved_profit.get(), 0);
     assert_eq!(controller.open_positions.get(), 0);
     assert_eq!(position.status, PositionStatus::Closed as u8);
@@ -728,7 +1003,7 @@ fn flat_cash_close_refunds_all_principal_and_releases_every_live_cap() {
         &mut market,
         &mut controller,
         &mut position,
-        400,
+        500,
         100_000_000,
         None,
         false,
@@ -929,6 +1204,7 @@ fn profitable_cash_close_pays_available_cash_then_queues_exact_remainder() {
     let (pool_key, market_key, controller_key, mut pool, mut market, mut controller, mut position) =
         opened_cash_close_fixture(PositionSide::Long, false);
     pool.idle_cash_collateral = U128Le::new(370);
+    controller.available_cash_collateral = U128Le::new(370);
     pool.free_cash = U128Le::new(30);
     let mut page = QueuePageState::new(pool_key, 0, NO_PAGE_INDEX, 1).unwrap();
 
@@ -965,10 +1241,12 @@ fn profitable_cash_close_pays_available_cash_then_queues_exact_remainder() {
     assert_eq!(pool.protected_principal.get(), 0);
     assert_eq!(pool.reserved_open_profit.get(), 0);
     assert_eq!(pool.fee_accrual.get(), 2);
-    assert_eq!(pool.represented_quote_custody().unwrap(), 370);
+    assert_eq!(pool.idle_cash_collateral.get(), 500);
+    assert_eq!(pool.represented_quote_custody().unwrap(), 500);
     assert_eq!(market.long_open_interest.get(), 0);
     assert_eq!(market.reserved_profit.get(), 0);
     assert_eq!(controller.reserved_profit.get(), 0);
+    assert_eq!(controller.available_cash_collateral.get(), 500);
     assert_eq!(controller.open_positions.get(), 0);
     assert_eq!(controller.queued_claim_face.get(), 58);
     assert_eq!(controller.active_claims.get(), 1);
@@ -1068,7 +1346,9 @@ fn profitable_cash_close_handles_zero_atom_profit_and_shape_failures_atomically(
     assert_eq!(outcome.immediate_profit_paid, 0);
     assert_eq!(outcome.queued_profit, 0);
     assert_eq!(outcome.principal_refund, 100);
-    assert_eq!(pool.represented_quote_custody().unwrap(), 400);
+    assert_eq!(pool.idle_cash_collateral.get(), 500);
+    assert_eq!(pool.represented_quote_custody().unwrap(), 500);
+    assert_eq!(controller.available_cash_collateral.get(), 500);
 
     let (pool_key, market_key, controller_key, mut pool, mut market, mut controller, mut position) =
         opened_cash_close_fixture(PositionSide::Long, false);
@@ -1771,11 +2051,13 @@ fn flat_claim_close_after_source_pop_can_pay_surviving_collateral_immediately() 
     assert_eq!(outcome.immediate_payout, 50);
     assert_eq!(outcome.queued_payout, 0);
     assert_eq!(outcome.child_claim, None);
-    assert_eq!(outcome.represented_custody_after, 10);
+    assert_eq!(outcome.represented_custody_after, 60);
     assert_eq!(pool.free_cash.get(), 10);
+    assert_eq!(pool.idle_cash_collateral.get(), 50);
     assert_eq!(pool.open_claim_collateral.get(), 0);
     assert_eq!(pool.protected_principal.get(), 0);
     assert_eq!(controller.claim_collateral_in_use.get(), 0);
+    assert_eq!(controller.available_cash_collateral.get(), 50);
     assert_eq!(controller.open_positions.get(), 0);
     assert_eq!(controller.active_claims.get(), 0);
     assert_eq!(claim.status, ClaimStatus::Settled as u8);

@@ -10,24 +10,25 @@ use crate::martingaler_state::{
     account_body_matches, account_len, close_cash_position, close_nonpositive_claim_position,
     close_profitable_cash_position, close_profitable_claim_position, decode_account,
     decode_account_boxed, decode_account_header, initialize_account,
-    initialize_queue_page_zero_account, open_cash_position_from_idle,
-    open_claim_position_from_queue, overwrite_account, pop_fifo_head_with_claim,
+    initialize_queue_page_zero_account, open_cash_position_from_idle_guarded,
+    open_claim_position_from_queue_guarded, overwrite_account, pop_fifo_head_with_claim,
     record_cash_deposit, resolve_bankrupt_claim_position, service_fifo_claim,
     transition_market_status, transition_pool_status, validate_queue_page_zero_account,
     withdraw_idle_cash, ClaimState, ControllerRiskState, HaircutConfig, Key32, MarketRiskState,
-    OraclePolicyState, PoolState, PoolStatus, PositionSide, PositionState, QueuePageState,
-    MAX_ORACLE_CONFIDENCE_BPS, MAX_ORACLE_STALENESS_SECS,
+    MartingalerAccount, OraclePolicyState, OracleRelaySource, OracleRelayState, PoolState,
+    PoolStatus, PositionSide, PositionState, QueuePageState, TradingSessionState,
+    MAX_ORACLE_CONFIDENCE_BPS, MAX_ORACLE_STALENESS_SECS, V1_MAX_LEVERAGE_X,
+    V1_MIN_PAYOUT_FACTOR_BPS, V1_PAYOUT_FACTOR_SCALE_BPS,
 };
 use alloc::{boxed::Box, vec::Vec};
 use percolator_martingaler_engine::martingaler::{
-    V1_MAX_LEVERAGE_X, V1_MAX_POSITION_NOTIONAL_QUOTE, V1_QUOTE_DECIMALS,
-    V1_TOTAL_POTENTIAL_LIABILITY_QUOTE,
+    V1_MAX_POSITION_NOTIONAL_QUOTE, V1_QUOTE_DECIMALS, V1_TOTAL_POTENTIAL_LIABILITY_QUOTE,
 };
 use solana_program::{
     account_info::AccountInfo,
     entrypoint::ProgramResult,
     instruction::{AccountMeta, Instruction as SolanaInstruction},
-    program::{invoke, invoke_signed},
+    program::{get_return_data, invoke, invoke_signed},
     program_error::ProgramError,
     program_option::COption,
     program_pack::Pack,
@@ -62,6 +63,22 @@ pub const CLOSE_CLAIM_POSITION_IX_LEN: usize = MARTINGALER_IX_PREFIX_LEN + 8 + 1
 pub const RESOLVE_BANKRUPT_CLAIM_POSITION_IX_LEN: usize = MARTINGALER_IX_PREFIX_LEN + 8;
 pub const SET_STATUS_IX_LEN: usize = MARTINGALER_IX_PREFIX_LEN + 1;
 pub const WITHDRAW_IDLE_CASH_IX_LEN: usize = MARTINGALER_IX_PREFIX_LEN + 8;
+pub const PREPARE_ORACLE_RELAY_IX_LEN: usize = MARTINGALER_IX_PREFIX_LEN + 2 + 32;
+pub const INITIALIZE_ORACLE_RELAY_IX_LEN: usize =
+    MARTINGALER_IX_PREFIX_LEN + 2 + 32 + 32 + 1 + 8 + 8 + 2 + 2;
+pub const UPDATE_ORACLE_RELAY_IX_LEN: usize = MARTINGALER_IX_PREFIX_LEN + 8 + 8 + 8 + 8;
+pub const REFRESH_PHOENIX_ORACLE_IX_LEN: usize = MARTINGALER_IX_PREFIX_LEN + 1 + 1;
+pub const PREPARE_TRADING_SESSION_IX_LEN: usize = MARTINGALER_IX_PREFIX_LEN;
+pub const INITIALIZE_TRADING_SESSION_IX_LEN: usize = MARTINGALER_IX_PREFIX_LEN + 32 + 8;
+pub const REVOKE_TRADING_SESSION_IX_LEN: usize = MARTINGALER_IX_PREFIX_LEN + 8;
+pub const SESSION_PREPARE_POSITION_IX_LEN: usize = PREPARE_POSITION_IX_LEN + 16;
+pub const SESSION_OPEN_POSITION_IX_LEN: usize = OPEN_CASH_POSITION_IX_LEN + 16;
+pub const SESSION_CLOSE_POSITION_IX_LEN: usize = CLOSE_CASH_POSITION_IX_LEN + 16;
+pub const SESSION_CLOSE_PROFITABLE_POSITION_IX_LEN: usize =
+    CLOSE_PROFITABLE_CASH_POSITION_IX_LEN + 16;
+pub const GUARDED_OPEN_POSITION_IX_LEN: usize = OPEN_CASH_POSITION_IX_LEN + 2;
+pub const SESSION_GUARDED_OPEN_POSITION_IX_LEN: usize = SESSION_OPEN_POSITION_IX_LEN + 2;
+pub const UPDATE_LEVERAGE_LIMIT_IX_LEN: usize = MARTINGALER_IX_PREFIX_LEN + 2 + 2;
 pub const MARTINGALER_IX_LEN: usize = POOL_IX_LEN;
 pub const PREPARE_POOL_TAG: u8 = 0;
 pub const INITIALIZE_POOL_TAG: u8 = 1;
@@ -89,6 +106,27 @@ pub const CLOSE_PROFITABLE_CLAIM_POSITION_TAG: u8 = 22;
 pub const SET_POOL_STATUS_TAG: u8 = 23;
 pub const SET_MARKET_STATUS_TAG: u8 = 24;
 pub const WITHDRAW_IDLE_CASH_TAG: u8 = 25;
+pub const PREPARE_ORACLE_RELAY_TAG: u8 = 26;
+pub const INITIALIZE_ORACLE_RELAY_TAG: u8 = 27;
+pub const UPDATE_ORACLE_RELAY_TAG: u8 = 28;
+pub const REFRESH_PHOENIX_ORACLE_TAG: u8 = 29;
+pub const SERVICE_FIFO_HEAD_INTERNAL_TAG: u8 = 30;
+pub const PREPARE_TRADING_SESSION_TAG: u8 = 31;
+pub const INITIALIZE_TRADING_SESSION_TAG: u8 = 32;
+pub const REVOKE_TRADING_SESSION_TAG: u8 = 33;
+pub const SESSION_PREPARE_POSITION_TAG: u8 = 34;
+pub const SESSION_OPEN_CASH_POSITION_TAG: u8 = 35;
+pub const SESSION_CLOSE_NONPOSITIVE_CASH_POSITION_TAG: u8 = 36;
+pub const SESSION_PREPARE_CLAIM_TAG: u8 = 37;
+pub const SESSION_CLOSE_PROFITABLE_CASH_POSITION_TAG: u8 = 38;
+pub const SESSION_OPEN_CLAIM_POSITION_TAG: u8 = 39;
+pub const SESSION_CLOSE_NONPOSITIVE_CLAIM_POSITION_TAG: u8 = 40;
+pub const SESSION_CLOSE_PROFITABLE_CLAIM_POSITION_TAG: u8 = 41;
+pub const GUARDED_OPEN_CASH_POSITION_TAG: u8 = 42;
+pub const GUARDED_OPEN_CLAIM_POSITION_TAG: u8 = 43;
+pub const SESSION_GUARDED_OPEN_CASH_POSITION_TAG: u8 = 44;
+pub const SESSION_GUARDED_OPEN_CLAIM_POSITION_TAG: u8 = 45;
+pub const UPDATE_LEVERAGE_LIMIT_TAG: u8 = 46;
 pub const MARTINGALER_PROGRAM_ERROR_BASE: u32 = 31_000;
 
 const POOL_SEED: &[u8] = b"martingaler_pool";
@@ -97,6 +135,8 @@ const VAULT_SEED: &[u8] = b"martingaler_vault";
 const MARKET_SEED: &[u8] = b"martingaler_market";
 const CONTROLLER_SEED: &[u8] = b"martingaler_controller";
 const ORACLE_POLICY_SEED: &[u8] = b"martingaler_oracle";
+const ORACLE_RELAY_SEED: &[u8] = b"martingaler_relay";
+const TRADING_SESSION_SEED: &[u8] = b"martingaler_session";
 const POSITION_SEED: &[u8] = b"martingaler_position";
 const CLAIM_SEED: &[u8] = b"martingaler_claim";
 const PAGE_ZERO: [u8; 8] = 0u64.to_le_bytes();
@@ -113,13 +153,42 @@ const PREPARE_CLAIM_ACCOUNT_COUNT: usize = 4;
 const PREPARE_QUEUE_PAGE_ACCOUNT_COUNT: usize = 4;
 const PROFITABLE_CLOSE_BASE_ACCOUNT_COUNT: usize = 12;
 const SERVICE_FIFO_HEAD_ACCOUNT_COUNT: usize = 9;
+const SERVICE_FIFO_HEAD_INTERNAL_ACCOUNT_COUNT: usize = 4;
+const PREPARE_TRADING_SESSION_ACCOUNT_COUNT: usize = 4;
+const INITIALIZE_TRADING_SESSION_ACCOUNT_COUNT: usize = 5;
+const REVOKE_TRADING_SESSION_ACCOUNT_COUNT: usize = 2;
+const SESSION_AUTH_ACCOUNT_COUNT: usize = 2;
 const POP_FIFO_HEAD_BASE_ACCOUNT_COUNT: usize = 3;
 const OPEN_CLAIM_BASE_ACCOUNT_COUNT: usize = 10;
 const CLAIM_CLOSE_BASE_ACCOUNT_COUNT: usize = 13;
 const CLAIM_BANKRUPTCY_BASE_ACCOUNT_COUNT: usize = 8;
 const SET_POOL_STATUS_ACCOUNT_COUNT: usize = 2;
 const SET_MARKET_STATUS_ACCOUNT_COUNT: usize = 3;
+const UPDATE_LEVERAGE_LIMIT_ACCOUNT_COUNT: usize = 3;
 const WITHDRAW_IDLE_CASH_ACCOUNT_COUNT: usize = 8;
+const ORACLE_RELAY_REGISTRATION_ACCOUNT_COUNT: usize = 5;
+const UPDATE_ORACLE_RELAY_ACCOUNT_COUNT: usize = 2;
+const REFRESH_PHOENIX_FIXED_ACCOUNT_COUNT: usize = 7;
+const MAX_PHOENIX_DYNAMIC_ACCOUNTS_PER_KIND: usize = 16;
+const ORACLE_RELAY_FUTURE_TOLERANCE_SECS: i64 = 5;
+const ORACLE_RELAY_MAX_INGRESS_AGE_SECS: i64 = 120;
+
+pub const HAWKEYE_PROGRAM_ID: Pubkey =
+    solana_program::pubkey!("RiSeVw3ZjNfsaXPRb4mgaqYaEEt41pNNJoDvVh7pgQj");
+pub const PHOENIX_MAINNET_PROGRAM_ID: Pubkey =
+    solana_program::pubkey!("EtrnLzgbS7nMMy5fbD42kXiUzGg8XQzJ972Xtk1cjWih");
+pub const PHOENIX_BETA_PROGRAM_ID: Pubkey =
+    solana_program::pubkey!("phDEVv4w6BcfkLrLNeXr8HhhgQxnxziVGXpGPcaadMf");
+pub const PHOENIX_MAINNET_GLOBAL_CONFIG: Pubkey =
+    solana_program::pubkey!("2zskx2iyCvb6Stg7RBZkt1f6MrF4dpYtMG3yMvKwqtUZ");
+pub const PHOENIX_BETA_GLOBAL_CONFIG: Pubkey =
+    solana_program::pubkey!("3CkM38UaZW6nyTJku4ABE5jjS5AComQErrkd55LGTfxa");
+pub const PHOENIX_VIEW_BBO_DISCRIMINANT: [u8; 8] = [55, 95, 35, 45, 83, 175, 18, 82];
+pub const PHOENIX_VIEW_BBO_RETURN_MAGIC: u64 = 17_278_657_705_831_514_481;
+pub const PHOENIX_HAWKEYE_RETURN_VERSION: u16 = 1;
+const PHOENIX_VIEW_BBO_RETURN_LEN: usize = 64;
+const PHOENIX_VIEW_BBO_HAS_BID: u8 = 1;
+const PHOENIX_VIEW_BBO_HAS_ASK: u8 = 2;
 
 const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
@@ -249,6 +318,15 @@ pub enum Instruction {
         notional: u64,
         leverage_x: u16,
     },
+    GuardedOpenCashPosition {
+        position_id: u64,
+        market_id: u16,
+        side: PositionSide,
+        collateral: u64,
+        notional: u64,
+        leverage_x: u16,
+        min_payout_factor_bps: u16,
+    },
     CloseNonPositiveCashPosition {
         position_id: u64,
     },
@@ -277,6 +355,15 @@ pub enum Instruction {
         notional: u64,
         leverage_x: u16,
     },
+    GuardedOpenClaimPosition {
+        position_id: u64,
+        market_id: u16,
+        side: PositionSide,
+        claim_amount: u64,
+        notional: u64,
+        leverage_x: u16,
+        min_payout_factor_bps: u16,
+    },
     CloseNonPositiveClaimPosition {
         position_id: u64,
         settlement_shape: ProfitSettlementShape,
@@ -297,6 +384,118 @@ pub enum Instruction {
     WithdrawIdleCash {
         amount: u64,
     },
+    PrepareOracleRelay {
+        market_id: u16,
+        feed_id: [u8; 32],
+    },
+    InitializeOracleRelay {
+        market_id: u16,
+        feed_id: [u8; 32],
+        authority: [u8; 32],
+        source: OracleRelaySource,
+        price_e6_per_tick: u64,
+        max_source_staleness_slots: u64,
+        max_spread_bps: u16,
+        max_mark_index_divergence_bps: u16,
+    },
+    UpdateOracleRelay {
+        price_e6: u64,
+        confidence_e6: u64,
+        publish_time: i64,
+        source_posted_slot: u64,
+    },
+    RefreshPhoenixOracle {
+        global_trader_index_count: u8,
+        active_trader_buffer_count: u8,
+    },
+    ServiceFifoHeadInternal,
+    PrepareTradingSession,
+    InitializeTradingSession {
+        session_key: [u8; 32],
+        expected_epoch: u64,
+    },
+    RevokeTradingSession {
+        expected_epoch: u64,
+    },
+    SessionPreparePosition {
+        position_id: u64,
+        epoch: u64,
+        nonce: u64,
+    },
+    SessionOpenCashPosition {
+        position_id: u64,
+        market_id: u16,
+        side: PositionSide,
+        collateral: u64,
+        notional: u64,
+        leverage_x: u16,
+        epoch: u64,
+        nonce: u64,
+    },
+    SessionGuardedOpenCashPosition {
+        position_id: u64,
+        market_id: u16,
+        side: PositionSide,
+        collateral: u64,
+        notional: u64,
+        leverage_x: u16,
+        min_payout_factor_bps: u16,
+        epoch: u64,
+        nonce: u64,
+    },
+    SessionCloseNonPositiveCashPosition {
+        position_id: u64,
+        epoch: u64,
+        nonce: u64,
+    },
+    SessionPrepareClaim {
+        position_id: u64,
+        epoch: u64,
+        nonce: u64,
+    },
+    SessionCloseProfitableCashPosition {
+        position_id: u64,
+        settlement_shape: ProfitSettlementShape,
+        epoch: u64,
+        nonce: u64,
+    },
+    SessionOpenClaimPosition {
+        position_id: u64,
+        market_id: u16,
+        side: PositionSide,
+        claim_amount: u64,
+        notional: u64,
+        leverage_x: u16,
+        epoch: u64,
+        nonce: u64,
+    },
+    SessionGuardedOpenClaimPosition {
+        position_id: u64,
+        market_id: u16,
+        side: PositionSide,
+        claim_amount: u64,
+        notional: u64,
+        leverage_x: u16,
+        min_payout_factor_bps: u16,
+        epoch: u64,
+        nonce: u64,
+    },
+    SessionCloseNonPositiveClaimPosition {
+        position_id: u64,
+        settlement_shape: ProfitSettlementShape,
+        epoch: u64,
+        nonce: u64,
+    },
+    SessionCloseProfitableClaimPosition {
+        position_id: u64,
+        settlement_shape: ProfitSettlementShape,
+        epoch: u64,
+        nonce: u64,
+    },
+    UpdateLeverageLimit {
+        market_id: u16,
+        max_leverage_x: u16,
+    },
 }
 
 impl Instruction {
@@ -314,6 +513,7 @@ impl Instruction {
             Self::InitializeOraclePolicy { .. } => (INITIALIZE_ORACLE_POLICY_TAG, 76),
             Self::PreparePosition { .. } => (PREPARE_POSITION_TAG, 8),
             Self::OpenCashPosition { .. } => (OPEN_CASH_POSITION_TAG, 29),
+            Self::GuardedOpenCashPosition { .. } => (GUARDED_OPEN_CASH_POSITION_TAG, 31),
             Self::CloseNonPositiveCashPosition { .. } => (CLOSE_NONPOSITIVE_CASH_POSITION_TAG, 8),
             Self::ResolveBankruptCashPosition { .. } => (RESOLVE_BANKRUPT_CASH_POSITION_TAG, 8),
             Self::PrepareClaim { .. } => (PREPARE_CLAIM_TAG, 8),
@@ -322,12 +522,44 @@ impl Instruction {
             Self::ServiceFifoHead => (SERVICE_FIFO_HEAD_TAG, 0),
             Self::PopFifoHead { .. } => (POP_FIFO_HEAD_TAG, 1),
             Self::OpenClaimPosition { .. } => (OPEN_CLAIM_POSITION_TAG, 29),
+            Self::GuardedOpenClaimPosition { .. } => (GUARDED_OPEN_CLAIM_POSITION_TAG, 31),
             Self::CloseNonPositiveClaimPosition { .. } => (CLOSE_NONPOSITIVE_CLAIM_POSITION_TAG, 9),
             Self::ResolveBankruptClaimPosition { .. } => (RESOLVE_BANKRUPT_CLAIM_POSITION_TAG, 8),
             Self::CloseProfitableClaimPosition { .. } => (CLOSE_PROFITABLE_CLAIM_POSITION_TAG, 9),
             Self::SetPoolStatus { .. } => (SET_POOL_STATUS_TAG, 1),
             Self::SetMarketStatus { .. } => (SET_MARKET_STATUS_TAG, 1),
             Self::WithdrawIdleCash { .. } => (WITHDRAW_IDLE_CASH_TAG, 8),
+            Self::PrepareOracleRelay { .. } => (PREPARE_ORACLE_RELAY_TAG, 34),
+            Self::InitializeOracleRelay { .. } => (INITIALIZE_ORACLE_RELAY_TAG, 87),
+            Self::UpdateOracleRelay { .. } => (UPDATE_ORACLE_RELAY_TAG, 32),
+            Self::RefreshPhoenixOracle { .. } => (REFRESH_PHOENIX_ORACLE_TAG, 2),
+            Self::ServiceFifoHeadInternal => (SERVICE_FIFO_HEAD_INTERNAL_TAG, 0),
+            Self::PrepareTradingSession => (PREPARE_TRADING_SESSION_TAG, 0),
+            Self::InitializeTradingSession { .. } => (INITIALIZE_TRADING_SESSION_TAG, 40),
+            Self::RevokeTradingSession { .. } => (REVOKE_TRADING_SESSION_TAG, 8),
+            Self::SessionPreparePosition { .. } => (SESSION_PREPARE_POSITION_TAG, 24),
+            Self::SessionOpenCashPosition { .. } => (SESSION_OPEN_CASH_POSITION_TAG, 45),
+            Self::SessionGuardedOpenCashPosition { .. } => {
+                (SESSION_GUARDED_OPEN_CASH_POSITION_TAG, 47)
+            }
+            Self::SessionCloseNonPositiveCashPosition { .. } => {
+                (SESSION_CLOSE_NONPOSITIVE_CASH_POSITION_TAG, 24)
+            }
+            Self::SessionPrepareClaim { .. } => (SESSION_PREPARE_CLAIM_TAG, 24),
+            Self::SessionCloseProfitableCashPosition { .. } => {
+                (SESSION_CLOSE_PROFITABLE_CASH_POSITION_TAG, 25)
+            }
+            Self::SessionOpenClaimPosition { .. } => (SESSION_OPEN_CLAIM_POSITION_TAG, 45),
+            Self::SessionGuardedOpenClaimPosition { .. } => {
+                (SESSION_GUARDED_OPEN_CLAIM_POSITION_TAG, 47)
+            }
+            Self::SessionCloseNonPositiveClaimPosition { .. } => {
+                (SESSION_CLOSE_NONPOSITIVE_CLAIM_POSITION_TAG, 25)
+            }
+            Self::SessionCloseProfitableClaimPosition { .. } => {
+                (SESSION_CLOSE_PROFITABLE_CLAIM_POSITION_TAG, 25)
+            }
+            Self::UpdateLeverageLimit { .. } => (UPDATE_LEVERAGE_LIMIT_TAG, 4),
         };
         let mut data = Vec::with_capacity(MARTINGALER_IX_PREFIX_LEN + body_len);
         data.extend_from_slice(&MARTINGALER_IX_MAGIC);
@@ -408,6 +640,179 @@ impl Instruction {
                 data.push(target as u8);
             }
             Self::WithdrawIdleCash { amount } => data.extend_from_slice(&amount.to_le_bytes()),
+            Self::PrepareOracleRelay { market_id, feed_id } => {
+                data.extend_from_slice(&market_id.to_le_bytes());
+                data.extend_from_slice(&feed_id);
+            }
+            Self::InitializeOracleRelay {
+                market_id,
+                feed_id,
+                authority,
+                source,
+                price_e6_per_tick,
+                max_source_staleness_slots,
+                max_spread_bps,
+                max_mark_index_divergence_bps,
+            } => {
+                data.extend_from_slice(&market_id.to_le_bytes());
+                data.extend_from_slice(&feed_id);
+                data.extend_from_slice(&authority);
+                data.push(source as u8);
+                data.extend_from_slice(&price_e6_per_tick.to_le_bytes());
+                data.extend_from_slice(&max_source_staleness_slots.to_le_bytes());
+                data.extend_from_slice(&max_spread_bps.to_le_bytes());
+                data.extend_from_slice(&max_mark_index_divergence_bps.to_le_bytes());
+            }
+            Self::UpdateOracleRelay {
+                price_e6,
+                confidence_e6,
+                publish_time,
+                source_posted_slot,
+            } => {
+                data.extend_from_slice(&price_e6.to_le_bytes());
+                data.extend_from_slice(&confidence_e6.to_le_bytes());
+                data.extend_from_slice(&publish_time.to_le_bytes());
+                data.extend_from_slice(&source_posted_slot.to_le_bytes());
+            }
+            Self::RefreshPhoenixOracle {
+                global_trader_index_count,
+                active_trader_buffer_count,
+            } => {
+                data.push(global_trader_index_count);
+                data.push(active_trader_buffer_count);
+            }
+            Self::InitializeTradingSession {
+                session_key,
+                expected_epoch,
+            } => {
+                data.extend_from_slice(&session_key);
+                data.extend_from_slice(&expected_epoch.to_le_bytes());
+            }
+            Self::RevokeTradingSession { expected_epoch } => {
+                data.extend_from_slice(&expected_epoch.to_le_bytes());
+            }
+            Self::SessionPreparePosition {
+                position_id,
+                epoch,
+                nonce,
+            }
+            | Self::SessionPrepareClaim {
+                position_id,
+                epoch,
+                nonce,
+            }
+            | Self::SessionCloseNonPositiveCashPosition {
+                position_id,
+                epoch,
+                nonce,
+            } => {
+                data.extend_from_slice(&position_id.to_le_bytes());
+                data.extend_from_slice(&epoch.to_le_bytes());
+                data.extend_from_slice(&nonce.to_le_bytes());
+            }
+            Self::SessionCloseProfitableCashPosition {
+                position_id,
+                settlement_shape,
+                epoch,
+                nonce,
+            }
+            | Self::SessionCloseNonPositiveClaimPosition {
+                position_id,
+                settlement_shape,
+                epoch,
+                nonce,
+            }
+            | Self::SessionCloseProfitableClaimPosition {
+                position_id,
+                settlement_shape,
+                epoch,
+                nonce,
+            } => {
+                data.extend_from_slice(&position_id.to_le_bytes());
+                data.push(settlement_shape as u8);
+                data.extend_from_slice(&epoch.to_le_bytes());
+                data.extend_from_slice(&nonce.to_le_bytes());
+            }
+            Self::SessionOpenCashPosition {
+                position_id,
+                market_id,
+                side,
+                collateral,
+                notional,
+                leverage_x,
+                epoch,
+                nonce,
+            } => {
+                data.extend_from_slice(&position_id.to_le_bytes());
+                data.extend_from_slice(&market_id.to_le_bytes());
+                data.push(side as u8);
+                data.extend_from_slice(&collateral.to_le_bytes());
+                data.extend_from_slice(&notional.to_le_bytes());
+                data.extend_from_slice(&leverage_x.to_le_bytes());
+                data.extend_from_slice(&epoch.to_le_bytes());
+                data.extend_from_slice(&nonce.to_le_bytes());
+            }
+            Self::SessionGuardedOpenCashPosition {
+                position_id,
+                market_id,
+                side,
+                collateral,
+                notional,
+                leverage_x,
+                min_payout_factor_bps,
+                epoch,
+                nonce,
+            } => {
+                data.extend_from_slice(&position_id.to_le_bytes());
+                data.extend_from_slice(&market_id.to_le_bytes());
+                data.push(side as u8);
+                data.extend_from_slice(&collateral.to_le_bytes());
+                data.extend_from_slice(&notional.to_le_bytes());
+                data.extend_from_slice(&leverage_x.to_le_bytes());
+                data.extend_from_slice(&min_payout_factor_bps.to_le_bytes());
+                data.extend_from_slice(&epoch.to_le_bytes());
+                data.extend_from_slice(&nonce.to_le_bytes());
+            }
+            Self::SessionOpenClaimPosition {
+                position_id,
+                market_id,
+                side,
+                claim_amount,
+                notional,
+                leverage_x,
+                epoch,
+                nonce,
+            } => {
+                data.extend_from_slice(&position_id.to_le_bytes());
+                data.extend_from_slice(&market_id.to_le_bytes());
+                data.push(side as u8);
+                data.extend_from_slice(&claim_amount.to_le_bytes());
+                data.extend_from_slice(&notional.to_le_bytes());
+                data.extend_from_slice(&leverage_x.to_le_bytes());
+                data.extend_from_slice(&epoch.to_le_bytes());
+                data.extend_from_slice(&nonce.to_le_bytes());
+            }
+            Self::SessionGuardedOpenClaimPosition {
+                position_id,
+                market_id,
+                side,
+                claim_amount,
+                notional,
+                leverage_x,
+                min_payout_factor_bps,
+                epoch,
+                nonce,
+            } => {
+                data.extend_from_slice(&position_id.to_le_bytes());
+                data.extend_from_slice(&market_id.to_le_bytes());
+                data.push(side as u8);
+                data.extend_from_slice(&claim_amount.to_le_bytes());
+                data.extend_from_slice(&notional.to_le_bytes());
+                data.extend_from_slice(&leverage_x.to_le_bytes());
+                data.extend_from_slice(&min_payout_factor_bps.to_le_bytes());
+                data.extend_from_slice(&epoch.to_le_bytes());
+                data.extend_from_slice(&nonce.to_le_bytes());
+            }
             Self::PopFifoHead { shape } => data.push(shape as u8),
             Self::OpenCashPosition {
                 position_id,
@@ -424,6 +829,23 @@ impl Instruction {
                 data.extend_from_slice(&notional.to_le_bytes());
                 data.extend_from_slice(&leverage_x.to_le_bytes());
             }
+            Self::GuardedOpenCashPosition {
+                position_id,
+                market_id,
+                side,
+                collateral,
+                notional,
+                leverage_x,
+                min_payout_factor_bps,
+            } => {
+                data.extend_from_slice(&position_id.to_le_bytes());
+                data.extend_from_slice(&market_id.to_le_bytes());
+                data.push(side as u8);
+                data.extend_from_slice(&collateral.to_le_bytes());
+                data.extend_from_slice(&notional.to_le_bytes());
+                data.extend_from_slice(&leverage_x.to_le_bytes());
+                data.extend_from_slice(&min_payout_factor_bps.to_le_bytes());
+            }
             Self::OpenClaimPosition {
                 position_id,
                 market_id,
@@ -439,10 +861,36 @@ impl Instruction {
                 data.extend_from_slice(&notional.to_le_bytes());
                 data.extend_from_slice(&leverage_x.to_le_bytes());
             }
+            Self::GuardedOpenClaimPosition {
+                position_id,
+                market_id,
+                side,
+                claim_amount,
+                notional,
+                leverage_x,
+                min_payout_factor_bps,
+            } => {
+                data.extend_from_slice(&position_id.to_le_bytes());
+                data.extend_from_slice(&market_id.to_le_bytes());
+                data.push(side as u8);
+                data.extend_from_slice(&claim_amount.to_le_bytes());
+                data.extend_from_slice(&notional.to_le_bytes());
+                data.extend_from_slice(&leverage_x.to_le_bytes());
+                data.extend_from_slice(&min_payout_factor_bps.to_le_bytes());
+            }
+            Self::UpdateLeverageLimit {
+                market_id,
+                max_leverage_x,
+            } => {
+                data.extend_from_slice(&market_id.to_le_bytes());
+                data.extend_from_slice(&max_leverage_x.to_le_bytes());
+            }
             Self::PrepareController
             | Self::InitializeController
             | Self::InitializeVault
-            | Self::ServiceFifoHead => {}
+            | Self::ServiceFifoHead
+            | Self::ServiceFifoHeadInternal
+            | Self::PrepareTradingSession => {}
         }
         data
     }
@@ -711,6 +1159,77 @@ impl Instruction {
                     leverage_x,
                 })
             }
+            GUARDED_OPEN_CASH_POSITION_TAG | GUARDED_OPEN_CLAIM_POSITION_TAG => {
+                if data.len() != GUARDED_OPEN_POSITION_IX_LEN {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                let position_id = u64::from_le_bytes(
+                    data[11..19]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let market_id = u16::from_le_bytes(
+                    data[19..21]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let side = PositionSide::try_from(data[21])
+                    .map_err(|_| ProgramError::from(BoundaryError::InvalidInstruction))?;
+                let collateral = u64::from_le_bytes(
+                    data[22..30]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let notional = u64::from_le_bytes(
+                    data[30..38]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let leverage_x = u16::from_le_bytes(
+                    data[38..40]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let min_payout_factor_bps = u16::from_le_bytes(
+                    data[40..42]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                if position_id == 0
+                    || market_id == 0
+                    || collateral == 0
+                    || notional == 0
+                    || u128::from(notional) > V1_MAX_POSITION_NOTIONAL_QUOTE
+                    || leverage_x == 0
+                    || leverage_x > V1_MAX_LEVERAGE_X
+                    || (min_payout_factor_bps != 0
+                        && !(V1_MIN_PAYOUT_FACTOR_BPS..=V1_PAYOUT_FACTOR_SCALE_BPS)
+                            .contains(&min_payout_factor_bps))
+                {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                if data[10] == GUARDED_OPEN_CASH_POSITION_TAG {
+                    Ok(Self::GuardedOpenCashPosition {
+                        position_id,
+                        market_id,
+                        side,
+                        collateral,
+                        notional,
+                        leverage_x,
+                        min_payout_factor_bps,
+                    })
+                } else {
+                    Ok(Self::GuardedOpenClaimPosition {
+                        position_id,
+                        market_id,
+                        side,
+                        claim_amount: collateral,
+                        notional,
+                        leverage_x,
+                        min_payout_factor_bps,
+                    })
+                }
+            }
             CLOSE_NONPOSITIVE_CASH_POSITION_TAG | RESOLVE_BANKRUPT_CASH_POSITION_TAG => {
                 if data.len() != CLOSE_CASH_POSITION_IX_LEN {
                     return Err(BoundaryError::InvalidInstruction.into());
@@ -773,6 +1292,12 @@ impl Instruction {
                     return Err(BoundaryError::InvalidInstruction.into());
                 }
                 Ok(Self::ServiceFifoHead)
+            }
+            SERVICE_FIFO_HEAD_INTERNAL_TAG => {
+                if data.len() != SERVICE_FIFO_HEAD_IX_LEN {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                Ok(Self::ServiceFifoHeadInternal)
             }
             POP_FIFO_HEAD_TAG => {
                 if data.len() != POP_FIFO_HEAD_IX_LEN {
@@ -897,6 +1422,450 @@ impl Instruction {
                 }
                 Ok(Self::WithdrawIdleCash { amount })
             }
+            PREPARE_ORACLE_RELAY_TAG => {
+                if data.len() != PREPARE_ORACLE_RELAY_IX_LEN {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                let market_id = u16::from_le_bytes(
+                    data[11..13]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let feed_id = data[13..45]
+                    .try_into()
+                    .map_err(|_| BoundaryError::InvalidInstruction)?;
+                if market_id == 0 || feed_id == [0; 32] {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                Ok(Self::PrepareOracleRelay { market_id, feed_id })
+            }
+            INITIALIZE_ORACLE_RELAY_TAG => {
+                if data.len() != INITIALIZE_ORACLE_RELAY_IX_LEN {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                let market_id = u16::from_le_bytes(
+                    data[11..13]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let feed_id = data[13..45]
+                    .try_into()
+                    .map_err(|_| BoundaryError::InvalidInstruction)?;
+                let authority = data[45..77]
+                    .try_into()
+                    .map_err(|_| BoundaryError::InvalidInstruction)?;
+                let source = OracleRelaySource::try_from(data[77])
+                    .map_err(|_| ProgramError::from(BoundaryError::InvalidInstruction))?;
+                let price_e6_per_tick = u64::from_le_bytes(
+                    data[78..86]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let max_source_staleness_slots = u64::from_le_bytes(
+                    data[86..94]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let max_spread_bps = u16::from_le_bytes(
+                    data[94..96]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let max_mark_index_divergence_bps = u16::from_le_bytes(
+                    data[96..98]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                if market_id == 0 || feed_id == [0; 32] || authority == [0; 32] {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                Ok(Self::InitializeOracleRelay {
+                    market_id,
+                    feed_id,
+                    authority,
+                    source,
+                    price_e6_per_tick,
+                    max_source_staleness_slots,
+                    max_spread_bps,
+                    max_mark_index_divergence_bps,
+                })
+            }
+            UPDATE_ORACLE_RELAY_TAG => {
+                if data.len() != UPDATE_ORACLE_RELAY_IX_LEN {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                let price_e6 = u64::from_le_bytes(
+                    data[11..19]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let confidence_e6 = u64::from_le_bytes(
+                    data[19..27]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let publish_time = i64::from_le_bytes(
+                    data[27..35]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let source_posted_slot = u64::from_le_bytes(
+                    data[35..43]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                if price_e6 == 0
+                    || confidence_e6 > price_e6
+                    || publish_time <= 0
+                    || source_posted_slot == 0
+                {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                Ok(Self::UpdateOracleRelay {
+                    price_e6,
+                    confidence_e6,
+                    publish_time,
+                    source_posted_slot,
+                })
+            }
+            REFRESH_PHOENIX_ORACLE_TAG => {
+                if data.len() != REFRESH_PHOENIX_ORACLE_IX_LEN {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                let global_trader_index_count = data[11];
+                let active_trader_buffer_count = data[12];
+                if global_trader_index_count == 0
+                    || usize::from(global_trader_index_count)
+                        > MAX_PHOENIX_DYNAMIC_ACCOUNTS_PER_KIND
+                    || active_trader_buffer_count == 0
+                    || usize::from(active_trader_buffer_count)
+                        > MAX_PHOENIX_DYNAMIC_ACCOUNTS_PER_KIND
+                {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                Ok(Self::RefreshPhoenixOracle {
+                    global_trader_index_count,
+                    active_trader_buffer_count,
+                })
+            }
+            PREPARE_TRADING_SESSION_TAG => {
+                if data.len() != PREPARE_TRADING_SESSION_IX_LEN {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                Ok(Self::PrepareTradingSession)
+            }
+            INITIALIZE_TRADING_SESSION_TAG => {
+                if data.len() != INITIALIZE_TRADING_SESSION_IX_LEN {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                let session_key = data[11..43]
+                    .try_into()
+                    .map_err(|_| BoundaryError::InvalidInstruction)?;
+                let expected_epoch = u64::from_le_bytes(
+                    data[43..51]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                if session_key == [0; 32] {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                Ok(Self::InitializeTradingSession {
+                    session_key,
+                    expected_epoch,
+                })
+            }
+            REVOKE_TRADING_SESSION_TAG => {
+                if data.len() != REVOKE_TRADING_SESSION_IX_LEN {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                let expected_epoch = u64::from_le_bytes(
+                    data[11..19]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                if expected_epoch == 0 {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                Ok(Self::RevokeTradingSession { expected_epoch })
+            }
+            SESSION_PREPARE_POSITION_TAG
+            | SESSION_CLOSE_NONPOSITIVE_CASH_POSITION_TAG
+            | SESSION_PREPARE_CLAIM_TAG => {
+                if data.len() != SESSION_PREPARE_POSITION_IX_LEN {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                let position_id = u64::from_le_bytes(
+                    data[11..19]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let epoch = u64::from_le_bytes(
+                    data[19..27]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let nonce = u64::from_le_bytes(
+                    data[27..35]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                if position_id == 0 || epoch == 0 {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                match data[10] {
+                    SESSION_PREPARE_POSITION_TAG => Ok(Self::SessionPreparePosition {
+                        position_id,
+                        epoch,
+                        nonce,
+                    }),
+                    SESSION_CLOSE_NONPOSITIVE_CASH_POSITION_TAG => {
+                        Ok(Self::SessionCloseNonPositiveCashPosition {
+                            position_id,
+                            epoch,
+                            nonce,
+                        })
+                    }
+                    _ => Ok(Self::SessionPrepareClaim {
+                        position_id,
+                        epoch,
+                        nonce,
+                    }),
+                }
+            }
+            SESSION_OPEN_CASH_POSITION_TAG | SESSION_OPEN_CLAIM_POSITION_TAG => {
+                if data.len() != SESSION_OPEN_POSITION_IX_LEN {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                let position_id = u64::from_le_bytes(
+                    data[11..19]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let market_id = u16::from_le_bytes(
+                    data[19..21]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let side = PositionSide::try_from(data[21])
+                    .map_err(|_| ProgramError::from(BoundaryError::InvalidInstruction))?;
+                let collateral = u64::from_le_bytes(
+                    data[22..30]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let notional = u64::from_le_bytes(
+                    data[30..38]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let leverage_x = u16::from_le_bytes(
+                    data[38..40]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let epoch = u64::from_le_bytes(
+                    data[40..48]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let nonce = u64::from_le_bytes(
+                    data[48..56]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                if position_id == 0
+                    || market_id == 0
+                    || collateral == 0
+                    || notional == 0
+                    || u128::from(notional) > V1_MAX_POSITION_NOTIONAL_QUOTE
+                    || leverage_x == 0
+                    || leverage_x > V1_MAX_LEVERAGE_X
+                    || epoch == 0
+                {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                if data[10] == SESSION_OPEN_CASH_POSITION_TAG {
+                    Ok(Self::SessionOpenCashPosition {
+                        position_id,
+                        market_id,
+                        side,
+                        collateral,
+                        notional,
+                        leverage_x,
+                        epoch,
+                        nonce,
+                    })
+                } else {
+                    Ok(Self::SessionOpenClaimPosition {
+                        position_id,
+                        market_id,
+                        side,
+                        claim_amount: collateral,
+                        notional,
+                        leverage_x,
+                        epoch,
+                        nonce,
+                    })
+                }
+            }
+            SESSION_GUARDED_OPEN_CASH_POSITION_TAG | SESSION_GUARDED_OPEN_CLAIM_POSITION_TAG => {
+                if data.len() != SESSION_GUARDED_OPEN_POSITION_IX_LEN {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                let position_id = u64::from_le_bytes(
+                    data[11..19]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let market_id = u16::from_le_bytes(
+                    data[19..21]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let side = PositionSide::try_from(data[21])
+                    .map_err(|_| ProgramError::from(BoundaryError::InvalidInstruction))?;
+                let collateral = u64::from_le_bytes(
+                    data[22..30]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let notional = u64::from_le_bytes(
+                    data[30..38]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let leverage_x = u16::from_le_bytes(
+                    data[38..40]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let min_payout_factor_bps = u16::from_le_bytes(
+                    data[40..42]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let epoch = u64::from_le_bytes(
+                    data[42..50]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let nonce = u64::from_le_bytes(
+                    data[50..58]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                if position_id == 0
+                    || market_id == 0
+                    || collateral == 0
+                    || notional == 0
+                    || u128::from(notional) > V1_MAX_POSITION_NOTIONAL_QUOTE
+                    || leverage_x == 0
+                    || leverage_x > V1_MAX_LEVERAGE_X
+                    || (min_payout_factor_bps != 0
+                        && !(V1_MIN_PAYOUT_FACTOR_BPS..=V1_PAYOUT_FACTOR_SCALE_BPS)
+                            .contains(&min_payout_factor_bps))
+                    || epoch == 0
+                {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                if data[10] == SESSION_GUARDED_OPEN_CASH_POSITION_TAG {
+                    Ok(Self::SessionGuardedOpenCashPosition {
+                        position_id,
+                        market_id,
+                        side,
+                        collateral,
+                        notional,
+                        leverage_x,
+                        min_payout_factor_bps,
+                        epoch,
+                        nonce,
+                    })
+                } else {
+                    Ok(Self::SessionGuardedOpenClaimPosition {
+                        position_id,
+                        market_id,
+                        side,
+                        claim_amount: collateral,
+                        notional,
+                        leverage_x,
+                        min_payout_factor_bps,
+                        epoch,
+                        nonce,
+                    })
+                }
+            }
+            SESSION_CLOSE_PROFITABLE_CASH_POSITION_TAG
+            | SESSION_CLOSE_NONPOSITIVE_CLAIM_POSITION_TAG
+            | SESSION_CLOSE_PROFITABLE_CLAIM_POSITION_TAG => {
+                if data.len() != SESSION_CLOSE_PROFITABLE_POSITION_IX_LEN {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                let position_id = u64::from_le_bytes(
+                    data[11..19]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let settlement_shape = ProfitSettlementShape::try_from(data[19])?;
+                let epoch = u64::from_le_bytes(
+                    data[20..28]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let nonce = u64::from_le_bytes(
+                    data[28..36]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                if position_id == 0 || epoch == 0 {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                match data[10] {
+                    SESSION_CLOSE_PROFITABLE_CASH_POSITION_TAG => {
+                        Ok(Self::SessionCloseProfitableCashPosition {
+                            position_id,
+                            settlement_shape,
+                            epoch,
+                            nonce,
+                        })
+                    }
+                    SESSION_CLOSE_NONPOSITIVE_CLAIM_POSITION_TAG => {
+                        Ok(Self::SessionCloseNonPositiveClaimPosition {
+                            position_id,
+                            settlement_shape,
+                            epoch,
+                            nonce,
+                        })
+                    }
+                    _ => Ok(Self::SessionCloseProfitableClaimPosition {
+                        position_id,
+                        settlement_shape,
+                        epoch,
+                        nonce,
+                    }),
+                }
+            }
+            UPDATE_LEVERAGE_LIMIT_TAG => {
+                if data.len() != UPDATE_LEVERAGE_LIMIT_IX_LEN {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                let market_id = u16::from_le_bytes(
+                    data[11..13]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let max_leverage_x = u16::from_le_bytes(
+                    data[13..15]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                if market_id == 0 || max_leverage_x == 0 || max_leverage_x > V1_MAX_LEVERAGE_X {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                Ok(Self::UpdateLeverageLimit {
+                    market_id,
+                    max_leverage_x,
+                })
+            }
             _ => Err(BoundaryError::InvalidInstruction.into()),
         }
     }
@@ -949,8 +1918,23 @@ pub fn derive_controller(program_id: &Pubkey, pool: &Pubkey, controller: &Pubkey
     )
 }
 
+pub fn derive_trading_session(program_id: &Pubkey, pool: &Pubkey, owner: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[TRADING_SESSION_SEED, pool.as_ref(), owner.as_ref()],
+        program_id,
+    )
+}
+
 pub fn derive_oracle_policy(program_id: &Pubkey, market: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[ORACLE_POLICY_SEED, market.as_ref()], program_id)
+}
+
+pub fn derive_oracle_relay(
+    program_id: &Pubkey,
+    market: &Pubkey,
+    feed_id: &[u8; 32],
+) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[ORACLE_RELAY_SEED, market.as_ref(), feed_id], program_id)
 }
 
 pub fn derive_position(
@@ -1041,7 +2025,7 @@ pub fn process_instruction<'a>(
             confidence_limit_bps,
         ),
         Instruction::PreparePosition { position_id } => {
-            process_prepare_position(program_id, accounts, position_id)
+            process_prepare_position(program_id, accounts, position_id, None)
         }
         Instruction::OpenCashPosition {
             position_id,
@@ -1059,15 +2043,40 @@ pub fn process_instruction<'a>(
             collateral,
             notional,
             leverage_x,
+            // Legacy wire tags remain decodable, but admission uses the same
+            // mandatory V1 floor and dynamic payout quote as guarded opens.
+            // A zero guard means "accept the displayed protocol factor".
+            0,
+            None,
+        ),
+        Instruction::GuardedOpenCashPosition {
+            position_id,
+            market_id,
+            side,
+            collateral,
+            notional,
+            leverage_x,
+            min_payout_factor_bps,
+        } => process_open_cash_position(
+            program_id,
+            accounts,
+            position_id,
+            market_id,
+            side,
+            collateral,
+            notional,
+            leverage_x,
+            min_payout_factor_bps,
+            None,
         ),
         Instruction::CloseNonPositiveCashPosition { position_id } => {
-            process_close_nonpositive_cash_position(program_id, accounts, position_id)
+            process_close_nonpositive_cash_position(program_id, accounts, position_id, None)
         }
         Instruction::ResolveBankruptCashPosition { position_id } => {
             process_resolve_bankrupt_cash_position(program_id, accounts, position_id)
         }
         Instruction::PrepareClaim { position_id } => {
-            process_prepare_claim(program_id, accounts, position_id)
+            process_prepare_claim(program_id, accounts, position_id, None)
         }
         Instruction::PrepareQueuePage { page_index } => {
             process_prepare_queue_page(program_id, accounts, page_index)
@@ -1080,8 +2089,12 @@ pub fn process_instruction<'a>(
             accounts,
             position_id,
             settlement_shape,
+            None,
         ),
         Instruction::ServiceFifoHead => process_service_fifo_head(program_id, accounts),
+        Instruction::ServiceFifoHeadInternal => {
+            process_service_fifo_head_internal(program_id, accounts)
+        }
         Instruction::PopFifoHead { shape } => process_pop_fifo_head(program_id, accounts, shape),
         Instruction::OpenClaimPosition {
             position_id,
@@ -1099,6 +2112,28 @@ pub fn process_instruction<'a>(
             claim_amount,
             notional,
             leverage_x,
+            0,
+            None,
+        ),
+        Instruction::GuardedOpenClaimPosition {
+            position_id,
+            market_id,
+            side,
+            claim_amount,
+            notional,
+            leverage_x,
+            min_payout_factor_bps,
+        } => process_open_claim_position(
+            program_id,
+            accounts,
+            position_id,
+            market_id,
+            side,
+            claim_amount,
+            notional,
+            leverage_x,
+            min_payout_factor_bps,
+            None,
         ),
         Instruction::CloseNonPositiveClaimPosition {
             position_id,
@@ -1109,6 +2144,7 @@ pub fn process_instruction<'a>(
             position_id,
             settlement_shape,
             ClaimVoluntaryCloseKind::NonPositive,
+            None,
         ),
         Instruction::ResolveBankruptClaimPosition { position_id } => {
             process_resolve_bankrupt_claim_position(program_id, accounts, position_id)
@@ -1122,6 +2158,7 @@ pub fn process_instruction<'a>(
             position_id,
             settlement_shape,
             ClaimVoluntaryCloseKind::Profitable,
+            None,
         ),
         Instruction::SetPoolStatus { target } => {
             process_set_pool_status(program_id, accounts, target)
@@ -1132,7 +2169,653 @@ pub fn process_instruction<'a>(
         Instruction::WithdrawIdleCash { amount } => {
             process_withdraw_idle_cash(program_id, accounts, amount)
         }
+        Instruction::PrepareOracleRelay { market_id, feed_id } => {
+            process_prepare_oracle_relay(program_id, accounts, market_id, feed_id)
+        }
+        Instruction::InitializeOracleRelay {
+            market_id,
+            feed_id,
+            authority,
+            source,
+            price_e6_per_tick,
+            max_source_staleness_slots,
+            max_spread_bps,
+            max_mark_index_divergence_bps,
+        } => process_initialize_oracle_relay(
+            program_id,
+            accounts,
+            market_id,
+            feed_id,
+            authority,
+            source,
+            price_e6_per_tick,
+            max_source_staleness_slots,
+            max_spread_bps,
+            max_mark_index_divergence_bps,
+        ),
+        Instruction::UpdateOracleRelay {
+            price_e6,
+            confidence_e6,
+            publish_time,
+            source_posted_slot,
+        } => process_update_oracle_relay(
+            program_id,
+            accounts,
+            price_e6,
+            confidence_e6,
+            publish_time,
+            source_posted_slot,
+        ),
+        Instruction::RefreshPhoenixOracle {
+            global_trader_index_count,
+            active_trader_buffer_count,
+        } => process_refresh_phoenix_oracle(
+            program_id,
+            accounts,
+            global_trader_index_count,
+            active_trader_buffer_count,
+        ),
+        Instruction::PrepareTradingSession => process_prepare_trading_session(program_id, accounts),
+        Instruction::InitializeTradingSession {
+            session_key,
+            expected_epoch,
+        } => process_initialize_trading_session(
+            program_id,
+            accounts,
+            Pubkey::new_from_array(session_key),
+            expected_epoch,
+        ),
+        Instruction::RevokeTradingSession { expected_epoch } => {
+            process_revoke_trading_session(program_id, accounts, expected_epoch)
+        }
+        Instruction::SessionPreparePosition {
+            position_id,
+            epoch,
+            nonce,
+        } => process_session_prepare_position(program_id, accounts, position_id, epoch, nonce),
+        Instruction::SessionOpenCashPosition {
+            position_id,
+            market_id,
+            side,
+            collateral,
+            notional,
+            leverage_x,
+            epoch,
+            nonce,
+        } => process_session_open_cash_position(
+            program_id,
+            accounts,
+            position_id,
+            market_id,
+            side,
+            collateral,
+            notional,
+            leverage_x,
+            0,
+            epoch,
+            nonce,
+        ),
+        Instruction::SessionGuardedOpenCashPosition {
+            position_id,
+            market_id,
+            side,
+            collateral,
+            notional,
+            leverage_x,
+            min_payout_factor_bps,
+            epoch,
+            nonce,
+        } => process_session_open_cash_position(
+            program_id,
+            accounts,
+            position_id,
+            market_id,
+            side,
+            collateral,
+            notional,
+            leverage_x,
+            min_payout_factor_bps,
+            epoch,
+            nonce,
+        ),
+        Instruction::SessionCloseNonPositiveCashPosition {
+            position_id,
+            epoch,
+            nonce,
+        } => process_session_close_nonpositive_cash_position(
+            program_id,
+            accounts,
+            position_id,
+            epoch,
+            nonce,
+        ),
+        Instruction::SessionPrepareClaim {
+            position_id,
+            epoch,
+            nonce,
+        } => process_session_prepare_claim(program_id, accounts, position_id, epoch, nonce),
+        Instruction::SessionCloseProfitableCashPosition {
+            position_id,
+            settlement_shape,
+            epoch,
+            nonce,
+        } => process_session_close_profitable_cash_position(
+            program_id,
+            accounts,
+            position_id,
+            settlement_shape,
+            epoch,
+            nonce,
+        ),
+        Instruction::SessionOpenClaimPosition {
+            position_id,
+            market_id,
+            side,
+            claim_amount,
+            notional,
+            leverage_x,
+            epoch,
+            nonce,
+        } => process_session_open_claim_position(
+            program_id,
+            accounts,
+            position_id,
+            market_id,
+            side,
+            claim_amount,
+            notional,
+            leverage_x,
+            0,
+            epoch,
+            nonce,
+        ),
+        Instruction::SessionGuardedOpenClaimPosition {
+            position_id,
+            market_id,
+            side,
+            claim_amount,
+            notional,
+            leverage_x,
+            min_payout_factor_bps,
+            epoch,
+            nonce,
+        } => process_session_open_claim_position(
+            program_id,
+            accounts,
+            position_id,
+            market_id,
+            side,
+            claim_amount,
+            notional,
+            leverage_x,
+            min_payout_factor_bps,
+            epoch,
+            nonce,
+        ),
+        Instruction::SessionCloseNonPositiveClaimPosition {
+            position_id,
+            settlement_shape,
+            epoch,
+            nonce,
+        } => process_session_close_claim_position(
+            program_id,
+            accounts,
+            position_id,
+            settlement_shape,
+            ClaimVoluntaryCloseKind::NonPositive,
+            epoch,
+            nonce,
+        ),
+        Instruction::SessionCloseProfitableClaimPosition {
+            position_id,
+            settlement_shape,
+            epoch,
+            nonce,
+        } => process_session_close_claim_position(
+            program_id,
+            accounts,
+            position_id,
+            settlement_shape,
+            ClaimVoluntaryCloseKind::Profitable,
+            epoch,
+            nonce,
+        ),
+        Instruction::UpdateLeverageLimit {
+            market_id,
+            max_leverage_x,
+        } => process_update_leverage_limit(program_id, accounts, market_id, max_leverage_x),
     }
+}
+
+#[inline(never)]
+fn process_prepare_trading_session<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+) -> ProgramResult {
+    if accounts.len() != PREPARE_TRADING_SESSION_ACCOUNT_COUNT {
+        return Err(BoundaryError::InvalidAccountCount.into());
+    }
+    ensure_distinct(accounts)?;
+    let owner = &accounts[0];
+    let pool = &accounts[1];
+    let session = &accounts[2];
+    let system_program_ai = &accounts[3];
+    validate_payer_authority(owner)?;
+    expect_readonly(pool)?;
+    load_canonical_pool(program_id, pool)?;
+    expect_writable(session)?;
+    expect_nonsigner(session)?;
+    validate_external_program(system_program_ai, &system_program::ID)?;
+    let (expected_session, bump) = derive_trading_session(program_id, pool.key, owner.key);
+    if session.key != &expected_session {
+        return Err(BoundaryError::InvalidPda.into());
+    }
+    validate_fresh_target(session)?;
+    let bump = [bump];
+    let signer_seeds: &[&[u8]] = &[
+        TRADING_SESSION_SEED,
+        pool.key.as_ref(),
+        owner.key.as_ref(),
+        &bump,
+    ];
+    allocate_pda(
+        owner,
+        session,
+        system_program_ai,
+        program_id,
+        account_len::<TradingSessionState>(),
+        signer_seeds,
+    )
+}
+
+#[inline(never)]
+fn process_initialize_trading_session<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    session_key: Pubkey,
+    expected_epoch: u64,
+) -> ProgramResult {
+    if accounts.len() != INITIALIZE_TRADING_SESSION_ACCOUNT_COUNT {
+        return Err(BoundaryError::InvalidAccountCount.into());
+    }
+    ensure_distinct(accounts)?;
+    let owner = &accounts[0];
+    let pool = &accounts[1];
+    let controller = &accounts[2];
+    let session = &accounts[3];
+    let session_key_ai = &accounts[4];
+    validate_payer_authority(owner)?;
+    expect_nonsigner(pool)?;
+    load_canonical_pool(program_id, pool)?;
+    expect_nonsigner(controller)?;
+    load_canonical_controller(program_id, pool.key, owner.key, controller)?;
+    expect_writable(session)?;
+    expect_nonsigner(session)?;
+    expect_signer(session_key_ai)?;
+    if session_key_ai.key != &session_key
+        || session_key_ai.owner != &system_program::ID
+        || session_key_ai.executable
+        || session_key_ai.data_len() != 0
+        || session_key == *owner.key
+    {
+        return Err(BoundaryError::InvalidAuthority.into());
+    }
+    let (expected_session, bump) = derive_trading_session(program_id, pool.key, owner.key);
+    if session.key != &expected_session
+        || session.owner != program_id
+        || session.executable
+        || session.data_len() != account_len::<TradingSessionState>()
+        || !Rent::get()?.is_exempt(session.lamports(), session.data_len())
+    {
+        return Err(BoundaryError::InvalidPda.into());
+    }
+    let now = Clock::get()?.unix_timestamp;
+    let is_prepared = session.try_borrow_data()?.iter().all(|byte| *byte == 0);
+    let next = if is_prepared {
+        if expected_epoch != 0 {
+            return Err(BoundaryError::InvalidAuthority.into());
+        }
+        TradingSessionState::new(
+            Key32::new(pool.key.to_bytes()),
+            Key32::new(owner.key.to_bytes()),
+            Key32::new(session_key.to_bytes()),
+            now,
+        )?
+    } else {
+        let current = load_canonical_trading_session(program_id, pool.key, owner.key, session)?;
+        current.renew(
+            Key32::new(owner.key.to_bytes()),
+            Key32::new(session_key.to_bytes()),
+            expected_epoch,
+            now,
+        )?
+    };
+    if is_prepared {
+        initialize_account(&mut session.try_borrow_mut_data()?, bump, &next)?;
+    } else {
+        overwrite_account(&mut session.try_borrow_mut_data()?, &next)?;
+    }
+    if load_canonical_trading_session(program_id, pool.key, owner.key, session)? != next {
+        return Err(BoundaryError::PostconditionFailed.into());
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn process_revoke_trading_session<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    expected_epoch: u64,
+) -> ProgramResult {
+    if accounts.len() != REVOKE_TRADING_SESSION_ACCOUNT_COUNT {
+        return Err(BoundaryError::InvalidAccountCount.into());
+    }
+    ensure_distinct(accounts)?;
+    let owner = &accounts[0];
+    let session = &accounts[1];
+    validate_payer_authority(owner)?;
+    expect_writable(session)?;
+    expect_nonsigner(session)?;
+    if session.owner != program_id || session.data_len() != account_len::<TradingSessionState>() {
+        return Err(BoundaryError::InvalidAuthority.into());
+    }
+    let current = decode_account::<TradingSessionState>(&session.try_borrow_data()?)?;
+    let pool = Pubkey::new_from_array(current.pool.0);
+    let canonical = load_canonical_trading_session(program_id, &pool, owner.key, session)?;
+    let next = canonical.revoke(Key32::new(owner.key.to_bytes()), expected_epoch)?;
+    overwrite_account(&mut session.try_borrow_mut_data()?, &next)?;
+    if load_canonical_trading_session(program_id, &pool, owner.key, session)? != next {
+        return Err(BoundaryError::PostconditionFailed.into());
+    }
+    Ok(())
+}
+
+fn validate_session_action<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    core_account_count: usize,
+    epoch: u64,
+    nonce: u64,
+    opened_notional: u64,
+) -> Result<
+    (
+        &'a [AccountInfo<'a>],
+        &'a AccountInfo<'a>,
+        Pubkey,
+        TradingSessionState,
+    ),
+    ProgramError,
+> {
+    if accounts.len() != core_account_count + SESSION_AUTH_ACCOUNT_COUNT {
+        return Err(BoundaryError::InvalidAccountCount.into());
+    }
+    ensure_distinct(accounts)?;
+    let core = &accounts[..core_account_count];
+    let session_signer = &core[0];
+    let session = &accounts[core_account_count];
+    let owner = &accounts[core_account_count + 1];
+    validate_payer_authority(session_signer)?;
+    expect_writable(session)?;
+    expect_nonsigner(session)?;
+    expect_readonly(owner)?;
+    expect_nonsigner(owner)?;
+    if owner.owner != &system_program::ID || owner.executable || owner.data_len() != 0 {
+        return Err(BoundaryError::InvalidAuthority.into());
+    }
+    if session.owner != program_id || session.data_len() != account_len::<TradingSessionState>() {
+        return Err(BoundaryError::InvalidAuthority.into());
+    }
+    let candidate = decode_account::<TradingSessionState>(&session.try_borrow_data()?)?;
+    let pool = Pubkey::new_from_array(candidate.pool.0);
+    let state = load_canonical_trading_session(program_id, &pool, owner.key, session)?;
+    let next = state.authorize_action(
+        Key32::new(pool.to_bytes()),
+        Key32::new(owner.key.to_bytes()),
+        Key32::new(session_signer.key.to_bytes()),
+        epoch,
+        nonce,
+        Clock::get()?.unix_timestamp,
+        u128::from(opened_notional),
+    )?;
+    Ok((core, session, *owner.key, next))
+}
+
+fn persist_session_action(
+    program_id: &Pubkey,
+    session: &AccountInfo<'_>,
+    owner: &Pubkey,
+    next: TradingSessionState,
+) -> ProgramResult {
+    overwrite_account(&mut session.try_borrow_mut_data()?, &next)?;
+    let pool = Pubkey::new_from_array(next.pool.0);
+    if load_canonical_trading_session(program_id, &pool, owner, session)? != next {
+        return Err(BoundaryError::PostconditionFailed.into());
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn process_session_prepare_position<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    position_id: u64,
+    epoch: u64,
+    nonce: u64,
+) -> ProgramResult {
+    let (core, session, owner, next) = validate_session_action(
+        program_id,
+        accounts,
+        PREPARE_POSITION_ACCOUNT_COUNT,
+        epoch,
+        nonce,
+        0,
+    )?;
+    process_prepare_position(program_id, core, position_id, Some(&owner))?;
+    persist_session_action(program_id, session, &owner, next)
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn process_session_open_cash_position<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    position_id: u64,
+    market_id: u16,
+    side: PositionSide,
+    collateral: u64,
+    notional: u64,
+    leverage_x: u16,
+    min_payout_factor_bps: u16,
+    epoch: u64,
+    nonce: u64,
+) -> ProgramResult {
+    let core_account_count = accounts
+        .len()
+        .checked_sub(SESSION_AUTH_ACCOUNT_COUNT)
+        .ok_or(BoundaryError::InvalidAccountCount)?;
+    if !(OPEN_CASH_BASE_ACCOUNT_COUNT..=OPEN_CASH_BASE_ACCOUNT_COUNT + 1)
+        .contains(&core_account_count)
+    {
+        return Err(BoundaryError::InvalidAccountCount.into());
+    }
+    let (core, session, owner, next) = validate_session_action(
+        program_id,
+        accounts,
+        core_account_count,
+        epoch,
+        nonce,
+        notional,
+    )?;
+    process_open_cash_position(
+        program_id,
+        core,
+        position_id,
+        market_id,
+        side,
+        collateral,
+        notional,
+        leverage_x,
+        min_payout_factor_bps,
+        Some(&owner),
+    )?;
+    persist_session_action(program_id, session, &owner, next)
+}
+
+#[inline(never)]
+fn process_session_close_nonpositive_cash_position<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    position_id: u64,
+    epoch: u64,
+    nonce: u64,
+) -> ProgramResult {
+    let core_account_count = accounts
+        .len()
+        .checked_sub(SESSION_AUTH_ACCOUNT_COUNT)
+        .ok_or(BoundaryError::InvalidAccountCount)?;
+    if !(CLOSE_CASH_ACCOUNT_COUNT..=CLOSE_CASH_ACCOUNT_COUNT + 1).contains(&core_account_count) {
+        return Err(BoundaryError::InvalidAccountCount.into());
+    }
+    let (core, session, owner, next) =
+        validate_session_action(program_id, accounts, core_account_count, epoch, nonce, 0)?;
+    process_close_nonpositive_cash_position(program_id, core, position_id, Some(&owner))?;
+    persist_session_action(program_id, session, &owner, next)
+}
+
+#[inline(never)]
+fn process_session_prepare_claim<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    position_id: u64,
+    epoch: u64,
+    nonce: u64,
+) -> ProgramResult {
+    let (core, session, owner, next) = validate_session_action(
+        program_id,
+        accounts,
+        PREPARE_CLAIM_ACCOUNT_COUNT,
+        epoch,
+        nonce,
+        0,
+    )?;
+    process_prepare_claim(program_id, core, position_id, Some(&owner))?;
+    persist_session_action(program_id, session, &owner, next)
+}
+
+#[inline(never)]
+fn process_session_close_profitable_cash_position<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    position_id: u64,
+    settlement_shape: ProfitSettlementShape,
+    epoch: u64,
+    nonce: u64,
+) -> ProgramResult {
+    let base_account_count = match settlement_shape {
+        ProfitSettlementShape::NoClaim => PROFITABLE_CLOSE_BASE_ACCOUNT_COUNT,
+        ProfitSettlementShape::CurrentTail => PROFITABLE_CLOSE_BASE_ACCOUNT_COUNT + 2,
+        ProfitSettlementShape::Rollover => PROFITABLE_CLOSE_BASE_ACCOUNT_COUNT + 3,
+    };
+    let core_account_count = accounts
+        .len()
+        .checked_sub(SESSION_AUTH_ACCOUNT_COUNT)
+        .ok_or(BoundaryError::InvalidAccountCount)?;
+    if !(base_account_count..=base_account_count + 1).contains(&core_account_count) {
+        return Err(BoundaryError::InvalidAccountCount.into());
+    }
+    let (core, session, owner, next) =
+        validate_session_action(program_id, accounts, core_account_count, epoch, nonce, 0)?;
+    process_close_profitable_cash_position(
+        program_id,
+        core,
+        position_id,
+        settlement_shape,
+        Some(&owner),
+    )?;
+    persist_session_action(program_id, session, &owner, next)
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn process_session_open_claim_position<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    position_id: u64,
+    market_id: u16,
+    side: PositionSide,
+    claim_amount: u64,
+    notional: u64,
+    leverage_x: u16,
+    min_payout_factor_bps: u16,
+    epoch: u64,
+    nonce: u64,
+) -> ProgramResult {
+    let core_account_count = accounts
+        .len()
+        .checked_sub(SESSION_AUTH_ACCOUNT_COUNT)
+        .ok_or(BoundaryError::InvalidAccountCount)?;
+    if !(OPEN_CLAIM_BASE_ACCOUNT_COUNT..=OPEN_CLAIM_BASE_ACCOUNT_COUNT + 1)
+        .contains(&core_account_count)
+    {
+        return Err(BoundaryError::InvalidAccountCount.into());
+    }
+    let (core, session, owner, next) = validate_session_action(
+        program_id,
+        accounts,
+        core_account_count,
+        epoch,
+        nonce,
+        notional,
+    )?;
+    process_open_claim_position(
+        program_id,
+        core,
+        position_id,
+        market_id,
+        side,
+        claim_amount,
+        notional,
+        leverage_x,
+        min_payout_factor_bps,
+        Some(&owner),
+    )?;
+    persist_session_action(program_id, session, &owner, next)
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn process_session_close_claim_position<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    position_id: u64,
+    settlement_shape: ProfitSettlementShape,
+    close_kind: ClaimVoluntaryCloseKind,
+    epoch: u64,
+    nonce: u64,
+) -> ProgramResult {
+    let base_account_count = match settlement_shape {
+        ProfitSettlementShape::NoClaim => CLAIM_CLOSE_BASE_ACCOUNT_COUNT,
+        ProfitSettlementShape::CurrentTail => CLAIM_CLOSE_BASE_ACCOUNT_COUNT + 2,
+        ProfitSettlementShape::Rollover => CLAIM_CLOSE_BASE_ACCOUNT_COUNT + 3,
+    };
+    let core_account_count = accounts
+        .len()
+        .checked_sub(SESSION_AUTH_ACCOUNT_COUNT)
+        .ok_or(BoundaryError::InvalidAccountCount)?;
+    if !(base_account_count..=base_account_count + 1).contains(&core_account_count) {
+        return Err(BoundaryError::InvalidAccountCount.into());
+    }
+    let (core, session, owner, next) =
+        validate_session_action(program_id, accounts, core_account_count, epoch, nonce, 0)?;
+    process_close_claim_position(
+        program_id,
+        core,
+        position_id,
+        settlement_shape,
+        close_kind,
+        Some(&owner),
+    )?;
+    persist_session_action(program_id, session, &owner, next)
 }
 
 #[inline(never)]
@@ -1700,6 +3383,419 @@ fn validate_oracle_policy_registration<'a, 'info>(
     })
 }
 
+struct OracleRelayRegistrationAccounts<'a, 'info> {
+    authority: &'a AccountInfo<'info>,
+    pool: &'a AccountInfo<'info>,
+    market: &'a AccountInfo<'info>,
+    target: &'a AccountInfo<'info>,
+    system_program: &'a AccountInfo<'info>,
+    target_bump: u8,
+}
+
+fn validate_oracle_relay_registration<'a, 'info>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'info>],
+    market_id: u16,
+    feed_id: &[u8; 32],
+) -> Result<OracleRelayRegistrationAccounts<'a, 'info>, ProgramError> {
+    if accounts.len() != ORACLE_RELAY_REGISTRATION_ACCOUNT_COUNT {
+        return Err(BoundaryError::InvalidAccountCount.into());
+    }
+    ensure_distinct(accounts)?;
+    let authority = &accounts[0];
+    let pool = &accounts[1];
+    let market = &accounts[2];
+    let target = &accounts[3];
+    let system_program_ai = &accounts[4];
+
+    validate_payer_authority(authority)?;
+    expect_readonly(pool)?;
+    let pool_state = load_canonical_pool(program_id, pool)?;
+    if pool_state.admin.0 != authority.key.to_bytes()
+        || pool_state.status != PoolStatus::Active as u8
+    {
+        return Err(BoundaryError::InvalidAuthority.into());
+    }
+    expect_readonly(market)?;
+    let market_state = load_canonical_market(program_id, pool.key, market_id, market)?;
+    if market_state.status != PoolStatus::Active as u8 {
+        return Err(BoundaryError::InvalidMarket.into());
+    }
+    expect_writable(target)?;
+    expect_nonsigner(target)?;
+    validate_external_program(system_program_ai, &system_program::ID)?;
+    let (expected_target, target_bump) = derive_oracle_relay(program_id, market.key, feed_id);
+    if target.key != &expected_target {
+        return Err(BoundaryError::InvalidPda.into());
+    }
+    Ok(OracleRelayRegistrationAccounts {
+        authority,
+        pool,
+        market,
+        target,
+        system_program: system_program_ai,
+        target_bump,
+    })
+}
+
+#[inline(never)]
+fn process_prepare_oracle_relay<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    market_id: u16,
+    feed_id: [u8; 32],
+) -> ProgramResult {
+    let boundary = validate_oracle_relay_registration(program_id, accounts, market_id, &feed_id)?;
+    validate_fresh_target(boundary.target)?;
+    let bump = [boundary.target_bump];
+    let signer_seeds: &[&[u8]] = &[
+        ORACLE_RELAY_SEED,
+        boundary.market.key.as_ref(),
+        &feed_id,
+        &bump,
+    ];
+    allocate_pda(
+        boundary.authority,
+        boundary.target,
+        boundary.system_program,
+        program_id,
+        account_len::<OracleRelayState>(),
+        signer_seeds,
+    )
+}
+
+#[inline(never)]
+fn process_initialize_oracle_relay<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    market_id: u16,
+    feed_id: [u8; 32],
+    relay_authority: [u8; 32],
+    source: OracleRelaySource,
+    price_e6_per_tick: u64,
+    max_source_staleness_slots: u64,
+    max_spread_bps: u16,
+    max_mark_index_divergence_bps: u16,
+) -> ProgramResult {
+    if source == OracleRelaySource::PhoenixHawkeye
+        && relay_authority != PHOENIX_MAINNET_PROGRAM_ID.to_bytes()
+        && relay_authority != PHOENIX_BETA_PROGRAM_ID.to_bytes()
+    {
+        return Err(BoundaryError::InvalidOracle.into());
+    }
+    let boundary = validate_oracle_relay_registration(program_id, accounts, market_id, &feed_id)?;
+    validate_prepared_target(
+        boundary.target,
+        program_id,
+        account_len::<OracleRelayState>(),
+    )?;
+    let state = OracleRelayState::new(
+        Key32::new(boundary.pool.key.to_bytes()),
+        Key32::new(boundary.market.key.to_bytes()),
+        Key32::new(feed_id),
+        Key32::new(relay_authority),
+        source,
+        price_e6_per_tick,
+        max_source_staleness_slots,
+        max_spread_bps,
+        max_mark_index_divergence_bps,
+    )?;
+    initialize_account(
+        &mut boundary.target.try_borrow_mut_data()?,
+        boundary.target_bump,
+        &state,
+    )?;
+    let data = boundary.target.try_borrow_data()?;
+    let header = decode_account_header::<OracleRelayState>(&data)?;
+    if header.bump != boundary.target_bump || decode_account::<OracleRelayState>(&data)? != state {
+        return Err(BoundaryError::PostconditionFailed.into());
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn process_update_oracle_relay<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    price_e6: u64,
+    confidence_e6: u64,
+    publish_time: i64,
+    source_posted_slot: u64,
+) -> ProgramResult {
+    if accounts.len() != UPDATE_ORACLE_RELAY_ACCOUNT_COUNT {
+        return Err(BoundaryError::InvalidAccountCount.into());
+    }
+    ensure_distinct(accounts)?;
+    let authority = &accounts[0];
+    let relay = &accounts[1];
+    validate_controller_authority(authority)?;
+    expect_writable(relay)?;
+    expect_nonsigner(relay)?;
+    let mut state = load_canonical_oracle_relay(program_id, relay)?;
+    let source = OracleRelaySource::try_from(state.source)
+        .map_err(|_| ProgramError::from(BoundaryError::InvalidOracle))?;
+    if !matches!(
+        source,
+        OracleRelaySource::MagicBlockDemo | OracleRelaySource::PhoenixMainnetRelay
+    ) || state.authority.0 != authority.key.to_bytes()
+    {
+        return Err(BoundaryError::InvalidAuthority.into());
+    }
+    let clock = Clock::get()?;
+    if publish_time
+        > clock
+            .unix_timestamp
+            .saturating_add(ORACLE_RELAY_FUTURE_TOLERANCE_SECS)
+        || clock.unix_timestamp.saturating_sub(publish_time) > ORACLE_RELAY_MAX_INGRESS_AGE_SECS
+    {
+        return Err(BoundaryError::InvalidOracle.into());
+    }
+    state
+        .record_observation(
+            price_e6,
+            confidence_e6,
+            publish_time,
+            source_posted_slot,
+            clock.slot,
+        )
+        .map_err(|_| ProgramError::from(BoundaryError::InvalidOracle))?;
+    overwrite_account(&mut relay.try_borrow_mut_data()?, &state)?;
+    if decode_account::<OracleRelayState>(&relay.try_borrow_data()?)? != state {
+        return Err(BoundaryError::PostconditionFailed.into());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhoenixBboReturn {
+    pub best_bid_ticks: u64,
+    pub best_ask_ticks: u64,
+    pub mark_price_ticks: u64,
+    pub index_price_ticks: u64,
+    pub mark_price_last_updated_slot: u64,
+    pub index_price_last_updated_slot: u64,
+}
+
+pub fn decode_phoenix_bbo_return(data: &[u8]) -> Result<PhoenixBboReturn, ProgramError> {
+    if data.len() != PHOENIX_VIEW_BBO_RETURN_LEN
+        || u64::from_le_bytes(
+            data[0..8]
+                .try_into()
+                .map_err(|_| BoundaryError::InvalidOracle)?,
+        ) != PHOENIX_VIEW_BBO_RETURN_MAGIC
+        || u16::from_le_bytes(
+            data[8..10]
+                .try_into()
+                .map_err(|_| BoundaryError::InvalidOracle)?,
+        ) != PHOENIX_HAWKEYE_RETURN_VERSION
+        || data[10] != (PHOENIX_VIEW_BBO_HAS_BID | PHOENIX_VIEW_BBO_HAS_ASK)
+        || data[11..16].iter().any(|byte| *byte != 0)
+    {
+        return Err(BoundaryError::InvalidOracle.into());
+    }
+    let read_u64 = |range: core::ops::Range<usize>| -> Result<u64, ProgramError> {
+        Ok(u64::from_le_bytes(data[range].try_into().map_err(
+            |_| ProgramError::from(BoundaryError::InvalidOracle),
+        )?))
+    };
+    let decoded = PhoenixBboReturn {
+        best_bid_ticks: read_u64(16..24)?,
+        best_ask_ticks: read_u64(24..32)?,
+        mark_price_ticks: read_u64(32..40)?,
+        index_price_ticks: read_u64(40..48)?,
+        mark_price_last_updated_slot: read_u64(48..56)?,
+        index_price_last_updated_slot: read_u64(56..64)?,
+    };
+    if decoded.best_bid_ticks == 0
+        || decoded.best_ask_ticks == 0
+        || decoded.best_bid_ticks > decoded.best_ask_ticks
+        || decoded.mark_price_ticks == 0
+        || decoded.index_price_ticks == 0
+        || decoded.mark_price_last_updated_slot == 0
+        || decoded.index_price_last_updated_slot == 0
+    {
+        return Err(BoundaryError::InvalidOracle.into());
+    }
+    Ok(decoded)
+}
+
+fn phoenix_spread_bps_ceil(best_bid_ticks: u64, best_ask_ticks: u64) -> Option<u64> {
+    if best_bid_ticks == 0 || best_ask_ticks < best_bid_ticks {
+        return None;
+    }
+    if best_bid_ticks == best_ask_ticks {
+        return Some(0);
+    }
+    let numerator = u128::from(best_ask_ticks.checked_sub(best_bid_ticks)?).checked_mul(20_000)?;
+    let denominator = u128::from(best_ask_ticks).checked_add(u128::from(best_bid_ticks))?;
+    let bps = numerator
+        .checked_add(denominator.checked_sub(1)?)?
+        .checked_div(denominator)?;
+    u64::try_from(bps).ok()
+}
+
+fn validate_phoenix_data_account(account: &AccountInfo<'_>, owner: &Pubkey) -> ProgramResult {
+    expect_readonly(account)?;
+    expect_nonsigner(account)?;
+    if account.executable || account.owner != owner || account.data_len() == 0 {
+        return Err(BoundaryError::InvalidOracle.into());
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn process_refresh_phoenix_oracle<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    global_trader_index_count: u8,
+    active_trader_buffer_count: u8,
+) -> ProgramResult {
+    let global_trader_index_count = usize::from(global_trader_index_count);
+    let active_trader_buffer_count = usize::from(active_trader_buffer_count);
+    if global_trader_index_count == 0
+        || global_trader_index_count > MAX_PHOENIX_DYNAMIC_ACCOUNTS_PER_KIND
+        || active_trader_buffer_count == 0
+        || active_trader_buffer_count > MAX_PHOENIX_DYNAMIC_ACCOUNTS_PER_KIND
+        || accounts.len()
+            != REFRESH_PHOENIX_FIXED_ACCOUNT_COUNT
+                .checked_add(global_trader_index_count)
+                .and_then(|count| count.checked_add(active_trader_buffer_count))
+                .ok_or(BoundaryError::ArithmeticOverflow)?
+    {
+        return Err(BoundaryError::InvalidAccountCount.into());
+    }
+    ensure_distinct(accounts)?;
+
+    let relay = &accounts[0];
+    let hawkeye_program = &accounts[1];
+    let phoenix_program = &accounts[2];
+    let global_config = &accounts[3];
+    let global_trader_index_start = 4;
+    let active_trader_buffer_start = global_trader_index_start + global_trader_index_count;
+    let perp_asset_map_index = active_trader_buffer_start + active_trader_buffer_count;
+    let orderbook_index = perp_asset_map_index + 1;
+    let spline_collection_index = orderbook_index + 1;
+    let phoenix_data_accounts = &accounts[3..=spline_collection_index];
+    let orderbook = &accounts[orderbook_index];
+
+    expect_writable(relay)?;
+    expect_nonsigner(relay)?;
+    validate_external_program(hawkeye_program, &HAWKEYE_PROGRAM_ID)?;
+    expect_readonly(phoenix_program)?;
+    expect_nonsigner(phoenix_program)?;
+    if !phoenix_program.executable {
+        return Err(BoundaryError::InvalidProgram.into());
+    }
+    let expected_global_config = if phoenix_program.key == &PHOENIX_MAINNET_PROGRAM_ID {
+        PHOENIX_MAINNET_GLOBAL_CONFIG
+    } else if phoenix_program.key == &PHOENIX_BETA_PROGRAM_ID {
+        PHOENIX_BETA_GLOBAL_CONFIG
+    } else {
+        return Err(BoundaryError::InvalidProgram.into());
+    };
+    if global_config.key != &expected_global_config {
+        return Err(BoundaryError::InvalidOracle.into());
+    }
+    for account in phoenix_data_accounts {
+        validate_phoenix_data_account(account, phoenix_program.key)?;
+    }
+
+    let mut state = load_canonical_oracle_relay(program_id, relay)?;
+    if OracleRelaySource::try_from(state.source) != Ok(OracleRelaySource::PhoenixHawkeye)
+        || state.authority.0 != phoenix_program.key.to_bytes()
+        || state.feed_id.0 != orderbook.key.to_bytes()
+    {
+        return Err(BoundaryError::InvalidOracle.into());
+    }
+
+    let mut cpi_metas = Vec::with_capacity(accounts.len().saturating_sub(2));
+    let mut cpi_infos = Vec::with_capacity(accounts.len().saturating_sub(1));
+    for account in &accounts[2..] {
+        cpi_metas.push(AccountMeta::new_readonly(*account.key, false));
+        cpi_infos.push(account.clone());
+    }
+    cpi_infos.push(hawkeye_program.clone());
+    invoke(
+        &SolanaInstruction {
+            program_id: HAWKEYE_PROGRAM_ID,
+            accounts: cpi_metas,
+            data: PHOENIX_VIEW_BBO_DISCRIMINANT.to_vec(),
+        },
+        &cpi_infos,
+    )?;
+
+    let (return_program_id, return_data) = get_return_data().ok_or(BoundaryError::InvalidOracle)?;
+    if return_program_id != HAWKEYE_PROGRAM_ID {
+        return Err(BoundaryError::InvalidOracle.into());
+    }
+    let observation = decode_phoenix_bbo_return(&return_data)?;
+    let clock = Clock::get()?;
+    if observation.mark_price_last_updated_slot > clock.slot
+        || observation.index_price_last_updated_slot > clock.slot
+        || clock
+            .slot
+            .saturating_sub(observation.mark_price_last_updated_slot)
+            > state.max_source_staleness_slots.get()
+        || clock
+            .slot
+            .saturating_sub(observation.index_price_last_updated_slot)
+            > state.max_source_staleness_slots.get()
+    {
+        return Err(BoundaryError::InvalidOracle.into());
+    }
+    let spread_bps =
+        phoenix_spread_bps_ceil(observation.best_bid_ticks, observation.best_ask_ticks)
+            .ok_or(BoundaryError::ArithmeticOverflow)?;
+    if spread_bps > u64::from(state.max_spread_bps.get()) {
+        return Err(BoundaryError::OracleDivergence.into());
+    }
+    let mark_index_divergence =
+        price_divergence_bps_ceil(observation.mark_price_ticks, observation.index_price_ticks)
+            .ok_or(BoundaryError::ArithmeticOverflow)?;
+    if mark_index_divergence > u64::from(state.max_mark_index_divergence_bps.get()) {
+        return Err(BoundaryError::OracleDivergence.into());
+    }
+
+    let scale = state.price_e6_per_tick.get();
+    let price_e6 = observation
+        .mark_price_ticks
+        .checked_mul(scale)
+        .ok_or(BoundaryError::ArithmeticOverflow)?;
+    let half_spread_ticks = observation
+        .best_ask_ticks
+        .checked_sub(observation.best_bid_ticks)
+        .and_then(|spread| spread.checked_add(1))
+        .map(|spread| spread / 2)
+        .ok_or(BoundaryError::ArithmeticOverflow)?;
+    let uncertainty_ticks = core::cmp::max(
+        half_spread_ticks,
+        observation
+            .mark_price_ticks
+            .abs_diff(observation.index_price_ticks),
+    );
+    let confidence_e6 = uncertainty_ticks
+        .checked_mul(scale)
+        .ok_or(BoundaryError::ArithmeticOverflow)?;
+    let source_posted_slot = core::cmp::min(
+        observation.mark_price_last_updated_slot,
+        observation.index_price_last_updated_slot,
+    );
+    state
+        .record_observation(
+            price_e6,
+            confidence_e6,
+            clock.unix_timestamp,
+            source_posted_slot,
+            clock.slot,
+        )
+        .map_err(|_| ProgramError::from(BoundaryError::InvalidOracle))?;
+    overwrite_account(&mut relay.try_borrow_mut_data()?, &state)?;
+    if decode_account::<OracleRelayState>(&relay.try_borrow_data()?)? != state {
+        return Err(BoundaryError::PostconditionFailed.into());
+    }
+    Ok(())
+}
+
 struct PositionPreparationAccounts<'a, 'info> {
     authority: &'a AccountInfo<'info>,
     pool: &'a AccountInfo<'info>,
@@ -1713,8 +3809,10 @@ fn process_prepare_position<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
     position_id: u64,
+    controller_override: Option<&Pubkey>,
 ) -> ProgramResult {
-    let boundary = validate_position_preparation(program_id, accounts, position_id)?;
+    let boundary =
+        validate_position_preparation(program_id, accounts, position_id, controller_override)?;
     validate_fresh_target(boundary.target)?;
 
     let position_id_bytes = position_id.to_le_bytes();
@@ -1722,7 +3820,9 @@ fn process_prepare_position<'a>(
     let signer_seeds: &[&[u8]] = &[
         POSITION_SEED,
         boundary.pool.key.as_ref(),
-        boundary.authority.key.as_ref(),
+        controller_override
+            .unwrap_or(boundary.authority.key)
+            .as_ref(),
         &position_id_bytes,
         &target_bump,
     ];
@@ -1740,6 +3840,7 @@ fn validate_position_preparation<'a, 'info>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'info>],
     position_id: u64,
+    controller_override: Option<&Pubkey>,
 ) -> Result<PositionPreparationAccounts<'a, 'info>, ProgramError> {
     if accounts.len() != PREPARE_POSITION_ACCOUNT_COUNT {
         return Err(BoundaryError::InvalidAccountCount.into());
@@ -1750,6 +3851,7 @@ fn validate_position_preparation<'a, 'info>(
     let controller = &accounts[2];
     let target = &accounts[3];
     let system_program_ai = &accounts[4];
+    let controller_key = controller_override.unwrap_or(authority.key);
 
     validate_payer_authority(authority)?;
     // The bundled open instruction mutates pool/controller, so their
@@ -1757,12 +3859,12 @@ fn validate_position_preparation<'a, 'info>(
     expect_nonsigner(pool)?;
     load_canonical_pool(program_id, pool)?;
     expect_nonsigner(controller)?;
-    load_canonical_controller(program_id, pool.key, authority.key, controller)?;
+    load_canonical_controller(program_id, pool.key, controller_key, controller)?;
     expect_writable(target)?;
     expect_nonsigner(target)?;
     validate_external_program(system_program_ai, &system_program::ID)?;
     let (expected_target, target_bump) =
-        derive_position(program_id, pool.key, authority.key, position_id);
+        derive_position(program_id, pool.key, controller_key, position_id);
     if target.key != &expected_target {
         return Err(BoundaryError::InvalidPda.into());
     }
@@ -1780,6 +3882,7 @@ fn process_prepare_claim<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
     position_id: u64,
+    controller_override: Option<&Pubkey>,
 ) -> ProgramResult {
     if accounts.len() != PREPARE_CLAIM_ACCOUNT_COUNT {
         return Err(BoundaryError::InvalidAccountCount.into());
@@ -1789,12 +3892,13 @@ fn process_prepare_claim<'a>(
     let position = &accounts[1];
     let claim = &accounts[2];
     let system_program_ai = &accounts[3];
+    let controller_key = controller_override.unwrap_or(authority.key);
     validate_payer_authority(authority)?;
     expect_writable(position)?;
     expect_nonsigner(position)?;
     let position_state = load_self_canonical_position(program_id, position)?;
     if position_state.position_id.get() != position_id
-        || position_state.controller.0 != authority.key.to_bytes()
+        || position_state.controller.0 != controller_key.to_bytes()
         || position_state.status != crate::martingaler_state::PositionStatus::Open as u8
     {
         return Err(BoundaryError::InvalidPosition.into());
@@ -1876,6 +3980,8 @@ fn process_open_cash_position<'a>(
     collateral: u64,
     notional: u64,
     leverage_x: u16,
+    min_payout_factor_bps: u16,
+    controller_override: Option<&Pubkey>,
 ) -> ProgramResult {
     if accounts.len() != OPEN_CASH_BASE_ACCOUNT_COUNT
         && accounts.len() != OPEN_CASH_BASE_ACCOUNT_COUNT + 1
@@ -1891,6 +3997,7 @@ fn process_open_cash_position<'a>(
     let oracle_policy = &accounts[5];
     let vault = &accounts[6];
     let primary_oracle = &accounts[7];
+    let controller_key = controller_override.unwrap_or(authority.key);
 
     // The same authority funds the canonical position PDA in the preceding
     // prepare instruction, so transaction-wide privileges keep it writable.
@@ -1904,11 +4011,11 @@ fn process_open_cash_position<'a>(
     expect_writable(controller)?;
     expect_nonsigner(controller)?;
     let mut controller_state =
-        load_canonical_controller(program_id, pool.key, authority.key, controller)?;
+        load_canonical_controller(program_id, pool.key, controller_key, controller)?;
     expect_writable(position)?;
     expect_nonsigner(position)?;
     let (expected_position, position_bump) =
-        derive_position(program_id, pool.key, authority.key, position_id);
+        derive_position(program_id, pool.key, controller_key, position_id);
     if position.key != &expected_position {
         return Err(BoundaryError::InvalidPda.into());
     }
@@ -1932,45 +4039,23 @@ fn process_open_cash_position<'a>(
     }
     let vault_state = validate_vault_token_account(vault, &quote_mint, &vault_authority)?;
 
-    let primary_provider = validate_oracle_account(primary_oracle)?;
     let now_unix_ts = Clock::get()?.unix_timestamp;
-    let (entry_price_e6, entry_publish_time) = crate::oracle_v16::read_oracle_price_e6(
+    let (primary_observation, secondary_observation) = read_policy_prices(
+        program_id,
+        &policy_state,
+        &market_state,
         primary_oracle,
-        &policy_state.primary_feed_id.0,
+        (policy_state.oracle_count == 2).then(|| &accounts[8]),
         now_unix_ts,
-        policy_state.max_staleness_secs.get(),
-        policy_state.confidence_limit_bps.get(),
-    )
-    .map_err(|_| ProgramError::from(BoundaryError::InvalidOracle))?;
+    )?;
+    let (entry_price_e6, entry_publish_time) = primary_observation;
+    let (secondary_entry_price_e6, secondary_publish_time) =
+        secondary_observation.unwrap_or((0, 0));
 
-    let (secondary_entry_price_e6, secondary_publish_time) = if policy_state.oracle_count == 2 {
-        let secondary_oracle = &accounts[8];
-        let secondary_provider = validate_oracle_account(secondary_oracle)?;
-        if secondary_provider == primary_provider {
-            return Err(BoundaryError::InvalidOracle.into());
-        }
-        let observation = crate::oracle_v16::read_oracle_price_e6(
-            secondary_oracle,
-            &policy_state.secondary_feed_id.0,
-            now_unix_ts,
-            policy_state.max_staleness_secs.get(),
-            policy_state.confidence_limit_bps.get(),
-        )
-        .map_err(|_| ProgramError::from(BoundaryError::InvalidOracle))?;
-        let divergence = price_divergence_bps_ceil(entry_price_e6, observation.0)
-            .ok_or(BoundaryError::ArithmeticOverflow)?;
-        if divergence > u64::from(market_state.divergence_limit_bps.get()) {
-            return Err(BoundaryError::OracleDivergence.into());
-        }
-        observation
-    } else {
-        (0, 0)
-    };
-
-    let outcome = open_cash_position_from_idle(
+    let outcome = open_cash_position_from_idle_guarded(
         Key32::new(pool.key.to_bytes()),
         Key32::new(market.key.to_bytes()),
-        Key32::new(authority.key.to_bytes()),
+        Key32::new(controller_key.to_bytes()),
         &mut pool_state,
         &mut market_state,
         &mut controller_state,
@@ -1984,6 +4069,7 @@ fn process_open_cash_position<'a>(
         entry_publish_time,
         secondary_entry_price_e6,
         secondary_publish_time,
+        min_payout_factor_bps,
     )?;
 
     initialize_account(
@@ -2025,6 +4111,8 @@ fn process_open_claim_position<'a>(
     claim_amount: u64,
     notional: u64,
     leverage_x: u16,
+    min_payout_factor_bps: u16,
+    controller_override: Option<&Pubkey>,
 ) -> ProgramResult {
     if accounts.len() != OPEN_CLAIM_BASE_ACCOUNT_COUNT
         && accounts.len() != OPEN_CLAIM_BASE_ACCOUNT_COUNT + 1
@@ -2042,6 +4130,7 @@ fn process_open_claim_position<'a>(
     let oracle_policy = &accounts[7];
     let vault = &accounts[8];
     let primary_oracle = &accounts[9];
+    let controller_key = controller_override.unwrap_or(authority.key);
 
     validate_payer_authority(authority)?;
     expect_writable(pool)?;
@@ -2053,7 +4142,7 @@ fn process_open_claim_position<'a>(
     expect_writable(controller)?;
     expect_nonsigner(controller)?;
     let mut controller_state =
-        load_canonical_controller(program_id, pool.key, authority.key, controller)?;
+        load_canonical_controller(program_id, pool.key, controller_key, controller)?;
     expect_writable(source_claim)?;
     expect_nonsigner(source_claim)?;
     let mut source_claim_state = load_canonical_claim(program_id, pool.key, source_claim)?;
@@ -2069,7 +4158,7 @@ fn process_open_claim_position<'a>(
     expect_writable(position)?;
     expect_nonsigner(position)?;
     let (expected_position, position_bump) =
-        derive_position(program_id, pool.key, authority.key, position_id);
+        derive_position(program_id, pool.key, controller_key, position_id);
     if position.key != &expected_position {
         return Err(BoundaryError::InvalidPda.into());
     }
@@ -2095,44 +4184,23 @@ fn process_open_claim_position<'a>(
     }
     let vault_state = validate_vault_token_account(vault, &quote_mint, &vault_authority)?;
 
-    let primary_provider = validate_oracle_account(primary_oracle)?;
     let now_unix_ts = Clock::get()?.unix_timestamp;
-    let (entry_price_e6, entry_publish_time) = crate::oracle_v16::read_oracle_price_e6(
+    let (primary_observation, secondary_observation) = read_policy_prices(
+        program_id,
+        &policy_state,
+        &market_state,
         primary_oracle,
-        &policy_state.primary_feed_id.0,
+        (policy_state.oracle_count == 2).then(|| &accounts[10]),
         now_unix_ts,
-        policy_state.max_staleness_secs.get(),
-        policy_state.confidence_limit_bps.get(),
-    )
-    .map_err(|_| ProgramError::from(BoundaryError::InvalidOracle))?;
-    let (secondary_entry_price_e6, secondary_publish_time) = if policy_state.oracle_count == 2 {
-        let secondary_oracle = &accounts[10];
-        let secondary_provider = validate_oracle_account(secondary_oracle)?;
-        if secondary_provider == primary_provider {
-            return Err(BoundaryError::InvalidOracle.into());
-        }
-        let observation = crate::oracle_v16::read_oracle_price_e6(
-            secondary_oracle,
-            &policy_state.secondary_feed_id.0,
-            now_unix_ts,
-            policy_state.max_staleness_secs.get(),
-            policy_state.confidence_limit_bps.get(),
-        )
-        .map_err(|_| ProgramError::from(BoundaryError::InvalidOracle))?;
-        let divergence = price_divergence_bps_ceil(entry_price_e6, observation.0)
-            .ok_or(BoundaryError::ArithmeticOverflow)?;
-        if divergence > u64::from(market_state.divergence_limit_bps.get()) {
-            return Err(BoundaryError::OracleDivergence.into());
-        }
-        observation
-    } else {
-        (0, 0)
-    };
+    )?;
+    let (entry_price_e6, entry_publish_time) = primary_observation;
+    let (secondary_entry_price_e6, secondary_publish_time) =
+        secondary_observation.unwrap_or((0, 0));
 
-    let outcome = open_claim_position_from_queue(
+    let outcome = open_claim_position_from_queue_guarded(
         Key32::new(pool.key.to_bytes()),
         Key32::new(market.key.to_bytes()),
-        Key32::new(authority.key.to_bytes()),
+        Key32::new(controller_key.to_bytes()),
         Key32::new(source_claim.key.to_bytes()),
         &mut pool_state,
         &mut market_state,
@@ -2149,6 +4217,7 @@ fn process_open_claim_position<'a>(
         entry_publish_time,
         secondary_entry_price_e6,
         secondary_publish_time,
+        min_payout_factor_bps,
     )?;
 
     initialize_account(
@@ -2190,6 +4259,7 @@ fn process_close_nonpositive_cash_position<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
     position_id: u64,
+    controller_override: Option<&Pubkey>,
 ) -> ProgramResult {
     if accounts.len() != CLOSE_CASH_ACCOUNT_COUNT && accounts.len() != CLOSE_CASH_ACCOUNT_COUNT + 1
     {
@@ -2208,6 +4278,7 @@ fn process_close_nonpositive_cash_position<'a>(
     let quote_mint = &accounts[9];
     let token_program = &accounts[10];
     let primary_oracle = &accounts[11];
+    let controller_key = controller_override.unwrap_or(authority.key);
 
     validate_controller_authority(authority)?;
     expect_writable(pool)?;
@@ -2223,7 +4294,7 @@ fn process_close_nonpositive_cash_position<'a>(
     expect_writable(position)?;
     expect_nonsigner(position)?;
     let mut position_state =
-        load_canonical_position(program_id, pool.key, authority.key, position_id, position)?;
+        load_canonical_position(program_id, pool.key, controller_key, position_id, position)?;
     let mut market_state =
         load_canonical_market(program_id, pool.key, position_state.market_id.get(), market)?;
     if !matches!(
@@ -2235,7 +4306,7 @@ fn process_close_nonpositive_cash_position<'a>(
     expect_writable(controller)?;
     expect_nonsigner(controller)?;
     let mut controller_state =
-        load_canonical_controller(program_id, pool.key, authority.key, controller)?;
+        load_canonical_controller(program_id, pool.key, controller_key, controller)?;
     expect_readonly(oracle_policy)?;
     let policy_state =
         load_canonical_oracle_policy(program_id, pool.key, market.key, oracle_policy)?;
@@ -2253,8 +4324,7 @@ fn process_close_nonpositive_cash_position<'a>(
     if vault_authority.executable {
         return Err(BoundaryError::InvalidVault.into());
     }
-    let (expected_vault_authority, vault_authority_bump) =
-        derive_vault_authority(program_id, pool.key);
+    let (expected_vault_authority, _) = derive_vault_authority(program_id, pool.key);
     if vault_authority.key != &expected_vault_authority {
         return Err(BoundaryError::InvalidVault.into());
     }
@@ -2272,13 +4342,14 @@ fn process_close_nonpositive_cash_position<'a>(
     let vault_before =
         validate_vault_token_account(vault, quote_mint.key, &expected_vault_authority)?;
     let destination_before =
-        validate_destination_token_account(destination, quote_mint.key, authority.key)?;
+        validate_destination_token_account(destination, quote_mint.key, controller_key)?;
     let mint_supply_before = Mint::unpack(&quote_mint.try_borrow_data()?)
         .map_err(|_| ProgramError::from(BoundaryError::InvalidMint))?
         .supply;
 
     let now_unix_ts = Clock::get()?.unix_timestamp;
     let (exit_price_e6, secondary_exit_price_e6) = read_policy_exit_prices(
+        program_id,
         &policy_state,
         &market_state,
         primary_oracle,
@@ -2288,7 +4359,7 @@ fn process_close_nonpositive_cash_position<'a>(
     let outcome = close_cash_position(
         Key32::new(pool.key.to_bytes()),
         Key32::new(market.key.to_bytes()),
-        Key32::new(authority.key.to_bytes()),
+        Key32::new(controller_key.to_bytes()),
         &mut pool_state,
         &mut market_state,
         &mut controller_state,
@@ -2299,49 +4370,15 @@ fn process_close_nonpositive_cash_position<'a>(
         false,
     )?;
 
-    if outcome.principal_refund != 0 {
-        let transfer = spl_token::instruction::transfer_checked(
-            &spl_token::ID,
-            vault.key,
-            quote_mint.key,
-            destination.key,
-            vault_authority.key,
-            &[],
-            outcome.principal_refund,
-            V1_QUOTE_DECIMALS,
-        )?;
-        let bump = [vault_authority_bump];
-        let signer_seeds: &[&[u8]] = &[VAULT_SEED, pool.key.as_ref(), &bump];
-        invoke_signed(
-            &transfer,
-            &[
-                vault.clone(),
-                quote_mint.clone(),
-                destination.clone(),
-                vault_authority.clone(),
-                token_program.clone(),
-            ],
-            &[signer_seeds],
-        )?;
-    }
-
     let vault_after =
         validate_vault_token_account(vault, quote_mint.key, &expected_vault_authority)?;
     let destination_after =
-        validate_destination_token_account(destination, quote_mint.key, authority.key)?;
+        validate_destination_token_account(destination, quote_mint.key, controller_key)?;
     let mint_supply_after = Mint::unpack(&quote_mint.try_borrow_data()?)
         .map_err(|_| ProgramError::from(BoundaryError::InvalidMint))?
         .supply;
-    if vault_after.amount
-        != vault_before
-            .amount
-            .checked_sub(outcome.principal_refund)
-            .ok_or(BoundaryError::InvalidTokenDelta)?
-        || destination_after.amount
-            != destination_before
-                .amount
-                .checked_add(outcome.principal_refund)
-                .ok_or(BoundaryError::InvalidTokenDelta)?
+    if vault_after.amount != vault_before.amount
+        || destination_after.amount != destination_before.amount
         || mint_supply_after != mint_supply_before
         || vault_after.amount != outcome.represented_custody_after
     {
@@ -2370,6 +4407,7 @@ fn process_close_profitable_cash_position<'a>(
     accounts: &'a [AccountInfo<'a>],
     position_id: u64,
     settlement_shape: ProfitSettlementShape,
+    controller_override: Option<&Pubkey>,
 ) -> ProgramResult {
     let settlement_account_count = match settlement_shape {
         ProfitSettlementShape::NoClaim => 0,
@@ -2395,6 +4433,7 @@ fn process_close_profitable_cash_position<'a>(
     let quote_mint = &accounts[9];
     let token_program = &accounts[10];
     let primary_oracle = &accounts[11];
+    let controller_key = controller_override.unwrap_or(authority.key);
 
     validate_payer_authority(authority)?;
     expect_writable(pool)?;
@@ -2410,7 +4449,7 @@ fn process_close_profitable_cash_position<'a>(
     expect_writable(position)?;
     expect_nonsigner(position)?;
     let mut position_state =
-        load_canonical_position(program_id, pool.key, authority.key, position_id, position)?;
+        load_canonical_position(program_id, pool.key, controller_key, position_id, position)?;
     let mut market_state =
         load_canonical_market(program_id, pool.key, position_state.market_id.get(), market)?;
     if !matches!(
@@ -2422,7 +4461,7 @@ fn process_close_profitable_cash_position<'a>(
     expect_writable(controller)?;
     expect_nonsigner(controller)?;
     let mut controller_state =
-        load_canonical_controller(program_id, pool.key, authority.key, controller)?;
+        load_canonical_controller(program_id, pool.key, controller_key, controller)?;
     expect_readonly(oracle_policy)?;
     let policy_state =
         load_canonical_oracle_policy(program_id, pool.key, market.key, oracle_policy)?;
@@ -2441,8 +4480,7 @@ fn process_close_profitable_cash_position<'a>(
     if vault_authority.executable {
         return Err(BoundaryError::InvalidVault.into());
     }
-    let (expected_vault_authority, vault_authority_bump) =
-        derive_vault_authority(program_id, pool.key);
+    let (expected_vault_authority, _) = derive_vault_authority(program_id, pool.key);
     if vault_authority.key != &expected_vault_authority {
         return Err(BoundaryError::InvalidVault.into());
     }
@@ -2460,13 +4498,14 @@ fn process_close_profitable_cash_position<'a>(
     let vault_before =
         validate_vault_token_account(vault, quote_mint.key, &expected_vault_authority)?;
     let destination_before =
-        validate_destination_token_account(destination, quote_mint.key, authority.key)?;
+        validate_destination_token_account(destination, quote_mint.key, controller_key)?;
     let mint_supply_before = Mint::unpack(&quote_mint.try_borrow_data()?)
         .map_err(|_| ProgramError::from(BoundaryError::InvalidMint))?
         .supply;
 
     let now_unix_ts = Clock::get()?.unix_timestamp;
     let (exit_price_e6, secondary_exit_price_e6) = read_policy_exit_prices(
+        program_id,
         &policy_state,
         &market_state,
         primary_oracle,
@@ -2526,7 +4565,7 @@ fn process_close_profitable_cash_position<'a>(
     let outcome = close_profitable_cash_position(
         Key32::new(pool.key.to_bytes()),
         Key32::new(market.key.to_bytes()),
-        Key32::new(authority.key.to_bytes()),
+        Key32::new(controller_key.to_bytes()),
         claim_key,
         &mut pool_state,
         &mut market_state,
@@ -2548,53 +4587,15 @@ fn process_close_profitable_cash_position<'a>(
         return Err(BoundaryError::SettlementShapeMismatch.into());
     }
 
-    let transfer_amount = outcome
-        .principal_refund
-        .checked_add(outcome.immediate_profit_paid)
-        .ok_or(BoundaryError::ArithmeticOverflow)?;
-    if transfer_amount != 0 {
-        let transfer = spl_token::instruction::transfer_checked(
-            &spl_token::ID,
-            vault.key,
-            quote_mint.key,
-            destination.key,
-            vault_authority.key,
-            &[],
-            transfer_amount,
-            V1_QUOTE_DECIMALS,
-        )?;
-        let bump = [vault_authority_bump];
-        let signer_seeds: &[&[u8]] = &[VAULT_SEED, pool.key.as_ref(), &bump];
-        invoke_signed(
-            &transfer,
-            &[
-                vault.clone(),
-                quote_mint.clone(),
-                destination.clone(),
-                vault_authority.clone(),
-                token_program.clone(),
-            ],
-            &[signer_seeds],
-        )?;
-    }
-
     let vault_after =
         validate_vault_token_account(vault, quote_mint.key, &expected_vault_authority)?;
     let destination_after =
-        validate_destination_token_account(destination, quote_mint.key, authority.key)?;
+        validate_destination_token_account(destination, quote_mint.key, controller_key)?;
     let mint_supply_after = Mint::unpack(&quote_mint.try_borrow_data()?)
         .map_err(|_| ProgramError::from(BoundaryError::InvalidMint))?
         .supply;
-    if vault_after.amount
-        != vault_before
-            .amount
-            .checked_sub(transfer_amount)
-            .ok_or(BoundaryError::InvalidTokenDelta)?
-        || destination_after.amount
-            != destination_before
-                .amount
-                .checked_add(transfer_amount)
-                .ok_or(BoundaryError::InvalidTokenDelta)?
+    if vault_after.amount != vault_before.amount
+        || destination_after.amount != destination_before.amount
         || mint_supply_after != mint_supply_before
         || vault_after.amount != outcome.represented_custody_after
     {
@@ -2677,6 +4678,7 @@ fn process_close_claim_position<'a>(
     position_id: u64,
     settlement_shape: ProfitSettlementShape,
     close_kind: ClaimVoluntaryCloseKind,
+    controller_override: Option<&Pubkey>,
 ) -> ProgramResult {
     let settlement_account_count = match settlement_shape {
         ProfitSettlementShape::NoClaim => 0,
@@ -2703,6 +4705,7 @@ fn process_close_claim_position<'a>(
     let quote_mint = &accounts[10];
     let token_program = &accounts[11];
     let primary_oracle = &accounts[12];
+    let controller_key = controller_override.unwrap_or(authority.key);
 
     validate_payer_authority(authority)?;
     expect_writable(pool)?;
@@ -2716,7 +4719,7 @@ fn process_close_claim_position<'a>(
     expect_writable(position)?;
     expect_nonsigner(position)?;
     let mut position_state =
-        load_canonical_position(program_id, pool.key, authority.key, position_id, position)?;
+        load_canonical_position(program_id, pool.key, controller_key, position_id, position)?;
     expect_writable(market)?;
     expect_nonsigner(market)?;
     let mut market_state =
@@ -2730,7 +4733,7 @@ fn process_close_claim_position<'a>(
     expect_writable(controller)?;
     expect_nonsigner(controller)?;
     let mut controller_state =
-        load_canonical_controller(program_id, pool.key, authority.key, controller)?;
+        load_canonical_controller(program_id, pool.key, controller_key, controller)?;
     expect_writable(source_claim)?;
     expect_nonsigner(source_claim)?;
     let mut source_claim_state = load_canonical_claim(program_id, pool.key, source_claim)?;
@@ -2755,8 +4758,7 @@ fn process_close_claim_position<'a>(
     if vault_authority.executable {
         return Err(BoundaryError::InvalidVault.into());
     }
-    let (expected_vault_authority, vault_authority_bump) =
-        derive_vault_authority(program_id, pool.key);
+    let (expected_vault_authority, _) = derive_vault_authority(program_id, pool.key);
     if vault_authority.key != &expected_vault_authority {
         return Err(BoundaryError::InvalidVault.into());
     }
@@ -2774,13 +4776,14 @@ fn process_close_claim_position<'a>(
     let vault_before =
         validate_vault_token_account(vault, quote_mint.key, &expected_vault_authority)?;
     let destination_before =
-        validate_destination_token_account(destination, quote_mint.key, authority.key)?;
+        validate_destination_token_account(destination, quote_mint.key, controller_key)?;
     let mint_supply_before = Mint::unpack(&quote_mint.try_borrow_data()?)
         .map_err(|_| ProgramError::from(BoundaryError::InvalidMint))?
         .supply;
 
     let now_unix_ts = Clock::get()?.unix_timestamp;
     let (exit_price_e6, secondary_exit_price_e6) = read_policy_exit_prices(
+        program_id,
         &policy_state,
         &market_state,
         primary_oracle,
@@ -2841,7 +4844,7 @@ fn process_close_claim_position<'a>(
         ClaimVoluntaryCloseKind::NonPositive => close_nonpositive_claim_position(
             Key32::new(pool.key.to_bytes()),
             Key32::new(market.key.to_bytes()),
-            Key32::new(authority.key.to_bytes()),
+            Key32::new(controller_key.to_bytes()),
             child_claim_key,
             &mut pool_state,
             &mut market_state,
@@ -2857,7 +4860,7 @@ fn process_close_claim_position<'a>(
         ClaimVoluntaryCloseKind::Profitable => close_profitable_claim_position(
             Key32::new(pool.key.to_bytes()),
             Key32::new(market.key.to_bytes()),
-            Key32::new(authority.key.to_bytes()),
+            Key32::new(controller_key.to_bytes()),
             child_claim_key,
             &mut pool_state,
             &mut market_state,
@@ -2881,49 +4884,15 @@ fn process_close_claim_position<'a>(
         return Err(BoundaryError::SettlementShapeMismatch.into());
     }
 
-    if outcome.immediate_payout != 0 {
-        let transfer = spl_token::instruction::transfer_checked(
-            &spl_token::ID,
-            vault.key,
-            quote_mint.key,
-            destination.key,
-            vault_authority.key,
-            &[],
-            outcome.immediate_payout,
-            V1_QUOTE_DECIMALS,
-        )?;
-        let bump = [vault_authority_bump];
-        let signer_seeds: &[&[u8]] = &[VAULT_SEED, pool.key.as_ref(), &bump];
-        invoke_signed(
-            &transfer,
-            &[
-                vault.clone(),
-                quote_mint.clone(),
-                destination.clone(),
-                vault_authority.clone(),
-                token_program.clone(),
-            ],
-            &[signer_seeds],
-        )?;
-    }
-
     let vault_after =
         validate_vault_token_account(vault, quote_mint.key, &expected_vault_authority)?;
     let destination_after =
-        validate_destination_token_account(destination, quote_mint.key, authority.key)?;
+        validate_destination_token_account(destination, quote_mint.key, controller_key)?;
     let mint_supply_after = Mint::unpack(&quote_mint.try_borrow_data()?)
         .map_err(|_| ProgramError::from(BoundaryError::InvalidMint))?
         .supply;
-    if vault_after.amount
-        != vault_before
-            .amount
-            .checked_sub(outcome.immediate_payout)
-            .ok_or(BoundaryError::InvalidTokenDelta)?
-        || destination_after.amount
-            != destination_before
-                .amount
-                .checked_add(outcome.immediate_payout)
-                .ok_or(BoundaryError::InvalidTokenDelta)?
+    if vault_after.amount != vault_before.amount
+        || destination_after.amount != destination_before.amount
         || mint_supply_after != mint_supply_before
         || vault_after.amount != outcome.represented_custody_after
     {
@@ -3039,8 +5008,7 @@ fn process_service_fifo_head<'a>(
     if vault_authority.executable {
         return Err(BoundaryError::InvalidVault.into());
     }
-    let (expected_vault_authority, vault_authority_bump) =
-        derive_vault_authority(program_id, pool.key);
+    let (expected_vault_authority, _) = derive_vault_authority(program_id, pool.key);
     if vault_authority.key != &expected_vault_authority {
         return Err(BoundaryError::InvalidVault.into());
     }
@@ -3069,7 +5037,7 @@ fn process_service_fifo_head<'a>(
         return Err(BoundaryError::CustodyMismatch.into());
     }
 
-    let outcome = service_fifo_claim(
+    let _outcome = service_fifo_claim(
         Key32::new(pool.key.to_bytes()),
         &mut pool_state,
         &mut controller_state,
@@ -3077,31 +5045,6 @@ fn process_service_fifo_head<'a>(
         Key32::new(claim.key.to_bytes()),
         &mut claim_state,
     )?;
-    let payment = u64::try_from(outcome.paid).map_err(|_| BoundaryError::ArithmeticOverflow)?;
-    let transfer = spl_token::instruction::transfer_checked(
-        &spl_token::ID,
-        vault.key,
-        quote_mint.key,
-        destination.key,
-        vault_authority.key,
-        &[],
-        payment,
-        V1_QUOTE_DECIMALS,
-    )?;
-    let bump = [vault_authority_bump];
-    let signer_seeds: &[&[u8]] = &[VAULT_SEED, pool.key.as_ref(), &bump];
-    invoke_signed(
-        &transfer,
-        &[
-            vault.clone(),
-            quote_mint.clone(),
-            destination.clone(),
-            vault_authority.clone(),
-            token_program.clone(),
-        ],
-        &[signer_seeds],
-    )?;
-
     let vault_after =
         validate_vault_token_account(vault, quote_mint.key, &expected_vault_authority)?;
     let destination_after =
@@ -3109,16 +5052,8 @@ fn process_service_fifo_head<'a>(
     let mint_supply_after = Mint::unpack(&quote_mint.try_borrow_data()?)
         .map_err(|_| ProgramError::from(BoundaryError::InvalidMint))?
         .supply;
-    if vault_after.amount
-        != vault_before
-            .amount
-            .checked_sub(payment)
-            .ok_or(BoundaryError::InvalidTokenDelta)?
-        || destination_after.amount
-            != destination_before
-                .amount
-                .checked_add(payment)
-                .ok_or(BoundaryError::InvalidTokenDelta)?
+    if vault_after.amount != vault_before.amount
+        || destination_after.amount != destination_before.amount
         || mint_supply_after != mint_supply_before
         || pool_state.represented_quote_custody()? != u128::from(vault_after.amount)
     {
@@ -3138,6 +5073,75 @@ fn process_service_fifo_head<'a>(
         || decode_account::<ClaimState>(&claim.try_borrow_data()?)? != claim_state
         || !account_body_matches(&head_page.try_borrow_data()?, head_page_state.as_ref())?
         || pool_state.represented_quote_custody()? != u128::from(vault_after.amount)
+    {
+        return Err(BoundaryError::PostconditionFailed.into());
+    }
+    Ok(())
+}
+
+/// Reclassifies serviced FIFO value into the claim owner's internal Account
+/// USDC balance. No quote token leaves custody; explicit withdrawal remains the
+/// only path that can move value from the canonical vault to a wallet ATA.
+#[inline(never)]
+fn process_service_fifo_head_internal<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+) -> ProgramResult {
+    if accounts.len() != SERVICE_FIFO_HEAD_INTERNAL_ACCOUNT_COUNT {
+        return Err(BoundaryError::InvalidAccountCount.into());
+    }
+    ensure_distinct(accounts)?;
+    let pool = &accounts[0];
+    let controller = &accounts[1];
+    let claim = &accounts[2];
+    let head_page = &accounts[3];
+
+    expect_writable(pool)?;
+    expect_nonsigner(pool)?;
+    let mut pool_state = load_canonical_pool_for_claim_service(program_id, pool)?;
+    let represented_before = pool_state.represented_quote_custody()?;
+    expect_writable(claim)?;
+    expect_nonsigner(claim)?;
+    let mut claim_state = load_canonical_claim(program_id, pool.key, claim)?;
+    let controller_key = Pubkey::new_from_array(claim_state.controller.0);
+    expect_writable(controller)?;
+    expect_nonsigner(controller)?;
+    let mut controller_state =
+        load_canonical_controller(program_id, pool.key, &controller_key, controller)?;
+    expect_writable(head_page)?;
+    expect_nonsigner(head_page)?;
+    let mut head_page_state = load_canonical_queue_page(
+        program_id,
+        pool.key,
+        pool_state.head_page_index.get(),
+        head_page,
+    )?;
+
+    service_fifo_claim(
+        Key32::new(pool.key.to_bytes()),
+        &mut pool_state,
+        &mut controller_state,
+        head_page_state.as_mut(),
+        Key32::new(claim.key.to_bytes()),
+        &mut claim_state,
+    )?;
+    if pool_state.represented_quote_custody()? != represented_before {
+        return Err(BoundaryError::InvalidTokenDelta.into());
+    }
+
+    overwrite_account(&mut pool.try_borrow_mut_data()?, &pool_state)?;
+    overwrite_account(&mut controller.try_borrow_mut_data()?, &controller_state)?;
+    overwrite_account(&mut claim.try_borrow_mut_data()?, &claim_state)?;
+    overwrite_account(
+        &mut head_page.try_borrow_mut_data()?,
+        head_page_state.as_ref(),
+    )?;
+    if decode_account::<PoolState>(&pool.try_borrow_data()?)? != pool_state
+        || decode_account::<ControllerRiskState>(&controller.try_borrow_data()?)?
+            != controller_state
+        || decode_account::<ClaimState>(&claim.try_borrow_data()?)? != claim_state
+        || !account_body_matches(&head_page.try_borrow_data()?, head_page_state.as_ref())?
+        || pool_state.represented_quote_custody()? != represented_before
     {
         return Err(BoundaryError::PostconditionFailed.into());
     }
@@ -3300,39 +5304,15 @@ fn process_resolve_bankrupt_cash_position<'a>(
         return Err(BoundaryError::InvalidVault.into());
     }
     let vault_before = validate_vault_token_account(vault, &quote_mint, &vault_authority)?;
-    let primary_provider = validate_oracle_account(primary_oracle)?;
     let now_unix_ts = Clock::get()?.unix_timestamp;
-    let (primary_exit_price_e6, _) = crate::oracle_v16::read_oracle_price_e6(
+    let (primary_exit_price_e6, secondary_exit_price_e6) = read_policy_exit_prices(
+        program_id,
+        &policy_state,
+        &market_state,
         primary_oracle,
-        &policy_state.primary_feed_id.0,
+        (policy_state.oracle_count == 2).then(|| &accounts[7]),
         now_unix_ts,
-        policy_state.max_staleness_secs.get(),
-        policy_state.confidence_limit_bps.get(),
-    )
-    .map_err(|_| ProgramError::from(BoundaryError::InvalidOracle))?;
-    let secondary_exit_price_e6 = if policy_state.oracle_count == 2 {
-        let secondary_oracle = &accounts[7];
-        let secondary_provider = validate_oracle_account(secondary_oracle)?;
-        if secondary_provider == primary_provider {
-            return Err(BoundaryError::InvalidOracle.into());
-        }
-        let (secondary_price, _) = crate::oracle_v16::read_oracle_price_e6(
-            secondary_oracle,
-            &policy_state.secondary_feed_id.0,
-            now_unix_ts,
-            policy_state.max_staleness_secs.get(),
-            policy_state.confidence_limit_bps.get(),
-        )
-        .map_err(|_| ProgramError::from(BoundaryError::InvalidOracle))?;
-        let divergence = price_divergence_bps_ceil(primary_exit_price_e6, secondary_price)
-            .ok_or(BoundaryError::ArithmeticOverflow)?;
-        if divergence > u64::from(market_state.divergence_limit_bps.get()) {
-            return Err(BoundaryError::OracleDivergence.into());
-        }
-        Some(secondary_price)
-    } else {
-        None
-    };
+    )?;
 
     let outcome = close_cash_position(
         Key32::new(pool.key.to_bytes()),
@@ -3443,39 +5423,15 @@ fn process_resolve_bankrupt_claim_position<'a>(
         return Err(BoundaryError::InvalidVault.into());
     }
     let vault_before = validate_vault_token_account(vault, &quote_mint, &vault_authority)?;
-    let primary_provider = validate_oracle_account(primary_oracle)?;
     let now_unix_ts = Clock::get()?.unix_timestamp;
-    let (primary_exit_price_e6, _) = crate::oracle_v16::read_oracle_price_e6(
+    let (primary_exit_price_e6, secondary_exit_price_e6) = read_policy_exit_prices(
+        program_id,
+        &policy_state,
+        &market_state,
         primary_oracle,
-        &policy_state.primary_feed_id.0,
+        (policy_state.oracle_count == 2).then(|| &accounts[8]),
         now_unix_ts,
-        policy_state.max_staleness_secs.get(),
-        policy_state.confidence_limit_bps.get(),
-    )
-    .map_err(|_| ProgramError::from(BoundaryError::InvalidOracle))?;
-    let secondary_exit_price_e6 = if policy_state.oracle_count == 2 {
-        let secondary_oracle = &accounts[8];
-        let secondary_provider = validate_oracle_account(secondary_oracle)?;
-        if secondary_provider == primary_provider {
-            return Err(BoundaryError::InvalidOracle.into());
-        }
-        let (secondary_price, _) = crate::oracle_v16::read_oracle_price_e6(
-            secondary_oracle,
-            &policy_state.secondary_feed_id.0,
-            now_unix_ts,
-            policy_state.max_staleness_secs.get(),
-            policy_state.confidence_limit_bps.get(),
-        )
-        .map_err(|_| ProgramError::from(BoundaryError::InvalidOracle))?;
-        let divergence = price_divergence_bps_ceil(primary_exit_price_e6, secondary_price)
-            .ok_or(BoundaryError::ArithmeticOverflow)?;
-        if divergence > u64::from(market_state.divergence_limit_bps.get()) {
-            return Err(BoundaryError::OracleDivergence.into());
-        }
-        Some(secondary_price)
-    } else {
-        None
-    };
+    )?;
 
     let outcome = resolve_bankrupt_claim_position(
         Key32::new(pool.key.to_bytes()),
@@ -3578,6 +5534,57 @@ fn process_set_market_status<'a>(
     transition_market_status(Key32::new(pool.key.to_bytes()), &mut market_state, target)?;
     overwrite_account(&mut market.try_borrow_mut_data()?, &market_state)?;
     if decode_account::<MarketRiskState>(&market.try_borrow_data()?)? != market_state {
+        return Err(BoundaryError::PostconditionFailed.into());
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn process_update_leverage_limit<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    market_id: u16,
+    max_leverage_x: u16,
+) -> ProgramResult {
+    if accounts.len() != UPDATE_LEVERAGE_LIMIT_ACCOUNT_COUNT {
+        return Err(BoundaryError::InvalidAccountCount.into());
+    }
+    ensure_distinct(accounts)?;
+    let admin = &accounts[0];
+    let pool = &accounts[1];
+    let market = &accounts[2];
+    validate_controller_authority(admin)?;
+    expect_writable(pool)?;
+    expect_nonsigner(pool)?;
+    let mut pool_state = load_canonical_pool(program_id, pool)?;
+    if pool_state.admin.0 != admin.key.to_bytes()
+        || pool_state.status != PoolStatus::Active as u8
+        || pool_state.reserved_open_profit.get() != 0
+        || max_leverage_x < pool_state.max_leverage_x.get()
+    {
+        return Err(BoundaryError::InvalidMarketLimits.into());
+    }
+    expect_writable(market)?;
+    expect_nonsigner(market)?;
+    let mut market_state = load_canonical_market(program_id, pool.key, market_id, market)?;
+    if market_state.status != PoolStatus::Active as u8
+        || market_state.long_open_interest.get() != 0
+        || market_state.short_open_interest.get() != 0
+        || market_state.reserved_profit.get() != 0
+        || max_leverage_x < market_state.max_leverage_x.get()
+        || max_leverage_x > V1_MAX_LEVERAGE_X
+    {
+        return Err(BoundaryError::InvalidMarketLimits.into());
+    }
+    pool_state.max_leverage_x = crate::martingaler_state::U16Le::new(max_leverage_x);
+    market_state.max_leverage_x = crate::martingaler_state::U16Le::new(max_leverage_x);
+    pool_state.validate()?;
+    market_state.validate()?;
+    overwrite_account(&mut pool.try_borrow_mut_data()?, &pool_state)?;
+    overwrite_account(&mut market.try_borrow_mut_data()?, &market_state)?;
+    if decode_account::<PoolState>(&pool.try_borrow_data()?)? != pool_state
+        || decode_account::<MarketRiskState>(&market.try_borrow_data()?)? != market_state
+    {
         return Err(BoundaryError::PostconditionFailed.into());
     }
     Ok(())
@@ -3714,9 +5721,10 @@ fn process_withdraw_idle_cash<'a>(
 enum OracleProviderFamily {
     Pyth,
     Switchboard,
+    Phoenix,
 }
 
-fn validate_oracle_account(
+fn validate_direct_oracle_account(
     account: &AccountInfo<'_>,
 ) -> Result<OracleProviderFamily, ProgramError> {
     expect_readonly(account)?;
@@ -3735,47 +5743,122 @@ fn validate_oracle_account(
     }
 }
 
+fn read_policy_oracle_price(
+    program_id: &Pubkey,
+    policy: &OraclePolicyState,
+    feed_id: &[u8; 32],
+    account: &AccountInfo<'_>,
+    now_unix_ts: i64,
+) -> Result<(OracleProviderFamily, u64, i64), ProgramError> {
+    if account.owner == program_id {
+        expect_readonly(account)?;
+        expect_nonsigner(account)?;
+        let state = load_canonical_oracle_relay(program_id, account)?;
+        let source = OracleRelaySource::try_from(state.source)
+            .map_err(|_| ProgramError::from(BoundaryError::InvalidOracle))?;
+        if state.pool != policy.pool
+            || state.market != policy.market
+            || state.feed_id.0 != *feed_id
+            || state.sequence.get() == 0
+            || state.source_posted_slot.get() == 0
+            || state.price_e6.get() == 0
+            || state.publish_time.get() <= 0
+            || state.publish_time.get()
+                > now_unix_ts.saturating_add(ORACLE_RELAY_FUTURE_TOLERANCE_SECS)
+            || now_unix_ts.saturating_sub(state.publish_time.get())
+                > i64::try_from(policy.max_staleness_secs.get())
+                    .map_err(|_| BoundaryError::InvalidOracle)?
+            || u128::from(state.confidence_e6.get()) * 10_000
+                > u128::from(state.price_e6.get()) * u128::from(policy.confidence_limit_bps.get())
+        {
+            return Err(BoundaryError::InvalidOracle.into());
+        }
+        // The pinned MagicBlock demo PriceUpdateV3 is Pyth-family transport,
+        // while Phoenix Hawkeye is a distinct onchain market/mark family.
+        // Keeping the immutable source tag in state prevents either relay
+        // from silently satisfying a different independence requirement.
+        let provider = match source {
+            OracleRelaySource::MagicBlockDemo => OracleProviderFamily::Pyth,
+            OracleRelaySource::PhoenixHawkeye | OracleRelaySource::PhoenixMainnetRelay => {
+                OracleProviderFamily::Phoenix
+            }
+        };
+        return Ok((provider, state.price_e6.get(), state.publish_time.get()));
+    }
+
+    let provider = validate_direct_oracle_account(account)?;
+    let (price, publish_time) = crate::oracle_v16::read_oracle_price_e6(
+        account,
+        feed_id,
+        now_unix_ts,
+        policy.max_staleness_secs.get(),
+        policy.confidence_limit_bps.get(),
+    )
+    .map_err(|_| ProgramError::from(BoundaryError::InvalidOracle))?;
+    Ok((provider, price, publish_time))
+}
+
+fn read_policy_prices(
+    program_id: &Pubkey,
+    policy: &OraclePolicyState,
+    market: &MarketRiskState,
+    primary_oracle: &AccountInfo<'_>,
+    secondary_oracle: Option<&AccountInfo<'_>>,
+    now_unix_ts: i64,
+) -> Result<((u64, i64), Option<(u64, i64)>), ProgramError> {
+    let (primary_provider, primary_price, primary_publish_time) = read_policy_oracle_price(
+        program_id,
+        policy,
+        &policy.primary_feed_id.0,
+        primary_oracle,
+        now_unix_ts,
+    )?;
+
+    match (policy.oracle_count, secondary_oracle) {
+        (1, None) => Ok(((primary_price, primary_publish_time), None)),
+        (2, Some(secondary_oracle)) => {
+            let (secondary_provider, secondary_price, secondary_publish_time) =
+                read_policy_oracle_price(
+                    program_id,
+                    policy,
+                    &policy.secondary_feed_id.0,
+                    secondary_oracle,
+                    now_unix_ts,
+                )?;
+            if secondary_provider == primary_provider {
+                return Err(BoundaryError::InvalidOracle.into());
+            }
+            let divergence = price_divergence_bps_ceil(primary_price, secondary_price)
+                .ok_or(BoundaryError::ArithmeticOverflow)?;
+            if divergence > u64::from(market.divergence_limit_bps.get()) {
+                return Err(BoundaryError::OracleDivergence.into());
+            }
+            Ok((
+                (primary_price, primary_publish_time),
+                Some((secondary_price, secondary_publish_time)),
+            ))
+        }
+        _ => Err(BoundaryError::InvalidAccountCount.into()),
+    }
+}
+
 fn read_policy_exit_prices(
+    program_id: &Pubkey,
     policy: &OraclePolicyState,
     market: &MarketRiskState,
     primary_oracle: &AccountInfo<'_>,
     secondary_oracle: Option<&AccountInfo<'_>>,
     now_unix_ts: i64,
 ) -> Result<(u64, Option<u64>), ProgramError> {
-    let primary_provider = validate_oracle_account(primary_oracle)?;
-    let (primary_price, _) = crate::oracle_v16::read_oracle_price_e6(
+    let (primary, secondary) = read_policy_prices(
+        program_id,
+        policy,
+        market,
         primary_oracle,
-        &policy.primary_feed_id.0,
+        secondary_oracle,
         now_unix_ts,
-        policy.max_staleness_secs.get(),
-        policy.confidence_limit_bps.get(),
-    )
-    .map_err(|_| ProgramError::from(BoundaryError::InvalidOracle))?;
-
-    match (policy.oracle_count, secondary_oracle) {
-        (1, None) => Ok((primary_price, None)),
-        (2, Some(secondary_oracle)) => {
-            let secondary_provider = validate_oracle_account(secondary_oracle)?;
-            if secondary_provider == primary_provider {
-                return Err(BoundaryError::InvalidOracle.into());
-            }
-            let (secondary_price, _) = crate::oracle_v16::read_oracle_price_e6(
-                secondary_oracle,
-                &policy.secondary_feed_id.0,
-                now_unix_ts,
-                policy.max_staleness_secs.get(),
-                policy.confidence_limit_bps.get(),
-            )
-            .map_err(|_| ProgramError::from(BoundaryError::InvalidOracle))?;
-            let divergence = price_divergence_bps_ceil(primary_price, secondary_price)
-                .ok_or(BoundaryError::ArithmeticOverflow)?;
-            if divergence > u64::from(market.divergence_limit_bps.get()) {
-                return Err(BoundaryError::OracleDivergence.into());
-            }
-            Ok((primary_price, Some(secondary_price)))
-        }
-        _ => Err(BoundaryError::InvalidAccountCount.into()),
-    }
+    )?;
+    Ok((primary.0, secondary.map(|observation| observation.0)))
 }
 
 fn price_divergence_bps_ceil(left: u64, right: u64) -> Option<u64> {
@@ -3916,9 +5999,10 @@ fn validate_payer_authority(authority: &AccountInfo<'_>) -> ProgramResult {
 
 fn validate_controller_authority(authority: &AccountInfo<'_>) -> ProgramResult {
     expect_signer(authority)?;
-    if authority.is_writable {
-        return Err(BoundaryError::ExpectedReadonly.into());
-    }
+    // Solana promotes the transaction fee payer to writable in the compiled
+    // message even when the instruction requests a read-only signer. Browser
+    // wallets normally pay their own fees, so writability cannot be rejected
+    // here. This program never mutates or borrows authority data or lamports.
     if authority.owner != &system_program::ID || authority.executable || authority.data_len() != 0 {
         return Err(BoundaryError::InvalidAuthority.into());
     }
@@ -4055,6 +6139,30 @@ fn load_canonical_oracle_policy(
     Ok(state)
 }
 
+fn load_canonical_oracle_relay(
+    program_id: &Pubkey,
+    relay: &AccountInfo<'_>,
+) -> Result<OracleRelayState, ProgramError> {
+    if relay.owner != program_id
+        || relay.executable
+        || relay.data_len() != account_len::<OracleRelayState>()
+        || !Rent::get()?.is_exempt(relay.lamports(), relay.data_len())
+    {
+        return Err(BoundaryError::InvalidOracle.into());
+    }
+    let data = relay.try_borrow_data()?;
+    let header = decode_account_header::<OracleRelayState>(&data)
+        .map_err(|_| ProgramError::from(BoundaryError::InvalidOracle))?;
+    let state = decode_account::<OracleRelayState>(&data)
+        .map_err(|_| ProgramError::from(BoundaryError::InvalidOracle))?;
+    let market = Pubkey::new_from_array(state.market.0);
+    let (expected, bump) = derive_oracle_relay(program_id, &market, &state.feed_id.0);
+    if relay.key != &expected || header.bump != bump {
+        return Err(BoundaryError::InvalidOracle.into());
+    }
+    Ok(state)
+}
+
 fn load_canonical_controller(
     program_id: &Pubkey,
     pool: &Pubkey,
@@ -4076,6 +6184,33 @@ fn load_canonical_controller(
         || header.bump != bump
         || state.pool.0 != pool.to_bytes()
         || state.controller.0 != authority.to_bytes()
+    {
+        return Err(BoundaryError::InvalidAuthority.into());
+    }
+    Ok(state)
+}
+
+fn load_canonical_trading_session(
+    program_id: &Pubkey,
+    pool: &Pubkey,
+    owner: &Pubkey,
+    session: &AccountInfo<'_>,
+) -> Result<TradingSessionState, ProgramError> {
+    if session.owner != program_id
+        || session.executable
+        || session.data_len() != account_len::<TradingSessionState>()
+        || !Rent::get()?.is_exempt(session.lamports(), session.data_len())
+    {
+        return Err(BoundaryError::InvalidAuthority.into());
+    }
+    let data = session.try_borrow_data()?;
+    let header = decode_account_header::<TradingSessionState>(&data)?;
+    let state = decode_account::<TradingSessionState>(&data)?;
+    let (expected, bump) = derive_trading_session(program_id, pool, owner);
+    if session.key != &expected
+        || header.bump != bump
+        || state.pool.0 != pool.to_bytes()
+        || state.owner.0 != owner.to_bytes()
     {
         return Err(BoundaryError::InvalidAuthority.into());
     }
