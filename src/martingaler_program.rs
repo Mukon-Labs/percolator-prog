@@ -17,17 +17,18 @@ use crate::martingaler_state::{
     withdraw_idle_cash, ClaimState, ControllerRiskState, HaircutConfig, Key32, MarketRiskState,
     MartingalerAccount, OraclePolicyState, OracleRelaySource, OracleRelayState, PoolState,
     PoolStatus, PositionSide, PositionState, QueuePageState, TradingSessionState,
-    MAX_ORACLE_CONFIDENCE_BPS, MAX_ORACLE_STALENESS_SECS, V1_MAX_LEVERAGE_X,
-    V1_MIN_PAYOUT_FACTOR_BPS, V1_PAYOUT_FACTOR_SCALE_BPS,
+    MAX_ORACLE_CONFIDENCE_BPS, MAX_ORACLE_STALENESS_SECS, NO_CLAIM_SEQUENCE, V1_MAX_LEVERAGE_X,
+    V1_MAX_NET_PROFIT_PER_POSITION_QUOTE, V1_MAX_POSITION_NOTIONAL_QUOTE,
+    V1_MAX_RESERVED_PROFIT_PER_CONTROLLER_QUOTE, V1_MIN_PAYOUT_FACTOR_BPS,
+    V1_PAYOUT_FACTOR_SCALE_BPS, V1_TOTAL_POTENTIAL_LIABILITY_QUOTE,
 };
 use alloc::{boxed::Box, vec::Vec};
-use percolator_martingaler_engine::martingaler::{
-    V1_MAX_POSITION_NOTIONAL_QUOTE, V1_QUOTE_DECIMALS, V1_TOTAL_POTENTIAL_LIABILITY_QUOTE,
-};
+use percolator_martingaler_engine::martingaler::V1_QUOTE_DECIMALS;
 use solana_program::{
     account_info::AccountInfo,
     entrypoint::ProgramResult,
     instruction::{AccountMeta, Instruction as SolanaInstruction},
+    log::sol_log_data,
     program::{get_return_data, invoke, invoke_signed},
     program_error::ProgramError,
     program_option::COption,
@@ -79,6 +80,7 @@ pub const SESSION_CLOSE_PROFITABLE_POSITION_IX_LEN: usize =
 pub const GUARDED_OPEN_POSITION_IX_LEN: usize = OPEN_CASH_POSITION_IX_LEN + 2;
 pub const SESSION_GUARDED_OPEN_POSITION_IX_LEN: usize = SESSION_OPEN_POSITION_IX_LEN + 2;
 pub const UPDATE_LEVERAGE_LIMIT_IX_LEN: usize = MARTINGALER_IX_PREFIX_LEN + 2 + 2;
+pub const UPDATE_RISK_LIMITS_IX_LEN: usize = MARTINGALER_IX_PREFIX_LEN + 2 + 2 + 8 * 6;
 pub const MARTINGALER_IX_LEN: usize = POOL_IX_LEN;
 pub const PREPARE_POOL_TAG: u8 = 0;
 pub const INITIALIZE_POOL_TAG: u8 = 1;
@@ -127,7 +129,17 @@ pub const GUARDED_OPEN_CLAIM_POSITION_TAG: u8 = 43;
 pub const SESSION_GUARDED_OPEN_CASH_POSITION_TAG: u8 = 44;
 pub const SESSION_GUARDED_OPEN_CLAIM_POSITION_TAG: u8 = 45;
 pub const UPDATE_LEVERAGE_LIMIT_TAG: u8 = 46;
+pub const UPDATE_RISK_LIMITS_TAG: u8 = 47;
 pub const MARTINGALER_PROGRAM_ERROR_BASE: u32 = 31_000;
+pub const MARTINGALER_HISTORY_MAGIC: [u8; 8] = *b"NINHST01";
+pub const MARTINGALER_HISTORY_VERSION: u8 = 1;
+pub const MARTINGALER_HISTORY_OPEN_KIND: u8 = 1;
+pub const MARTINGALER_HISTORY_CLOSE_KIND: u8 = 2;
+pub const MARTINGALER_HISTORY_OPEN_LEN: usize = 178;
+pub const MARTINGALER_HISTORY_CLOSE_LEN: usize = 280;
+pub const MARTINGALER_CLOSE_NONPOSITIVE: u8 = 1;
+pub const MARTINGALER_CLOSE_PROFITABLE: u8 = 2;
+pub const MARTINGALER_CLOSE_BANKRUPT: u8 = 3;
 
 const POOL_SEED: &[u8] = b"martingaler_pool";
 const QUEUE_SEED: &[u8] = b"martingaler_queue";
@@ -165,6 +177,7 @@ const CLAIM_BANKRUPTCY_BASE_ACCOUNT_COUNT: usize = 8;
 const SET_POOL_STATUS_ACCOUNT_COUNT: usize = 2;
 const SET_MARKET_STATUS_ACCOUNT_COUNT: usize = 3;
 const UPDATE_LEVERAGE_LIMIT_ACCOUNT_COUNT: usize = 3;
+const UPDATE_RISK_LIMITS_ACCOUNT_COUNT: usize = 3;
 const WITHDRAW_IDLE_CASH_ACCOUNT_COUNT: usize = 8;
 const ORACLE_RELAY_REGISTRATION_ACCOUNT_COUNT: usize = 5;
 const UPDATE_ORACLE_RELAY_ACCOUNT_COUNT: usize = 2;
@@ -192,6 +205,128 @@ const PHOENIX_VIEW_BBO_HAS_ASK: u8 = 2;
 
 const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+
+fn history_u64(value: u128) -> Result<u64, ProgramError> {
+    u64::try_from(value).map_err(|_| BoundaryError::ArithmeticOverflow.into())
+}
+
+pub fn encode_martingaler_open_history_receipt(
+    pool: &Pubkey,
+    position: &Pubkey,
+    state: &PositionState,
+    max_net_profit_per_position: u128,
+) -> Result<Vec<u8>, ProgramError> {
+    let mut data = Vec::with_capacity(MARTINGALER_HISTORY_OPEN_LEN);
+    data.extend_from_slice(&MARTINGALER_HISTORY_MAGIC);
+    data.push(MARTINGALER_HISTORY_VERSION);
+    data.push(MARTINGALER_HISTORY_OPEN_KIND);
+    data.push(state.funding_kind);
+    data.push(state.side);
+    data.extend_from_slice(pool.as_ref());
+    data.extend_from_slice(&state.controller.0);
+    data.extend_from_slice(position.as_ref());
+    data.extend_from_slice(&state.market_id.get().to_le_bytes());
+    data.extend_from_slice(&state.position_id.get().to_le_bytes());
+    data.extend_from_slice(&history_u64(state.collateral.get())?.to_le_bytes());
+    data.extend_from_slice(&history_u64(state.notional.get())?.to_le_bytes());
+    data.extend_from_slice(&state.leverage_x.get().to_le_bytes());
+    data.extend_from_slice(&state.entry_price_e6.get().to_le_bytes());
+    data.extend_from_slice(&state.secondary_entry_price_e6.get().to_le_bytes());
+    let nominal_profit = core::cmp::min(state.notional.get(), max_net_profit_per_position);
+    let payout_factor_bps = state
+        .max_payable_profit
+        .get()
+        .checked_mul(u128::from(V1_PAYOUT_FACTOR_SCALE_BPS))
+        .and_then(|value| value.checked_div(nominal_profit))
+        .ok_or(BoundaryError::ArithmeticOverflow)?;
+    data.extend_from_slice(
+        &u16::try_from(payout_factor_bps)
+            .map_err(|_| BoundaryError::ArithmeticOverflow)?
+            .to_le_bytes(),
+    );
+    data.extend_from_slice(&history_u64(state.max_payable_profit.get())?.to_le_bytes());
+    data.extend_from_slice(&state.source_claim_sequence.get().to_le_bytes());
+    if data.len() != MARTINGALER_HISTORY_OPEN_LEN {
+        return Err(BoundaryError::PostconditionFailed.into());
+    }
+    Ok(data)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MartingalerCloseReceiptAmounts {
+    principal_refund: u64,
+    gross_loss: u128,
+    haircut_withheld: u128,
+    win_fee: u128,
+    profit_cap_withheld: u128,
+    immediate_profit_paid: u64,
+    queued_profit: u128,
+    residual_bad_debt_added: u128,
+    child_claim_sequence: u128,
+}
+
+fn signed_raw_pnl(position: &PositionState, exit_price_e6: u64) -> Result<i128, ProgramError> {
+    use crate::martingaler_state::OracleCashPnl;
+    let amount = crate::martingaler_state::oracle_cash_pnl(
+        PositionSide::try_from(position.side)?,
+        position.notional.get(),
+        position.entry_price_e6.get(),
+        exit_price_e6,
+    )?;
+    match amount {
+        OracleCashPnl::Profit(value) => {
+            i128::try_from(value).map_err(|_| BoundaryError::ArithmeticOverflow.into())
+        }
+        OracleCashPnl::Flat => Ok(0),
+        OracleCashPnl::Loss(value) => i128::try_from(value)
+            .map(|value| -value)
+            .map_err(|_| BoundaryError::ArithmeticOverflow.into()),
+    }
+}
+
+fn encode_martingaler_close_history_receipt(
+    pool: &Pubkey,
+    position: &Pubkey,
+    state: &PositionState,
+    close_kind: u8,
+    exit_price_e6: u64,
+    secondary_exit_price_e6: Option<u64>,
+    amounts: MartingalerCloseReceiptAmounts,
+) -> Result<Vec<u8>, ProgramError> {
+    let mut data = Vec::with_capacity(MARTINGALER_HISTORY_CLOSE_LEN);
+    data.extend_from_slice(&MARTINGALER_HISTORY_MAGIC);
+    data.push(MARTINGALER_HISTORY_VERSION);
+    data.push(MARTINGALER_HISTORY_CLOSE_KIND);
+    data.push(state.funding_kind);
+    data.push(state.side);
+    data.push(close_kind);
+    data.push(0);
+    data.extend_from_slice(pool.as_ref());
+    data.extend_from_slice(&state.controller.0);
+    data.extend_from_slice(position.as_ref());
+    data.extend_from_slice(&state.market_id.get().to_le_bytes());
+    data.extend_from_slice(&state.position_id.get().to_le_bytes());
+    data.extend_from_slice(&exit_price_e6.to_le_bytes());
+    data.extend_from_slice(&secondary_exit_price_e6.unwrap_or(0).to_le_bytes());
+    data.extend_from_slice(&signed_raw_pnl(state, exit_price_e6)?.to_le_bytes());
+    data.extend_from_slice(&amounts.principal_refund.to_le_bytes());
+    data.extend_from_slice(&amounts.gross_loss.to_le_bytes());
+    data.extend_from_slice(&amounts.haircut_withheld.to_le_bytes());
+    data.extend_from_slice(&amounts.win_fee.to_le_bytes());
+    data.extend_from_slice(&amounts.profit_cap_withheld.to_le_bytes());
+    data.extend_from_slice(&amounts.immediate_profit_paid.to_le_bytes());
+    data.extend_from_slice(&amounts.queued_profit.to_le_bytes());
+    data.extend_from_slice(&amounts.residual_bad_debt_added.to_le_bytes());
+    data.extend_from_slice(&amounts.child_claim_sequence.to_le_bytes());
+    if data.len() != MARTINGALER_HISTORY_CLOSE_LEN {
+        return Err(BoundaryError::PostconditionFailed.into());
+    }
+    Ok(data)
+}
+
+fn emit_martingaler_history(data: &[u8]) {
+    sol_log_data(&[data]);
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -496,6 +631,16 @@ pub enum Instruction {
         market_id: u16,
         max_leverage_x: u16,
     },
+    UpdateRiskLimits {
+        market_id: u16,
+        max_leverage_x: u16,
+        max_position_notional: u64,
+        max_net_profit_per_position: u64,
+        max_reserved_profit_per_controller: u64,
+        total_liability_open_gate: u64,
+        max_long_open_interest: u64,
+        max_short_open_interest: u64,
+    },
 }
 
 impl Instruction {
@@ -560,6 +705,7 @@ impl Instruction {
                 (SESSION_CLOSE_PROFITABLE_CLAIM_POSITION_TAG, 25)
             }
             Self::UpdateLeverageLimit { .. } => (UPDATE_LEVERAGE_LIMIT_TAG, 4),
+            Self::UpdateRiskLimits { .. } => (UPDATE_RISK_LIMITS_TAG, 52),
         };
         let mut data = Vec::with_capacity(MARTINGALER_IX_PREFIX_LEN + body_len);
         data.extend_from_slice(&MARTINGALER_IX_MAGIC);
@@ -884,6 +1030,25 @@ impl Instruction {
             } => {
                 data.extend_from_slice(&market_id.to_le_bytes());
                 data.extend_from_slice(&max_leverage_x.to_le_bytes());
+            }
+            Self::UpdateRiskLimits {
+                market_id,
+                max_leverage_x,
+                max_position_notional,
+                max_net_profit_per_position,
+                max_reserved_profit_per_controller,
+                total_liability_open_gate,
+                max_long_open_interest,
+                max_short_open_interest,
+            } => {
+                data.extend_from_slice(&market_id.to_le_bytes());
+                data.extend_from_slice(&max_leverage_x.to_le_bytes());
+                data.extend_from_slice(&max_position_notional.to_le_bytes());
+                data.extend_from_slice(&max_net_profit_per_position.to_le_bytes());
+                data.extend_from_slice(&max_reserved_profit_per_controller.to_le_bytes());
+                data.extend_from_slice(&total_liability_open_gate.to_le_bytes());
+                data.extend_from_slice(&max_long_open_interest.to_le_bytes());
+                data.extend_from_slice(&max_short_open_interest.to_le_bytes());
             }
             Self::PrepareController
             | Self::InitializeController
@@ -1866,6 +2031,42 @@ impl Instruction {
                     max_leverage_x,
                 })
             }
+            UPDATE_RISK_LIMITS_TAG => {
+                if data.len() != UPDATE_RISK_LIMITS_IX_LEN {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                let market_id = u16::from_le_bytes(
+                    data[11..13]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let max_leverage_x = u16::from_le_bytes(
+                    data[13..15]
+                        .try_into()
+                        .map_err(|_| BoundaryError::InvalidInstruction)?,
+                );
+                let read = |offset: usize| -> Result<u64, ProgramError> {
+                    Ok(u64::from_le_bytes(
+                        data[offset..offset + 8]
+                            .try_into()
+                            .map_err(|_| BoundaryError::InvalidInstruction)?,
+                    ))
+                };
+                let candidate = Self::UpdateRiskLimits {
+                    market_id,
+                    max_leverage_x,
+                    max_position_notional: read(15)?,
+                    max_net_profit_per_position: read(23)?,
+                    max_reserved_profit_per_controller: read(31)?,
+                    total_liability_open_gate: read(39)?,
+                    max_long_open_interest: read(47)?,
+                    max_short_open_interest: read(55)?,
+                };
+                if market_id == 0 || max_leverage_x == 0 || max_leverage_x > V1_MAX_LEVERAGE_X {
+                    return Err(BoundaryError::InvalidInstruction.into());
+                }
+                Ok(candidate)
+            }
             _ => Err(BoundaryError::InvalidInstruction.into()),
         }
     }
@@ -2384,6 +2585,27 @@ pub fn process_instruction<'a>(
             market_id,
             max_leverage_x,
         } => process_update_leverage_limit(program_id, accounts, market_id, max_leverage_x),
+        Instruction::UpdateRiskLimits {
+            market_id,
+            max_leverage_x,
+            max_position_notional,
+            max_net_profit_per_position,
+            max_reserved_profit_per_controller,
+            total_liability_open_gate,
+            max_long_open_interest,
+            max_short_open_interest,
+        } => process_update_risk_limits(
+            program_id,
+            accounts,
+            market_id,
+            max_leverage_x,
+            max_position_notional,
+            max_net_profit_per_position,
+            max_reserved_profit_per_controller,
+            total_liability_open_gate,
+            max_long_open_interest,
+            max_short_open_interest,
+        ),
     }
 }
 
@@ -4097,6 +4319,12 @@ fn process_open_cash_position<'a>(
     {
         return Err(BoundaryError::PostconditionFailed.into());
     }
+    emit_martingaler_history(&encode_martingaler_open_history_receipt(
+        pool.key,
+        position.key,
+        &outcome.position,
+        market_state.max_net_profit_per_position.get(),
+    )?);
     Ok(())
 }
 
@@ -4251,6 +4479,12 @@ fn process_open_claim_position<'a>(
     {
         return Err(BoundaryError::PostconditionFailed.into());
     }
+    emit_martingaler_history(&encode_martingaler_open_history_receipt(
+        pool.key,
+        position.key,
+        &outcome.position,
+        market_state.max_net_profit_per_position.get(),
+    )?);
     Ok(())
 }
 
@@ -4356,6 +4590,7 @@ fn process_close_nonpositive_cash_position<'a>(
         (policy_state.oracle_count == 2).then(|| &accounts[12]),
         now_unix_ts,
     )?;
+    let position_before = position_state;
     let outcome = close_cash_position(
         Key32::new(pool.key.to_bytes()),
         Key32::new(market.key.to_bytes()),
@@ -4398,6 +4633,21 @@ fn process_close_nonpositive_cash_position<'a>(
     {
         return Err(BoundaryError::PostconditionFailed.into());
     }
+    emit_martingaler_history(&encode_martingaler_close_history_receipt(
+        pool.key,
+        position.key,
+        &position_before,
+        MARTINGALER_CLOSE_NONPOSITIVE,
+        exit_price_e6,
+        secondary_exit_price_e6,
+        MartingalerCloseReceiptAmounts {
+            principal_refund: outcome.principal_refund,
+            gross_loss: outcome.gross_loss,
+            residual_bad_debt_added: outcome.residual_bad_debt_added,
+            child_claim_sequence: NO_CLAIM_SEQUENCE,
+            ..MartingalerCloseReceiptAmounts::default()
+        },
+    )?);
     Ok(())
 }
 
@@ -4562,6 +4812,7 @@ fn process_close_profitable_cash_position<'a>(
         Some(Key32::new(claim.key.to_bytes()))
     };
 
+    let position_before = position_state;
     let outcome = close_profitable_cash_position(
         Key32::new(pool.key.to_bytes()),
         Key32::new(market.key.to_bytes()),
@@ -4662,6 +4913,27 @@ fn process_close_profitable_cash_position<'a>(
             }
         }
     }
+    emit_martingaler_history(&encode_martingaler_close_history_receipt(
+        pool.key,
+        position.key,
+        &position_before,
+        MARTINGALER_CLOSE_PROFITABLE,
+        exit_price_e6,
+        secondary_exit_price_e6,
+        MartingalerCloseReceiptAmounts {
+            principal_refund: outcome.principal_refund,
+            haircut_withheld: outcome.adjustment.haircut_withheld,
+            win_fee: outcome.adjustment.win_fee,
+            profit_cap_withheld: outcome.adjustment.profit_cap_withheld,
+            immediate_profit_paid: outcome.immediate_profit_paid,
+            queued_profit: outcome.queued_profit,
+            child_claim_sequence: outcome
+                .claim
+                .map(|claim| claim.sequence.get())
+                .unwrap_or(NO_CLAIM_SEQUENCE),
+            ..MartingalerCloseReceiptAmounts::default()
+        },
+    )?);
     Ok(())
 }
 
@@ -4840,6 +5112,7 @@ fn process_close_claim_position<'a>(
         Some(Key32::new(child_claim.key.to_bytes()))
     };
 
+    let position_before = position_state;
     let outcome = match close_kind {
         ClaimVoluntaryCloseKind::NonPositive => close_nonpositive_claim_position(
             Key32::new(pool.key.to_bytes()),
@@ -4962,6 +5235,32 @@ fn process_close_claim_position<'a>(
             }
         }
     }
+    let adjustment = outcome.adjustment.unwrap_or_default();
+    emit_martingaler_history(&encode_martingaler_close_history_receipt(
+        pool.key,
+        position.key,
+        &position_before,
+        match close_kind {
+            ClaimVoluntaryCloseKind::NonPositive => MARTINGALER_CLOSE_NONPOSITIVE,
+            ClaimVoluntaryCloseKind::Profitable => MARTINGALER_CLOSE_PROFITABLE,
+        },
+        exit_price_e6,
+        secondary_exit_price_e6,
+        MartingalerCloseReceiptAmounts {
+            gross_loss: outcome.gross_loss,
+            haircut_withheld: adjustment.haircut_withheld,
+            win_fee: adjustment.win_fee,
+            profit_cap_withheld: adjustment.profit_cap_withheld,
+            immediate_profit_paid: outcome.immediate_payout,
+            queued_profit: outcome.queued_payout,
+            residual_bad_debt_added: outcome.residual_bad_debt_added,
+            child_claim_sequence: outcome
+                .child_claim
+                .map(|claim| claim.sequence.get())
+                .unwrap_or(NO_CLAIM_SEQUENCE),
+            ..MartingalerCloseReceiptAmounts::default()
+        },
+    )?);
     Ok(())
 }
 
@@ -5314,6 +5613,7 @@ fn process_resolve_bankrupt_cash_position<'a>(
         now_unix_ts,
     )?;
 
+    let position_before = position_state;
     let outcome = close_cash_position(
         Key32::new(pool.key.to_bytes()),
         Key32::new(market.key.to_bytes()),
@@ -5346,6 +5646,20 @@ fn process_resolve_bankrupt_cash_position<'a>(
     {
         return Err(BoundaryError::PostconditionFailed.into());
     }
+    emit_martingaler_history(&encode_martingaler_close_history_receipt(
+        pool.key,
+        position.key,
+        &position_before,
+        MARTINGALER_CLOSE_BANKRUPT,
+        primary_exit_price_e6,
+        secondary_exit_price_e6,
+        MartingalerCloseReceiptAmounts {
+            gross_loss: outcome.gross_loss,
+            residual_bad_debt_added: outcome.residual_bad_debt_added,
+            child_claim_sequence: NO_CLAIM_SEQUENCE,
+            ..MartingalerCloseReceiptAmounts::default()
+        },
+    )?);
     Ok(())
 }
 
@@ -5433,6 +5747,7 @@ fn process_resolve_bankrupt_claim_position<'a>(
         now_unix_ts,
     )?;
 
+    let position_before = position_state;
     let outcome = resolve_bankrupt_claim_position(
         Key32::new(pool.key.to_bytes()),
         Key32::new(market.key.to_bytes()),
@@ -5474,6 +5789,20 @@ fn process_resolve_bankrupt_claim_position<'a>(
     {
         return Err(BoundaryError::PostconditionFailed.into());
     }
+    emit_martingaler_history(&encode_martingaler_close_history_receipt(
+        pool.key,
+        position.key,
+        &position_before,
+        MARTINGALER_CLOSE_BANKRUPT,
+        primary_exit_price_e6,
+        secondary_exit_price_e6,
+        MartingalerCloseReceiptAmounts {
+            gross_loss: outcome.gross_loss,
+            residual_bad_debt_added: outcome.residual_bad_debt_added,
+            child_claim_sequence: NO_CLAIM_SEQUENCE,
+            ..MartingalerCloseReceiptAmounts::default()
+        },
+    )?);
     Ok(())
 }
 
@@ -5578,6 +5907,108 @@ fn process_update_leverage_limit<'a>(
     }
     pool_state.max_leverage_x = crate::martingaler_state::U16Le::new(max_leverage_x);
     market_state.max_leverage_x = crate::martingaler_state::U16Le::new(max_leverage_x);
+    pool_state.validate()?;
+    market_state.validate()?;
+    overwrite_account(&mut pool.try_borrow_mut_data()?, &pool_state)?;
+    overwrite_account(&mut market.try_borrow_mut_data()?, &market_state)?;
+    if decode_account::<PoolState>(&pool.try_borrow_data()?)? != pool_state
+        || decode_account::<MarketRiskState>(&market.try_borrow_data()?)? != market_state
+    {
+        return Err(BoundaryError::PostconditionFailed.into());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn process_update_risk_limits<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    market_id: u16,
+    max_leverage_x: u16,
+    max_position_notional: u64,
+    max_net_profit_per_position: u64,
+    max_reserved_profit_per_controller: u64,
+    total_liability_open_gate: u64,
+    max_long_open_interest: u64,
+    max_short_open_interest: u64,
+) -> ProgramResult {
+    if accounts.len() != UPDATE_RISK_LIMITS_ACCOUNT_COUNT {
+        return Err(BoundaryError::InvalidAccountCount.into());
+    }
+    ensure_distinct(accounts)?;
+    let admin = &accounts[0];
+    let pool = &accounts[1];
+    let market = &accounts[2];
+    validate_controller_authority(admin)?;
+    expect_writable(pool)?;
+    expect_nonsigner(pool)?;
+    let mut pool_state = load_canonical_pool(program_id, pool)?;
+    expect_writable(market)?;
+    expect_nonsigner(market)?;
+    let mut market_state = load_canonical_market(program_id, pool.key, market_id, market)?;
+
+    let max_position_notional = u128::from(max_position_notional);
+    let max_net_profit_per_position = u128::from(max_net_profit_per_position);
+    let max_reserved_profit_per_controller = u128::from(max_reserved_profit_per_controller);
+    let total_liability_open_gate = u128::from(total_liability_open_gate);
+    let max_long_open_interest = u128::from(max_long_open_interest);
+    let max_short_open_interest = u128::from(max_short_open_interest);
+    let invalid_target = max_leverage_x == 0
+        || max_leverage_x > V1_MAX_LEVERAGE_X
+        || max_position_notional == 0
+        || max_position_notional > V1_MAX_POSITION_NOTIONAL_QUOTE
+        || max_net_profit_per_position == 0
+        || max_net_profit_per_position > V1_MAX_NET_PROFIT_PER_POSITION_QUOTE
+        || max_net_profit_per_position > max_position_notional
+        || max_reserved_profit_per_controller == 0
+        || max_reserved_profit_per_controller > V1_MAX_RESERVED_PROFIT_PER_CONTROLLER_QUOTE
+        || total_liability_open_gate == 0
+        || total_liability_open_gate > V1_TOTAL_POTENTIAL_LIABILITY_QUOTE
+        || max_long_open_interest == 0
+        || max_long_open_interest > total_liability_open_gate
+        || max_short_open_interest == 0
+        || max_short_open_interest > total_liability_open_gate;
+    let is_decrease = max_leverage_x < pool_state.max_leverage_x.get()
+        || max_position_notional < pool_state.max_position_notional.get()
+        || max_net_profit_per_position < pool_state.max_net_profit_per_position.get()
+        || max_reserved_profit_per_controller < pool_state.max_reserved_profit_per_controller.get()
+        || total_liability_open_gate < pool_state.total_liability_open_gate.get()
+        || max_leverage_x < market_state.max_leverage_x.get()
+        || max_position_notional < market_state.max_position_notional.get()
+        || max_net_profit_per_position < market_state.max_net_profit_per_position.get()
+        || max_long_open_interest < market_state.max_long_open_interest.get()
+        || max_short_open_interest < market_state.max_short_open_interest.get();
+    if pool_state.admin.0 != admin.key.to_bytes()
+        || pool_state.status != PoolStatus::Active as u8
+        || market_state.status != PoolStatus::Active as u8
+        || pool_state.reserved_open_profit.get() != 0
+        || market_state.long_open_interest.get() != 0
+        || market_state.short_open_interest.get() != 0
+        || market_state.reserved_profit.get() != 0
+        || invalid_target
+        || is_decrease
+    {
+        return Err(BoundaryError::InvalidMarketLimits.into());
+    }
+
+    pool_state.max_leverage_x = crate::martingaler_state::U16Le::new(max_leverage_x);
+    pool_state.max_position_notional = crate::martingaler_state::U128Le::new(max_position_notional);
+    pool_state.max_net_profit_per_position =
+        crate::martingaler_state::U128Le::new(max_net_profit_per_position);
+    pool_state.max_reserved_profit_per_controller =
+        crate::martingaler_state::U128Le::new(max_reserved_profit_per_controller);
+    pool_state.total_liability_open_gate =
+        crate::martingaler_state::U128Le::new(total_liability_open_gate);
+    market_state.max_leverage_x = crate::martingaler_state::U16Le::new(max_leverage_x);
+    market_state.max_position_notional =
+        crate::martingaler_state::U128Le::new(max_position_notional);
+    market_state.max_net_profit_per_position =
+        crate::martingaler_state::U128Le::new(max_net_profit_per_position);
+    market_state.max_long_open_interest =
+        crate::martingaler_state::U128Le::new(max_long_open_interest);
+    market_state.max_short_open_interest =
+        crate::martingaler_state::U128Le::new(max_short_open_interest);
     pool_state.validate()?;
     market_state.validate()?;
     overwrite_account(&mut pool.try_borrow_mut_data()?, &pool_state)?;

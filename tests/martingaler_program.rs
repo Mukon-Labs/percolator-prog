@@ -1,9 +1,5 @@
 use litesvm::LiteSVM;
-use percolator_martingaler_engine::martingaler::{
-    V1_MAX_NET_PROFIT_PER_POSITION_QUOTE, V1_MAX_POSITION_NOTIONAL_QUOTE,
-    V1_MAX_RESERVED_PROFIT_PER_CONTROLLER_QUOTE, V1_QUOTE_DECIMALS,
-    V1_TOTAL_POTENTIAL_LIABILITY_QUOTE,
-};
+use percolator_martingaler_engine::martingaler::V1_QUOTE_DECIMALS;
 use percolator_prog::{
     dispatch_instruction, id,
     ix::Instruction as V16Instruction,
@@ -11,7 +7,8 @@ use percolator_prog::{
         decode_phoenix_bbo_return, derive_canonical_vault, derive_claim, derive_controller,
         derive_market, derive_oracle_policy, derive_oracle_relay, derive_pool, derive_position,
         derive_queue_page, derive_queue_page_zero, derive_trading_session, derive_vault_authority,
-        has_namespace, Instruction as MartingalerInstruction, PopFifoShape, ProfitSettlementShape,
+        encode_martingaler_open_history_receipt, has_namespace,
+        Instruction as MartingalerInstruction, PopFifoShape, ProfitSettlementShape,
         CLOSE_CASH_POSITION_IX_LEN, CLOSE_CLAIM_POSITION_IX_LEN,
         CLOSE_PROFITABLE_CASH_POSITION_IX_LEN, CONTROLLER_IX_LEN, DEPOSIT_CASH_IX_LEN,
         HAWKEYE_PROGRAM_ID, INITIALIZE_MARKET_IX_LEN, INITIALIZE_ORACLE_POLICY_IX_LEN,
@@ -26,15 +23,17 @@ use percolator_prog::{
         REVOKE_TRADING_SESSION_IX_LEN, SERVICE_FIFO_HEAD_IX_LEN, SESSION_CLOSE_POSITION_IX_LEN,
         SESSION_CLOSE_PROFITABLE_POSITION_IX_LEN, SESSION_OPEN_POSITION_IX_LEN,
         SESSION_PREPARE_POSITION_IX_LEN, SET_STATUS_IX_LEN, UPDATE_ORACLE_RELAY_IX_LEN,
-        WITHDRAW_IDLE_CASH_IX_LEN,
+        UPDATE_RISK_LIMITS_IX_LEN, WITHDRAW_IDLE_CASH_IX_LEN,
     },
     martingaler_state::{
         account_len, decode_account, decode_account_header, initialize_account, overwrite_account,
         validate_queue_page_zero_account, ClaimState, ClaimStatus, ControllerRiskState,
-        FundingKind, HaircutConfig, Key32, MarketRiskState, OraclePolicyState, OracleRelaySource,
-        OracleRelayState, PoolState, PoolStatus, PositionSide, PositionState, PositionStatus,
-        QueueEntry, QueuePageState, TradingSessionState, U128Le, U16Le, ACCOUNT_HEADER_LEN,
-        NO_CLAIM_SEQUENCE, QUEUE_FLAG_HEAD_SETTLED, QUEUE_PAGE_CAPACITY,
+        FundingKind, HaircutConfig, Key32, MarketRiskState, MartingalerAccount, OraclePolicyState,
+        OracleRelaySource, OracleRelayState, PoolState, PoolStatus, PositionSide, PositionState,
+        PositionStatus, QueueEntry, QueuePageState, TradingSessionState, U128Le, U16Le,
+        ACCOUNT_HEADER_LEN, NO_CLAIM_SEQUENCE, QUEUE_FLAG_HEAD_SETTLED, QUEUE_PAGE_CAPACITY,
+        V1_MAX_LEVERAGE_X, V1_MAX_NET_PROFIT_PER_POSITION_QUOTE, V1_MAX_POSITION_NOTIONAL_QUOTE,
+        V1_MAX_RESERVED_PROFIT_PER_CONTROLLER_QUOTE, V1_TOTAL_POTENTIAL_LIABILITY_QUOTE,
     },
     oracle_v16, processor,
 };
@@ -367,6 +366,31 @@ impl Fixture {
             MartingalerInstruction::UpdateLeverageLimit {
                 market_id: MARKET_ID,
                 max_leverage_x,
+            },
+            vec![
+                AccountMeta::new_readonly(self.admin.pubkey(), true),
+                AccountMeta::new(self.pool, false),
+                AccountMeta::new(self.market, false),
+            ],
+        )
+    }
+
+    fn update_risk_limits_instruction(&self) -> SolInstruction {
+        self.instruction(
+            MartingalerInstruction::UpdateRiskLimits {
+                market_id: MARKET_ID,
+                max_leverage_x: V1_MAX_LEVERAGE_X,
+                max_position_notional: u64::try_from(V1_MAX_POSITION_NOTIONAL_QUOTE).unwrap(),
+                max_net_profit_per_position: u64::try_from(V1_MAX_NET_PROFIT_PER_POSITION_QUOTE)
+                    .unwrap(),
+                max_reserved_profit_per_controller: u64::try_from(
+                    V1_MAX_RESERVED_PROFIT_PER_CONTROLLER_QUOTE,
+                )
+                .unwrap(),
+                total_liability_open_gate: u64::try_from(V1_TOTAL_POTENTIAL_LIABILITY_QUOTE)
+                    .unwrap(),
+                max_long_open_interest: u64::try_from(V1_TOTAL_POTENTIAL_LIABILITY_QUOTE).unwrap(),
+                max_short_open_interest: u64::try_from(V1_TOTAL_POTENTIAL_LIABILITY_QUOTE).unwrap(),
             },
             vec![
                 AccountMeta::new_readonly(self.admin.pubkey(), true),
@@ -1848,6 +1872,24 @@ fn instruction_codec_is_strict_and_legacy_namespace_is_unchanged() {
             WITHDRAW_IDLE_CASH_IX_LEN,
         ),
         (
+            MartingalerInstruction::UpdateRiskLimits {
+                market_id: MARKET_ID,
+                max_leverage_x: V1_MAX_LEVERAGE_X,
+                max_position_notional: u64::try_from(V1_MAX_POSITION_NOTIONAL_QUOTE).unwrap(),
+                max_net_profit_per_position: u64::try_from(V1_MAX_NET_PROFIT_PER_POSITION_QUOTE)
+                    .unwrap(),
+                max_reserved_profit_per_controller: u64::try_from(
+                    V1_MAX_RESERVED_PROFIT_PER_CONTROLLER_QUOTE,
+                )
+                .unwrap(),
+                total_liability_open_gate: u64::try_from(V1_TOTAL_POTENTIAL_LIABILITY_QUOTE)
+                    .unwrap(),
+                max_long_open_interest: u64::try_from(V1_TOTAL_POTENTIAL_LIABILITY_QUOTE).unwrap(),
+                max_short_open_interest: u64::try_from(V1_TOTAL_POTENTIAL_LIABILITY_QUOTE).unwrap(),
+            },
+            UPDATE_RISK_LIMITS_IX_LEN,
+        ),
+        (
             MartingalerInstruction::PrepareTradingSession,
             PREPARE_TRADING_SESSION_IX_LEN,
         ),
@@ -2371,7 +2413,6 @@ fn atomic_bundle_creates_exact_pool_root_and_replay_fails() {
     );
     assert!(result.compute_units_consumed > 0);
     assert!(result.compute_units_consumed <= u64::from(TX_CU_LIMIT));
-
     let pool_account = fixture.svm.get_account(&fixture.pool).unwrap();
     let page_account = fixture.svm.get_account(&fixture.page_zero).unwrap();
     assert_eq!(pool_account.owner, id());
@@ -2697,7 +2738,7 @@ fn market_and_controller_bundles_create_exact_empty_roots_and_reject_replay() {
     assert_eq!(market.pool, Key32::new(fixture.pool.to_bytes()));
     assert_eq!(market.market_id.get(), MARKET_ID);
     assert_eq!(market.status, PoolStatus::Active as u8);
-    assert_eq!(market.max_leverage_x.get(), 500);
+    assert_eq!(market.max_leverage_x.get(), V1_MAX_LEVERAGE_X);
     assert_eq!(
         market.max_position_notional.get(),
         V1_MAX_POSITION_NOTIONAL_QUOTE
@@ -2872,6 +2913,291 @@ fn leverage_limit_update_is_state_compatible_and_rejects_live_risk() {
 }
 
 #[test]
+fn risk_limit_update_migrates_all_caps_atomically_and_rejects_live_risk() {
+    let mut fixture = Fixture::new(212);
+    fixture
+        .send(vec![fixture.prepare(), fixture.initialize()], true)
+        .unwrap();
+    fixture
+        .send(
+            vec![
+                fixture.market_instruction(true),
+                fixture.market_instruction(false),
+            ],
+            true,
+        )
+        .unwrap();
+
+    let mut pool_account = fixture.svm.get_account(&fixture.pool).unwrap();
+    let mut pool = decode_account::<PoolState>(&pool_account.data).unwrap();
+    pool.max_leverage_x = U16Le::new(500);
+    pool.max_position_notional = U128Le::new(1_000_000_000_000);
+    pool.max_net_profit_per_position = U128Le::new(100_000_000_000);
+    pool.max_reserved_profit_per_controller = U128Le::new(250_000_000_000);
+    pool.total_liability_open_gate = U128Le::new(1_000_000_000_000);
+    overwrite_account(&mut pool_account.data, &pool).unwrap();
+    fixture.svm.set_account(fixture.pool, pool_account).unwrap();
+    let mut market_account = fixture.svm.get_account(&fixture.market).unwrap();
+    let mut market = decode_account::<MarketRiskState>(&market_account.data).unwrap();
+    market.max_leverage_x = U16Le::new(500);
+    market.max_position_notional = U128Le::new(1_000_000_000_000);
+    market.max_net_profit_per_position = U128Le::new(100_000_000_000);
+    market.max_long_open_interest = U128Le::new(1_000_000_000_000);
+    market.max_short_open_interest = U128Le::new(1_000_000_000_000);
+    overwrite_account(&mut market_account.data, &market).unwrap();
+    fixture
+        .svm
+        .set_account(fixture.market, market_account)
+        .unwrap();
+
+    fixture
+        .send(vec![fixture.update_risk_limits_instruction()], true)
+        .unwrap();
+    let after_first_update = account_snapshot(&fixture, &[fixture.pool, fixture.market]);
+    fixture.svm.expire_blockhash();
+    fixture
+        .send(vec![fixture.update_risk_limits_instruction()], true)
+        .expect("risk-limit migration replay is idempotent");
+    assert_eq!(
+        account_snapshot(&fixture, &[fixture.pool, fixture.market]),
+        after_first_update
+    );
+    fixture.svm.expire_blockhash();
+    let mut unauthorized_update = fixture.update_risk_limits_instruction();
+    unauthorized_update.accounts[0] = AccountMeta::new_readonly(fixture.payer.pubkey(), true);
+    assert!(fixture.send(vec![unauthorized_update], false).is_err());
+    assert_eq!(
+        account_snapshot(&fixture, &[fixture.pool, fixture.market]),
+        after_first_update
+    );
+    let pool =
+        decode_account::<PoolState>(&fixture.svm.get_account(&fixture.pool).unwrap().data).unwrap();
+    let market =
+        decode_account::<MarketRiskState>(&fixture.svm.get_account(&fixture.market).unwrap().data)
+            .unwrap();
+    assert_eq!(pool.max_leverage_x.get(), V1_MAX_LEVERAGE_X);
+    assert_eq!(
+        pool.max_position_notional.get(),
+        V1_MAX_POSITION_NOTIONAL_QUOTE
+    );
+    assert_eq!(
+        pool.max_net_profit_per_position.get(),
+        V1_MAX_NET_PROFIT_PER_POSITION_QUOTE
+    );
+    assert_eq!(
+        pool.max_reserved_profit_per_controller.get(),
+        V1_MAX_RESERVED_PROFIT_PER_CONTROLLER_QUOTE
+    );
+    assert_eq!(
+        pool.total_liability_open_gate.get(),
+        V1_TOTAL_POTENTIAL_LIABILITY_QUOTE
+    );
+    assert_eq!(market.max_leverage_x.get(), V1_MAX_LEVERAGE_X);
+    assert_eq!(
+        market.max_position_notional.get(),
+        V1_MAX_POSITION_NOTIONAL_QUOTE
+    );
+    assert_eq!(
+        market.max_net_profit_per_position.get(),
+        V1_MAX_NET_PROFIT_PER_POSITION_QUOTE
+    );
+    assert_eq!(
+        market.max_long_open_interest.get(),
+        V1_TOTAL_POTENTIAL_LIABILITY_QUOTE
+    );
+    assert_eq!(
+        market.max_short_open_interest.get(),
+        V1_TOTAL_POTENTIAL_LIABILITY_QUOTE
+    );
+
+    let mut market_account = fixture.svm.get_account(&fixture.market).unwrap();
+    let mut market = decode_account::<MarketRiskState>(&market_account.data).unwrap();
+    market.long_open_interest = U128Le::new(1);
+    overwrite_account(&mut market_account.data, &market).unwrap();
+    fixture
+        .svm
+        .set_account(fixture.market, market_account)
+        .unwrap();
+    let before = account_snapshot(&fixture, &[fixture.pool, fixture.market]);
+    assert!(fixture
+        .send(vec![fixture.update_risk_limits_instruction()], true)
+        .is_err());
+    assert_eq!(
+        account_snapshot(&fixture, &[fixture.pool, fixture.market]),
+        before
+    );
+}
+
+#[test]
+fn delta_neutral_four_instruction_bundle_opens_both_legs_atomically() {
+    let mut fixture = Fixture::new(213);
+    bootstrap_cash_open(&mut fixture, false);
+    let oracle = fixture.install_pyth_price(&PRIMARY_FEED_ID, 100_000_000, 100_000, ORACLE_TIME);
+    let short_id = POSITION_ID + 1;
+    let short_position = fixture.position_for(short_id);
+    let mut short_accounts = fixture.open_cash_metas(oracle, None);
+    short_accounts[4] = AccountMeta::new(short_position, false);
+    let open_short = fixture.instruction(
+        MartingalerInstruction::OpenCashPosition {
+            position_id: short_id,
+            market_id: MARKET_ID,
+            side: PositionSide::Short,
+            collateral: OPEN_COLLATERAL,
+            notional: OPEN_NOTIONAL,
+            leverage_x: 100,
+        },
+        short_accounts,
+    );
+
+    let result = fixture
+        .send_controller(vec![
+            fixture.prepare_position_instruction(),
+            fixture.open_cash_instruction(oracle, None, OPEN_COLLATERAL, OPEN_NOTIONAL, 100),
+            fixture.prepare_position_instruction_for(short_id),
+            open_short,
+        ])
+        .expect("atomic delta-neutral bundle opens both legs");
+    let receipt_count = result
+        .logs
+        .iter()
+        .filter(|line| line.starts_with("Program data: TklOSFNUMDE"))
+        .count();
+    assert_eq!(receipt_count, 2, "one durable open receipt per leg");
+
+    let long =
+        decode_account::<PositionState>(&fixture.svm.get_account(&fixture.position).unwrap().data)
+            .unwrap();
+    let short =
+        decode_account::<PositionState>(&fixture.svm.get_account(&short_position).unwrap().data)
+            .unwrap();
+    assert_eq!(long.side, PositionSide::Long as u8);
+    assert_eq!(short.side, PositionSide::Short as u8);
+    assert_eq!(long.status, PositionStatus::Open as u8);
+    assert_eq!(short.status, PositionStatus::Open as u8);
+
+    let controller = decode_account::<ControllerRiskState>(
+        &fixture
+            .svm
+            .get_account(&fixture.controller_risk)
+            .unwrap()
+            .data,
+    )
+    .unwrap();
+    let market =
+        decode_account::<MarketRiskState>(&fixture.svm.get_account(&fixture.market).unwrap().data)
+            .unwrap();
+    let pool =
+        decode_account::<PoolState>(&fixture.svm.get_account(&fixture.pool).unwrap().data).unwrap();
+    assert_eq!(controller.open_positions.get(), 2);
+    assert_eq!(
+        controller.available_cash_collateral.get(),
+        u128::from(DEPOSIT_AMOUNT - (2 * OPEN_COLLATERAL))
+    );
+    assert_eq!(market.long_open_interest.get(), u128::from(OPEN_NOTIONAL));
+    assert_eq!(market.short_open_interest.get(), u128::from(OPEN_NOTIONAL));
+    assert_eq!(
+        pool.reserved_open_profit.get(),
+        long.reserved_profit.get() + short.reserved_profit.get()
+    );
+}
+
+#[test]
+fn open_history_receipt_reports_factor_against_the_capped_nominal_profit() {
+    let pool = Pubkey::new_unique();
+    let position_key = Pubkey::new_unique();
+    let mut position = PositionState::default();
+    position.pool = Key32::new(pool.to_bytes());
+    position.controller = Key32::new(Pubkey::new_unique().to_bytes());
+    position.position_id = percolator_prog::martingaler_state::U64Le::new(1);
+    position.market_id = U16Le::new(MARKET_ID);
+    position.side = PositionSide::Long as u8;
+    position.funding_kind = FundingKind::Cash as u8;
+    position.status = PositionStatus::Open as u8;
+    position.leverage_x = U16Le::new(V1_MAX_LEVERAGE_X);
+    position.collateral = U128Le::new(2_000_000_000);
+    position.notional = U128Le::new(V1_MAX_POSITION_NOTIONAL_QUOTE);
+    position.max_payable_profit = U128Le::new(V1_MAX_NET_PROFIT_PER_POSITION_QUOTE);
+    position.reserved_profit = U128Le::new(V1_MAX_NET_PROFIT_PER_POSITION_QUOTE);
+    position.entry_price_e6 = percolator_prog::martingaler_state::U64Le::new(100_000_000);
+    position.entry_publish_time = percolator_prog::martingaler_state::I64Le::new(1_000);
+    position.source_claim_sequence = U128Le::new(NO_CLAIM_SEQUENCE);
+    position.validate().unwrap();
+
+    let receipt = encode_martingaler_open_history_receipt(
+        &pool,
+        &position_key,
+        &position,
+        V1_MAX_NET_PROFIT_PER_POSITION_QUOTE,
+    )
+    .unwrap();
+    assert_eq!(
+        u16::from_le_bytes(receipt[152..154].try_into().unwrap()),
+        10_000
+    );
+}
+
+#[test]
+fn delta_neutral_four_instruction_bundle_rolls_back_when_second_leg_fails() {
+    let mut fixture = Fixture::new(213);
+    bootstrap_cash_open(&mut fixture, false);
+    let oracle = fixture.install_pyth_price(&PRIMARY_FEED_ID, 100_000_000, 100_000, ORACLE_TIME);
+    let short_id = POSITION_ID + 1;
+    let short_position = fixture.position_for(short_id);
+    let mut short_accounts = fixture.open_cash_metas(oracle, None);
+    short_accounts[4] = AccountMeta::new(short_position, false);
+    let invalid_short = fixture.instruction(
+        MartingalerInstruction::OpenCashPosition {
+            position_id: short_id,
+            market_id: MARKET_ID,
+            side: PositionSide::Short,
+            collateral: OPEN_COLLATERAL,
+            notional: OPEN_COLLATERAL * u64::from(V1_MAX_LEVERAGE_X + 1),
+            leverage_x: V1_MAX_LEVERAGE_X + 1,
+        },
+        short_accounts,
+    );
+    let before = account_snapshot(
+        &fixture,
+        &[
+            fixture.pool,
+            fixture.market,
+            fixture.controller_risk,
+            fixture.vault,
+            fixture.source,
+            fixture.controller.pubkey(),
+            fixture.position,
+            short_position,
+        ],
+    );
+    assert!(fixture
+        .send_controller(vec![
+            fixture.prepare_position_instruction(),
+            fixture.open_cash_instruction(oracle, None, OPEN_COLLATERAL, OPEN_NOTIONAL, 100,),
+            fixture.prepare_position_instruction_for(short_id),
+            invalid_short,
+        ])
+        .is_err());
+    assert_eq!(
+        account_snapshot(
+            &fixture,
+            &[
+                fixture.pool,
+                fixture.market,
+                fixture.controller_risk,
+                fixture.vault,
+                fixture.source,
+                fixture.controller.pubkey(),
+                fixture.position,
+                short_position,
+            ],
+        ),
+        before
+    );
+    assert!(fixture.svm.get_account(&fixture.position).is_none());
+    assert!(fixture.svm.get_account(&short_position).is_none());
+}
+
+#[test]
 fn guarded_open_and_session_guarded_open_codecs_are_exact() {
     let guarded = MartingalerInstruction::GuardedOpenCashPosition {
         position_id: 7,
@@ -2938,7 +3264,7 @@ fn guarded_open_enforces_signed_factor_at_the_real_instruction_boundary() {
 
     // Leave exactly $500 of controller profit depth. For this position's
     // $1,000 nominal-profit cap the immutable payout factor is therefore 50%.
-    let prior_reserved = 249_500_000_000u128;
+    let prior_reserved = V1_MAX_RESERVED_PROFIT_PER_CONTROLLER_QUOTE - 500_000_000;
     let mut pool_account = fixture.svm.get_account(&fixture.pool).unwrap();
     let mut pool = decode_account::<PoolState>(&pool_account.data).unwrap();
     pool.reserved_open_profit = U128Le::new(prior_reserved);
@@ -3575,6 +3901,10 @@ fn dual_oracle_cash_open_consumes_idle_cash_once_and_records_exact_provenance() 
     );
     assert!(result.compute_units_consumed > 0);
     assert!(result.compute_units_consumed <= u64::from(TX_CU_LIMIT));
+    assert!(result
+        .logs
+        .iter()
+        .any(|line| line.starts_with("Program data: TklOSFNUMDE")));
 
     let pool =
         decode_account::<PoolState>(&fixture.svm.get_account(&fixture.pool).unwrap().data).unwrap();

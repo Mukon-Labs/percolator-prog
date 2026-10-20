@@ -16,7 +16,9 @@ use percolator_prog::martingaler_state::{
     MARTINGALER_MAGIC, MARTINGALER_VERSION, NO_CLAIM_SEQUENCE, NO_PAGE_INDEX,
     ORACLE_POLICY_ACCOUNT_LEN, ORACLE_RELAY_ACCOUNT_LEN, POOL_ACCOUNT_LEN, POSITION_ACCOUNT_LEN,
     QUEUE_FLAG_HEAD_SETTLED, QUEUE_PAGE_ACCOUNT_LEN, QUEUE_PAGE_CAPACITY,
-    TRADING_SESSION_ACCOUNT_LEN, V1_MIN_COLLATERAL_QUOTE,
+    TRADING_SESSION_ACCOUNT_LEN, V1_MAX_LEVERAGE_X, V1_MAX_NET_PROFIT_PER_POSITION_QUOTE,
+    V1_MAX_POSITION_NOTIONAL_QUOTE, V1_MAX_RESERVED_PROFIT_PER_CONTROLLER_QUOTE,
+    V1_MIN_COLLATERAL_QUOTE, V1_TOTAL_POTENTIAL_LIABILITY_QUOTE,
 };
 
 fn key(byte: u8) -> Key32 {
@@ -130,6 +132,73 @@ where
         initialize_account(&mut data, 254, &body),
         Err(StateError::AlreadyInitialized)
     );
+}
+
+#[test]
+fn v1_risk_limits_accept_exact_maxima_and_reject_each_max_plus_one() {
+    let pool_key = key(90);
+    let pool = PoolState::new(77, key(91), key(92), key(93));
+    assert_eq!(pool.max_leverage_x.get(), V1_MAX_LEVERAGE_X);
+    assert_eq!(
+        pool.max_position_notional.get(),
+        V1_MAX_POSITION_NOTIONAL_QUOTE
+    );
+    assert_eq!(
+        pool.max_net_profit_per_position.get(),
+        V1_MAX_NET_PROFIT_PER_POSITION_QUOTE
+    );
+    assert_eq!(
+        pool.max_reserved_profit_per_controller.get(),
+        V1_MAX_RESERVED_PROFIT_PER_CONTROLLER_QUOTE
+    );
+    assert_eq!(
+        pool.total_liability_open_gate.get(),
+        V1_TOTAL_POTENTIAL_LIABILITY_QUOTE
+    );
+    pool.validate().unwrap();
+
+    let mut invalid_pool = pool;
+    invalid_pool.max_leverage_x = U16Le::new(V1_MAX_LEVERAGE_X + 1);
+    assert_eq!(invalid_pool.validate(), Err(StateError::InvalidState));
+    let mut invalid_pool = pool;
+    invalid_pool.max_position_notional = U128Le::new(V1_MAX_POSITION_NOTIONAL_QUOTE + 1);
+    assert_eq!(invalid_pool.validate(), Err(StateError::InvalidState));
+    let mut invalid_pool = pool;
+    invalid_pool.max_net_profit_per_position =
+        U128Le::new(V1_MAX_NET_PROFIT_PER_POSITION_QUOTE + 1);
+    assert_eq!(invalid_pool.validate(), Err(StateError::InvalidState));
+    let mut invalid_pool = pool;
+    invalid_pool.max_reserved_profit_per_controller =
+        U128Le::new(V1_MAX_RESERVED_PROFIT_PER_CONTROLLER_QUOTE + 1);
+    assert_eq!(invalid_pool.validate(), Err(StateError::InvalidState));
+    let mut invalid_pool = pool;
+    invalid_pool.total_liability_open_gate = U128Le::new(V1_TOTAL_POTENTIAL_LIABILITY_QUOTE + 1);
+    assert_eq!(invalid_pool.validate(), Err(StateError::InvalidState));
+
+    let mut market = market(pool_key);
+    market.max_leverage_x = U16Le::new(V1_MAX_LEVERAGE_X);
+    market.max_position_notional = U128Le::new(V1_MAX_POSITION_NOTIONAL_QUOTE);
+    market.max_net_profit_per_position = U128Le::new(V1_MAX_NET_PROFIT_PER_POSITION_QUOTE);
+    market.max_long_open_interest = U128Le::new(V1_TOTAL_POTENTIAL_LIABILITY_QUOTE);
+    market.max_short_open_interest = U128Le::new(V1_TOTAL_POTENTIAL_LIABILITY_QUOTE);
+    market.validate().unwrap();
+
+    let mut invalid_market = market;
+    invalid_market.max_leverage_x = U16Le::new(V1_MAX_LEVERAGE_X + 1);
+    assert_eq!(invalid_market.validate(), Err(StateError::InvalidState));
+    let mut invalid_market = market;
+    invalid_market.max_position_notional = U128Le::new(V1_MAX_POSITION_NOTIONAL_QUOTE + 1);
+    assert_eq!(invalid_market.validate(), Err(StateError::InvalidState));
+    let mut invalid_market = market;
+    invalid_market.max_net_profit_per_position =
+        U128Le::new(V1_MAX_NET_PROFIT_PER_POSITION_QUOTE + 1);
+    assert_eq!(invalid_market.validate(), Err(StateError::InvalidState));
+    let mut invalid_market = market;
+    invalid_market.max_long_open_interest = U128Le::new(V1_TOTAL_POTENTIAL_LIABILITY_QUOTE + 1);
+    assert_eq!(invalid_market.validate(), Err(StateError::InvalidState));
+    let mut invalid_market = market;
+    invalid_market.max_short_open_interest = U128Le::new(V1_TOTAL_POTENTIAL_LIABILITY_QUOTE + 1);
+    assert_eq!(invalid_market.validate(), Err(StateError::InvalidState));
 }
 
 #[test]
@@ -709,10 +778,11 @@ fn guarded_open_enforces_ten_dollar_floor_and_freezes_dynamic_payout_cap() {
     .unwrap();
     let mut controller = ControllerRiskState::new(pool_key, controller_key).unwrap();
     record_cash_deposit(pool_key, &mut pool, &mut controller, 0, 2_000 * 1_000_000).unwrap();
-    pool.reserved_open_profit = U128Le::new(200_000 * 1_000_000);
-    controller.reserved_profit = U128Le::new(200_000 * 1_000_000);
+    let prior_reserved = V1_MAX_RESERVED_PROFIT_PER_CONTROLLER_QUOTE - 50_000 * 1_000_000;
+    pool.reserved_open_profit = U128Le::new(prior_reserved);
+    controller.reserved_profit = U128Le::new(prior_reserved);
     controller.open_positions = U32Le::new(2);
-    market.reserved_profit = U128Le::new(200_000 * 1_000_000);
+    market.reserved_profit = U128Le::new(prior_reserved);
 
     let quote = quote_payout_factor(&pool, &market, &controller, 100_000 * 1_000_000, 0).unwrap();
     assert_eq!(quote.payout_factor_bps, 5_000);

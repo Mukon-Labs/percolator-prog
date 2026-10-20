@@ -7,10 +7,6 @@
 use alloc::boxed::Box;
 use bytemuck::{Pod, Zeroable};
 use core::mem::size_of;
-use percolator_martingaler_engine::martingaler::{
-    V1_MAX_NET_PROFIT_PER_POSITION_QUOTE, V1_MAX_POSITION_NOTIONAL_QUOTE,
-    V1_MAX_RESERVED_PROFIT_PER_CONTROLLER_QUOTE, V1_TOTAL_POTENTIAL_LIABILITY_QUOTE,
-};
 use solana_program::program_error::ProgramError;
 
 pub const MARTINGALER_MAGIC: [u8; 8] = *b"NINMART\0";
@@ -24,7 +20,12 @@ pub const QUEUE_FLAG_HEAD_SETTLED: u8 = 1;
 pub const MAX_ORACLE_STALENESS_SECS: u64 = 300;
 pub const MAX_ORACLE_CONFIDENCE_BPS: u16 = 1_000;
 pub const MAX_PHOENIX_SOURCE_STALENESS_SLOTS: u64 = 10_000;
-pub const V1_MAX_LEVERAGE_X: u16 = 500;
+pub const V1_QUOTE_ATOMS_PER_UNIT: u128 = 1_000_000;
+pub const V1_MAX_LEVERAGE_X: u16 = 1_000;
+pub const V1_MAX_POSITION_NOTIONAL_QUOTE: u128 = 2_000_000 * V1_QUOTE_ATOMS_PER_UNIT;
+pub const V1_MAX_NET_PROFIT_PER_POSITION_QUOTE: u128 = 200_000 * V1_QUOTE_ATOMS_PER_UNIT;
+pub const V1_MAX_RESERVED_PROFIT_PER_CONTROLLER_QUOTE: u128 = 500_000 * V1_QUOTE_ATOMS_PER_UNIT;
+pub const V1_TOTAL_POTENTIAL_LIABILITY_QUOTE: u128 = 2_000_000 * V1_QUOTE_ATOMS_PER_UNIT;
 pub const V1_MIN_COLLATERAL_QUOTE: u128 = 10 * 1_000_000;
 pub const V1_PAYOUT_FACTOR_SCALE_BPS: u16 = 10_000;
 pub const V1_MIN_PAYOUT_FACTOR_BPS: u16 = 3_000;
@@ -1702,7 +1703,7 @@ pub struct CashCloseOutcome {
     pub represented_custody_after: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ProfitAdjustment {
     pub raw_profit: u128,
     pub favorable_move_ppm: u32,
